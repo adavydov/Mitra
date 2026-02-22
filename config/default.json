@@ -1,0 +1,7 @@
+{
+  "name": "mitra-core",
+  "environment": "dev",
+  "features": ["lint", "evals"],
+  "maxWorkers": 2,
+  "secureMode": true
+}
