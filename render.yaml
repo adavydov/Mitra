@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: mitra-runtime
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m runtime.app
+    envVars:
+      - key: AUTONOMY_LEVEL
+        value: low
+      - key: RISK_APPETITE
+        value: low
