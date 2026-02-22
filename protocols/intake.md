@@ -1,47 +1,22 @@
-# PR-INTAKE-01 — Протокол intake
+# Intake Protocol
+ID: PR-INTAKE-01
+Level: L2
+Depends on: P-ACCESS-01, P-DATA-01, C-AUT-01
+Config keys: CFG-AUT-01, CFG-RISK-01
+Required evals: EVAL-REG-01
 
-## Назначение
-Протокол intake определяет, как входящий запрос из Telegram webhook преобразуется в нормализованную задачу для runtime перед любыми действиями.
+## Inputs
+Telegram update payload, AL/Risk context.
 
-## Входы
-- `update_id`: идентификатор Telegram update.
-- `message`/`edited_message`:
-  - `text` или `caption` (основной вход для классификации).
-  - `chat.id`, `from.id`, `date`.
-- `document` (опционально): метаданные вложения (`file_name`, `mime_type`, `file_size`).
-- Контекст исполнения:
-  - `AUTONOMY_LEVEL` (`low|medium|high`).
-  - `RISK_APPETITE` (`low|medium|high`).
+## Outputs
+classification, decision, reason, request_id.
 
-## Выходы
-Нормализованный объект intake:
-- `request_id`: `tg:<update_id>`.
-- `source`: `telegram`.
-- `raw_text`: текст для анализа (из `text` или `caption`).
-- `classification`:
-  - `report_document_request`
-  - `unknown`
-  - `restricted`
-- `decision`:
-  - `allow` — допускается дальнейшая обработка.
-  - `block` — запрос отклонён политикой.
-- `reason`: объяснение решения (`policy_gate_passed`, `restricted_content`, `autonomy_too_low`, `risk_appetite_too_low`).
+## Algorithm
+1) Extract text/caption.
+2) Classify as `report_document_request|unknown|restricted`.
+3) Run policy gate by AL/Risk.
+4) Emit intake decision and audit hooks.
 
-## Алгоритм классификации
-1. **Извлечение текста**: взять `message.text`, иначе `message.caption`, иначе пустую строку.
-2. **Нормализация**: привести к нижнему регистру, удалить лишние пробелы.
-3. **Проверка restricted-признаков (приоритет 1)**:
-   - команды на взлом, malware, обход ограничений, кражу данных/PII.
-   - если найден признак, класс = `restricted`.
-4. **Проверка report/document request (приоритет 2)**:
-   - намерение «подготовь/сделай/создай отчёт|документ|справку|резюме|pdf|doc».
-   - если найдено, класс = `report_document_request`.
-5. **Fallback**:
-   - класс = `unknown`.
-6. **Policy gating**:
-   - класс маппится на минимальные требования `Autonomy Level` и `Risk Appetite`.
-   - если текущие уровни ниже требований, `decision=block`.
-
-## Примечания
-- `restricted` всегда блокируется независимо от уровней автономии/риска.
-- Классификация rule-based (MVP) и должна сопровождаться eval-наборами для регрессии.
+## Fail-safe / rollback
+Unknown or restricted input defaults to safe deny/no side effects.
+REF: L0-CONST

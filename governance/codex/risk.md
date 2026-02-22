@@ -1,21 +1,15 @@
-# Risk Governance
+# Risk Codex
+ID: C-RISK-01
+Level: L1
+Owner: User
+Status: active
+Depends on: L0-CONST, L1-ID
+Config keys: CFG-RISK-01
+Required evals: EVAL-SEC-INJECT-01, EVAL-FIN-BUDGET-01
 
-## Risk Model
-- `LOW`: passive read/list operations.
-- `MEDIUM`: controlled write or local execution.
-- `HIGH`: network-side effects, deploy, production change.
-- `CRITICAL`: self-modification, policy bypass, irreversible destructive operations.
+## Нормы
+- Используется шкала риска и пороги, согласованные с policy.
+- Unknown risk трактуется как deny.
+- При аномалии система понижается до AL0.
 
-## Risk Enforcement
-- Effective action risk is sourced from `config/risk.json` mapping.
-- If an action declares lower risk than mapped baseline, mapped baseline wins.
-- If risk is unknown, classify as `CRITICAL` and deny by default.
-
-## Anomaly Handling
-The following trigger immediate policy incident:
-- policy bypass attempts,
-- repeated denied actions,
-- unauthorized self-modification,
-- budget tampering.
-
-Any incident triggers quarantine fallback (AL0).
+REF: L0-CONST

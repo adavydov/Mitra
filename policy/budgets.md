@@ -1,16 +1,21 @@
 # Budget Policy
+ID: P-BUDGET-01
+Level: L2
+Owner: User (merge)
+Status: active
+Depends on: L0-CONST, C-FIN-01
+Config keys: CFG-BUDGET-01
+Required evals: EVAL-FIN-BUDGET-01
 
-## Budget Controls
-- Budget is tracked in `tokens` on a daily window.
-- `soft_limit`: planning warning threshold.
-- `hard_limit`: strict deny threshold.
-- Per-action max budget is additionally constrained by autonomy level.
+## Intent
+Ограничивает расходы по дневному окну и per-action лимитам.
 
-## Enforcement Rules
-Before every action:
-1. Resolve tool cost from `config/budget.json`.
-2. Deny if tool cost is undefined (deny-by-default).
-3. Deny if projected spend exceeds hard limit.
-4. Deny if cost exceeds current AL per-action max.
+## Decision rules
+- IF projected_spend > hard_limit THEN deny.
+- IF tool_cost undefined THEN deny.
+- IF cost > AL.max_budget_per_action THEN deny.
+- ELSE allow; при soft_limit — warning.
 
-When soft limit is crossed, emit warning but allow actions if all hard constraints pass.
+## Audit requirements
+Фиксировать до/после spend и причину deny.
+REF: L0-CONST

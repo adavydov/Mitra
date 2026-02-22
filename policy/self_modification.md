@@ -1,16 +1,18 @@
-# Self-Modification Policy
+# Self Modification Policy
+ID: P-SELF-01
+Level: L2
+Owner: User (merge)
+Status: active
+Depends on: L0-CONST, C-EVO-01
+Config keys: CFG-AUT-01, CFG-RISK-01
+Required evals: EVAL-REG-01
 
-## Default Stance
-Self-modification is prohibited by default.
+## Intent
+Ограничение самоизменений для сохранения обратимости.
 
-## Explicit Conditions
-Self-modification requires all of the following:
-- user-approved maintenance mode,
-- AL3 or higher override profile,
-- risk acceptance for `CRITICAL` actions,
-- backup/recovery checkpoint before change.
+## Rules
+- По умолчанию self-modification запрещён.
+- Разрешение только при user-approved режиме и с rollback checkpoint.
+- Нарушение переводит систему в AL0.
 
-If any condition is missing, deny action.
-
-## Incident Response
-Unauthorized self-modification is treated as anomaly and forces quarantine fallback to AL0.
+REF: L0-CONST

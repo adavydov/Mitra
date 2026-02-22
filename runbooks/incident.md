@@ -1,18 +1,13 @@
-# Runbook: Incident Response
+# Incident Runbook
+ID: RB-IR-01
+Level: L3
+Depends on: PR-QUAR-01, P-IR-01
+Templates used: CFG-TPL-INCIDENT
+Audit: audit/events.ndjson
 
-## Триггеры
-- `/healthz` недоступен > 2 минут.
-- Рост 4xx/5xx на `/webhook` выше baseline.
-- Подозрение компрометации `SERVICE_SHARED_SECRET`.
-
-## Порядок действий
-1. Зафиксировать время и симптомы инцидента.
-2. Проверить состояние последнего deploy в Render.
-3. Включить усиленное логирование и собрать evidence.
-4. При подозрении на компрометацию — немедленная ротация секрета.
-5. Если деградация продолжается — выполнить rollback релиза.
-6. Если есть риск неконтролируемого выполнения задач — применить quarantine.
-
-## Завершение
-- Подтвердить восстановление (`/healthz`, тестовый webhook).
-- Оформить postmortem и список корректирующих действий.
+## Steps
+1) Активировать quarantine.
+2) Оценить масштаб и источник.
+3) Выполнить rollback при необходимости.
+4) Подготовить incident report.
+REF: L0-CONST

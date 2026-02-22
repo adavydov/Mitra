@@ -1,0 +1,6 @@
+{
+  "id": "CFG-TOOLS-01",
+  "telegram": ["send_message"],
+  "drive": ["create_file", "share_file", "get_link"],
+  "render": ["deploy", "healthcheck"]
+}

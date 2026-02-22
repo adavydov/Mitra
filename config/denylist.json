@@ -1,0 +1,4 @@
+{
+  "id": "CFG-DENY-01",
+  "patterns": ["exfiltrate", "bypass", "credential dump"]
+}

@@ -12,4 +12,4 @@ ID: POLICY-MERGE-RULES
    - `evals-scheduling`
    - `evals-regression`
 3. Branch protection/ruleset must require up-to-date branches and block merge on failing required checks.
-REF: GOV-CONSTITUTION
+REF: L0-CONST

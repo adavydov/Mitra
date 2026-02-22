@@ -1,21 +1,20 @@
 # Access Control Policy
+ID: P-ACCESS-01
+Level: L2
+Owner: User (merge)
+Status: active
+Depends on: L0-CONST, L1-ID, C-AUT-01, C-SEC-01
+Config keys: CFG-AUT-01, CFG-TOOLS-01
+Required evals: EVAL-SEC-TOOLCALL-01
 
-## Допустимые классы входов из Telegram
-- `report_document_request`: допустим к обработке при прохождении policy gate.
-- `unknown`: допустим только в режиме безопасного ответа (без внешних действий).
-- `restricted`: запрещён; выполнение действий блокируется.
+## Intent
+Регулирует допустимые действия по AL/Risk и правам инструментов.
 
-## Матрица допуска
-| Класс | Минимальный Autonomy Level | Минимальный Risk Appetite | Действие |
-|---|---|---|---|
-| report_document_request | medium | medium | allow при соответствии обоим условиям |
-| unknown | low | low | allow (safe-mode only) |
-| restricted | high | high | всегда block |
+## Decision rules
+- IF classification=restricted THEN deny.
+- IF AL/Risk ниже требуемых порогов THEN deny.
+- ELSE allow только для разрешённых инструментов.
 
-## Правила исполнения
-1. Каждый входящий webhook проходит `classification` до запуска обработчиков.
-2. Затем применяется проверка `Autonomy Level` и `Risk Appetite`.
-3. При несоответствии уровней — `block` с причиной:
-   - `autonomy_too_low`
-   - `risk_appetite_too_low`
-4. Для `unknown` запрещены побочные эффекты (изменение внешних систем).
+## Audit requirements
+Логировать request_id, decision, reason, policy IDs, execution_id.
+REF: L0-CONST

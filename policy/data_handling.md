@@ -1,26 +1,20 @@
 # Data Handling Policy
+ID: P-DATA-01
+Level: L2
+Owner: User (merge)
+Status: active
+Depends on: L0-CONST, C-PRIV-01
+Config keys: CFG-DENY-01
+Required evals: EVAL-PRIV-LEAK-01
 
-## Классы данных из Telegram
-Допустимые входные поля для intake:
-- `update_id`
-- `message.text` / `message.caption`
-- `message.chat.id`
-- `message.from.id`
-- `message.date`
-- `message.document.file_name|mime_type|file_size` (без загрузки файла)
+## Intent
+Минимизация данных и защита приватности в intake/логах.
 
-Недопустимо сохранять/логировать:
-- полный bot token, webhook secret,
-- сырые PII-идентификаторы пользователя без маскирования,
-- содержимое вложений документов.
+## Rules
+- Сохранять только минимальные поля Telegram update.
+- Перед логированием выполнять redaction.
+- Не хранить секреты и содержимое вложений в audit.
 
-## Redaction / PII ограничения
-Перед логированием обязательны маски:
-- Email: `user@example.com` → `u***@example.com`
-- Телефоны: маскировать средние цифры (`+7******1234`)
-- Секреты/токены: оставлять только префикс и 4 последних символа (`abcd...9f2a`)
-- Длинные числовые ID (`>=8` цифр): показывать только последние 2 цифры (`******42`)
-
-## Retention
-- Raw payload в постоянное хранилище не записывается в MVP.
-- В runtime допустимы только краткоживущие in-memory структуры для обработки запроса.
+## Audit requirements
+Логировать факт redaction и перечень применённых масок.
+REF: L0-CONST

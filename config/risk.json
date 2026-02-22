@@ -1,5 +1,10 @@
 {
-  "risk_scale": ["LOW", "MEDIUM", "HIGH", "CRITICAL"],
+  "risk_scale": [
+    "LOW",
+    "MEDIUM",
+    "HIGH",
+    "CRITICAL"
+  ],
   "categories": {
     "read": "LOW",
     "write": "MEDIUM",
@@ -13,5 +18,6 @@
     "repeated_denied_actions",
     "unexpected_self_modification",
     "budget_tampering"
-  ]
+  ],
+  "id": "CFG-RISK-01"
 }

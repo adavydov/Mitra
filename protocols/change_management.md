@@ -1,17 +1,14 @@
-# Protocol: Change Management и rollback релиза
+# Change Management Protocol
+ID: PR-CHG-01
+Level: L2
+Depends on: P-SELF-01, C-EVO-01
+Config keys: CFG-AUT-01
+Required evals: EVAL-REG-01
 
-## Перед релизом
-- Проверить changelog и влияние на policy/evidence слои.
-- Убедиться, что заданы env vars: `SERVICE_SHARED_SECRET`, `EVIDENCE_LOG_PATH` (опционально).
-- Выполнить локальные smoke-тесты.
-
-## Деплой
-1. Запустить deploy через Render с указанием целевой ветки.
-2. Проверить успешный старт процесса и endpoint `/healthz`.
-3. Отправить тестовый webhook с валидным секретом.
-
-## Откат
-1. В Render выбрать предыдущий стабильный deploy и нажать rollback.
-2. Проверить `/healthz` после rollback.
-3. Повторить тестовый webhook и сверить evidence.
-4. Зафиксировать rollback в журнале изменений с причиной.
+## Algorithm
+1) Hypothesis and risk.
+2) Branch-only implementation.
+3) Tests + evals.
+4) Canary/limited rollout.
+5) Monitor and rollback on red indicators.
+REF: L0-CONST

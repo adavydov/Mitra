@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["id", "timezone", "windows"],
+  "properties": {
+    "id": {"type": "string"},
+    "timezone": {"type": "string"},
+    "windows": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["start", "end", "days"],
+        "properties": {
+          "start": {"type": "string"},
+          "end": {"type": "string"},
+          "days": {"type": "array", "items": {"type": "integer"}}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
