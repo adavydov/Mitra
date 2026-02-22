@@ -1,0 +1,15 @@
+{
+  "currency": "tokens",
+  "window": "daily",
+  "hard_limit": 5000,
+  "soft_limit": 4000,
+  "tool_costs": {
+    "read": 1,
+    "list": 1,
+    "search": 2,
+    "write": 5,
+    "exec_local": 20,
+    "exec_network": 100,
+    "deploy": 250
+  }
+}
