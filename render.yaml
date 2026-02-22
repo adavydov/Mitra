@@ -1,13 +1,11 @@
 services:
   - type: web
-    name: mitra-webhook
+    name: mitra-runtime
     env: python
-    plan: starter
-    buildCommand: "python -m compileall service"
-    startCommand: "python service/app.py"
-    healthCheckPath: "/healthz"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m runtime.app
     envVars:
-      - key: SERVICE_SHARED_SECRET
-        sync: false
-      - key: EVIDENCE_LOG_PATH
-        value: "./data/evidence.log"
+      - key: AUTONOMY_LEVEL
+        value: low
+      - key: RISK_APPETITE
+        value: low
