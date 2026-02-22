@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Mitra config",
+  "type": "object",
+  "required": ["name", "environment", "features"],
+  "properties": {
+    "name": { "type": "string" },
+    "environment": { "type": "string", "enum": ["dev", "staging", "prod"] },
+    "features": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "maxWorkers": { "type": "integer" },
+    "secureMode": { "type": "boolean" }
+  },
+  "additionalProperties": false
+}

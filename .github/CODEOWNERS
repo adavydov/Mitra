@@ -1,0 +1,10 @@
+# Default ownership
+* @user
+
+# Governance core documents are owned only by the User
+governance/constitution.md @user
+governance/identity.md @user
+
+# Policy/Codex changes must be explicitly approved by the User
+policy/** @user
+codex/** @user
