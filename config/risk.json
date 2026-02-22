@@ -1,0 +1,17 @@
+{
+  "risk_scale": ["LOW", "MEDIUM", "HIGH", "CRITICAL"],
+  "categories": {
+    "read": "LOW",
+    "write": "MEDIUM",
+    "exec_local": "MEDIUM",
+    "exec_network": "HIGH",
+    "deploy": "HIGH",
+    "self_modify": "CRITICAL"
+  },
+  "anomaly_triggers": [
+    "policy_bypass_attempt",
+    "repeated_denied_actions",
+    "unexpected_self_modification",
+    "budget_tampering"
+  ]
+}
