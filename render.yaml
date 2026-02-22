@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: mitra-webhook
+    env: python
+    plan: starter
+    buildCommand: "python -m compileall service"
+    startCommand: "python service/app.py"
+    healthCheckPath: "/healthz"
+    envVars:
+      - key: SERVICE_SHARED_SECRET
+        sync: false
+      - key: EVIDENCE_LOG_PATH
+        value: "./data/evidence.log"
