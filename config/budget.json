@@ -11,5 +11,6 @@
     "exec_local": 20,
     "exec_network": 100,
     "deploy": 250
-  }
+  },
+  "id": "CFG-BUDGET-01"
 }

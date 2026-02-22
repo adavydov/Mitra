@@ -1,18 +1,13 @@
-# Protocol: Quarantine
+# Quarantine Protocol
+ID: PR-QUAR-01
+Level: L2
+Depends on: P-IR-01, C-SEC-01
+Config keys: CFG-AUT-01
+Required evals: EVAL-REG-01
 
-## Когда активировать
-- Компрометация webhook-секрета.
-- Некорректная оркестрация задач, создающая каскадные ошибки.
-- Необъяснимый всплеск вредоносных/невалидных webhook-событий.
-
-## Шаги quarantine
-1. Временно отключить внешние webhook-источники (или ограничить ingress на стороне отправителя).
-2. Заблокировать обработку новых событий (например, временно отклонять всё по policy).
-3. Снять снимок текущих логов/evidence для форензики.
-4. Выполнить проверку целостности конфигурации и переменных окружения.
-5. Провести ротацию секрета перед возвратом в нормальный режим.
-
-## Выход из quarantine
-- Пройти smoke-check: `/healthz` + валидный тестовый webhook.
-- Убедиться, что невалидные события отклоняются.
-- Согласовать возврат с incident commander и release manager.
+## Algorithm
+1) Switch AL to AL0.
+2) Block side-effectful actions.
+3) Snapshot logs and investigate.
+4) Recover via controlled rollback.
+REF: L0-CONST

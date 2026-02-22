@@ -1,16 +1,14 @@
-# Security governance для Codex/Mitra
+# Security Codex
+ID: C-SEC-01
+Level: L1
+Owner: User
+Status: active
+Depends on: L0-CONST, L1-ID
+Required evals: EVAL-SEC-INJECT-01, EVAL-SEC-TOOLCALL-01
 
-## Базовые требования
-- Все production-секреты хранятся только в платформенном secret manager (Render env vars).
-- Репозиторий содержит только шаблоны (`.env.example`), но не реальные значения.
-- Любой инцидент с секретом классифицируется как security incident и требует postmortem.
+## Нормы
+- Минимальные привилегии и сегментация секретов.
+- Обязательная ротация секретов.
+- Обязательный incident response и quarantine при подозрении на компрометацию.
 
-## Политика ротации
-- `SERVICE_SHARED_SECRET` ротируется по расписанию (90 дней) и по событию риска.
-- Ротация проводится с подтверждением вторым ответственным (four-eyes principle).
-- После ротации выполняется контрольный webhook-запрос и проверка evidence-журнала.
-
-## Аудит и evidence
-- Каждое webhook-решение (accepted/rejected) логируется в evidence layer.
-- Логи должны экспортироваться во внешний централизованный лог-канал для неизменяемого хранения.
-- Срок хранения audit-следов — минимум 180 дней.
+REF: L0-CONST

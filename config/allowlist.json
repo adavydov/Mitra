@@ -1,0 +1,5 @@
+{
+  "id": "CFG-ALLOW-01",
+  "hosts": ["api.telegram.org", "www.googleapis.com"],
+  "tools": ["telegram", "drive"]
+}

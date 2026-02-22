@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["id", "telegram", "drive", "render"],
+  "properties": {
+    "id": {"type": "string"},
+    "telegram": {"type": "array", "items": {"type": "string"}},
+    "drive": {"type": "array", "items": {"type": "string"}},
+    "render": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": false
+}
