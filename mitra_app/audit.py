@@ -18,6 +18,22 @@ def log_event(event: dict[str, object]) -> None:
         audit_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def log_budget_usage(category: str, amount: int = 1, metadata: dict[str, object] | None = None) -> None:
+    path = os.getenv("MITRA_BUDGET_LEDGER", "audit/budget_ledger.ndjson")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    payload: dict[str, object] = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "category": category,
+        "amount": amount,
+    }
+    if metadata:
+        payload["metadata"] = metadata
+
+    with open(path, "a", encoding="utf-8") as ledger_file:
+        ledger_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
 def log_report_event(
     action_id: str,
     file_id: str,

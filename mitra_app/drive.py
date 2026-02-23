@@ -123,6 +123,23 @@ def _build_drive_service(credentials_info: dict[str, Any]):
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
 
+async def check_drive_folder_access() -> None:
+    folder_id = os.getenv("DRIVE_ROOT_FOLDER_ID")
+    if not folder_id:
+        raise DriveNotConfigured("Missing DRIVE_ROOT_FOLDER_ID")
+
+    credentials_info = {}
+    if get_drive_auth_mode() == "service_account":
+        credentials_info = _load_service_account_info()
+    service = _build_drive_service(credentials_info)
+
+    service.files().get(
+        fileId=folder_id,
+        fields="id",
+        supportsAllDrives=True,
+    ).execute()
+
+
 async def upload_markdown(title: str, markdown_body: str) -> DriveUploadResult:
     folder_id = os.getenv("DRIVE_ROOT_FOLDER_ID")
     if not folder_id:
@@ -155,6 +172,14 @@ async def upload_markdown(title: str, markdown_body: str) -> DriveUploadResult:
 async def upload_markdown_document(title: str, markdown_body: str) -> DriveUploadResult:
     """Backward-compatible alias for older call sites."""
     return await upload_markdown(title=title, markdown_body=markdown_body)
+
+
+async def delete_file(file_id: str) -> None:
+    credentials_info = {}
+    if get_drive_auth_mode() == "service_account":
+        credentials_info = _load_service_account_info()
+    service = _build_drive_service(credentials_info)
+    service.files().delete(fileId=file_id).execute()
 
 
 async def list_recent_files(limit: int = 5) -> list[DriveFile]:

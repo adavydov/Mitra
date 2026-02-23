@@ -30,7 +30,11 @@ class PolicyEngine:
 
         self.current_al = self.autonomy["current_level"]
         self.current_spend = 0
-        self.denied_streak = 0
+        self.denied_streak_by_category: dict[str, int] = {}
+
+    @staticmethod
+    def _denial_categories() -> tuple[str, ...]:
+        return ("tool_permission", "risk", "budget", "config")
 
     def evaluate(self, action: str, declared_risk: str | None = None) -> Decision:
         """Evaluate AL, Risk, Budget and ToolPermission for an action."""
@@ -41,8 +45,11 @@ class PolicyEngine:
         if not level:
             return self._deny([f"Unknown autonomy level: {self.current_al}"], anomaly=True)
 
+        denied_categories: set[str] = set()
+
         if action not in level["allowed_tools"]:
             reasons.append(f"Tool '{action}' is not allowed for {self.current_al}")
+            denied_categories.add("tool_permission")
 
         # Risk
         mapped_risk = self.risk["categories"].get(action, "CRITICAL")
@@ -51,26 +58,32 @@ class PolicyEngine:
             reasons.append(
                 f"Risk '{effective_risk}' exceeds {self.current_al} max risk '{level['max_risk']}'"
             )
+            denied_categories.add("risk")
 
         # Budget
         tool_cost = self.budget["tool_costs"].get(action)
+        budget_exceeded = False
         if tool_cost is None:
             reasons.append(f"No budget cost configured for tool '{action}'")
+            denied_categories.add("config")
         else:
             if tool_cost > level["max_budget_per_action"]:
                 reasons.append(
                     f"Tool cost {tool_cost} exceeds {self.current_al} per-action max "
                     f"{level['max_budget_per_action']}"
                 )
+                denied_categories.add("budget")
+                budget_exceeded = True
             if self.current_spend + tool_cost > self.budget["hard_limit"]:
                 reasons.append("Projected spend exceeds hard limit")
+                denied_categories.add("budget")
+                budget_exceeded = True
 
         if reasons:
-            self.denied_streak += 1
-            anomaly = self.denied_streak >= 3
+            anomaly = budget_exceeded or self._apply_denial_streaks(denied_categories)
             return self._deny(reasons, anomaly=anomaly)
 
-        self.denied_streak = 0
+        self.denied_streak_by_category = {}
         return Decision(allowed=True, reasons=["Allowed"])
 
     def guarded_action(
@@ -96,11 +109,36 @@ class PolicyEngine:
             return self._deny([f"Anomaly detected: {anomaly_type}"], anomaly=True)
         return Decision(allowed=True, reasons=["No anomaly action required"])
 
+
+    def resume_from_quarantine(
+        self, requester_user_id: int, allowlisted_user_ids: set[int] | list[int] | tuple[int, ...]
+    ) -> Decision:
+        """Resume to default autonomy level only for allowlisted users."""
+        if requester_user_id not in set(allowlisted_user_ids):
+            return Decision(allowed=False, reasons=["Resume denied: requester is not allowlisted"])
+
+        self.current_al = self.autonomy["default_level"]
+        self.denied_streak_by_category = {}
+        return Decision(allowed=True, reasons=[f"Resumed to {self.current_al}"])
+
     def _deny(self, reasons: list[str], anomaly: bool = False) -> Decision:
         if anomaly:
             self.current_al = "AL0"
+            self.denied_streak_by_category = {}
             reasons.append("Quarantine fallback activated: autonomy downgraded to AL0")
         return Decision(allowed=False, reasons=reasons, quarantine_triggered=anomaly)
+
+    def _apply_denial_streaks(self, denied_categories: set[str]) -> bool:
+        if not denied_categories:
+            return False
+
+        for category in self._denial_categories():
+            if category in denied_categories:
+                self.denied_streak_by_category[category] = self.denied_streak_by_category.get(category, 0) + 1
+            else:
+                self.denied_streak_by_category[category] = 0
+
+        return any(streak >= 5 for streak in self.denied_streak_by_category.values())
 
     def _read_json(self, relpath: str) -> dict[str, Any]:
         with (self.root / relpath).open("r", encoding="utf-8") as f:
