@@ -58,6 +58,13 @@ class DriveUploadResult:
     web_view_link: str | None
 
 
+@dataclass
+class DriveFile:
+    file_id: str
+    name: str
+    web_view_link: str | None
+
+
 def _load_service_account_info() -> dict[str, Any]:
     payload_b64 = os.getenv("DRIVE_SERVICE_ACCOUNT_JSON_B64")
     payload_raw = os.getenv("DRIVE_SERVICE_ACCOUNT_JSON")
@@ -148,3 +155,40 @@ async def upload_markdown(title: str, markdown_body: str) -> DriveUploadResult:
 async def upload_markdown_document(title: str, markdown_body: str) -> DriveUploadResult:
     """Backward-compatible alias for older call sites."""
     return await upload_markdown(title=title, markdown_body=markdown_body)
+
+
+async def list_recent_files(limit: int = 5) -> list[DriveFile]:
+    folder_id = os.getenv("DRIVE_ROOT_FOLDER_ID")
+    if not folder_id:
+        raise DriveNotConfigured("Missing DRIVE_ROOT_FOLDER_ID")
+
+    credentials_info = {}
+    if get_drive_auth_mode() == "service_account":
+        credentials_info = _load_service_account_info()
+    service = _build_drive_service(credentials_info)
+
+    shared_drive_id = os.getenv("DRIVE_SHARED_DRIVE_ID")
+
+    list_kwargs: dict[str, Any] = {
+        "q": f"'{folder_id}' in parents and trashed = false",
+        "orderBy": "modifiedTime desc",
+        "pageSize": limit,
+        "fields": "files(id,name,webViewLink)",
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
+    }
+    if shared_drive_id:
+        list_kwargs["corpora"] = "drive"
+        list_kwargs["driveId"] = shared_drive_id
+
+    response = service.files().list(**list_kwargs).execute()
+    files = response.get("files", [])
+
+    return [
+        DriveFile(
+            file_id=str(item.get("id", "")),
+            name=str(item.get("name", "")),
+            web_view_link=item.get("webViewLink"),
+        )
+        for item in files
+    ]

@@ -1,6 +1,5 @@
 import logging
 import os
-import json
 from collections import OrderedDict
 from datetime import datetime, timezone
 from threading import Lock
@@ -126,12 +125,11 @@ def _audit_dedup(update_id: int, user_id: int | None, chat_id: int | None) -> No
         "outcome": "dedup",
     }
 
+    logger.info("telegram_dedup", extra=event)
+
     log_event = getattr(audit, "log_event", None)
     if callable(log_event):
         log_event(event)
-        return
-
-    logger.info("telegram_dedup", extra=event)
 
 
 def _build_report_title(now: datetime) -> str:
@@ -177,6 +175,34 @@ def _sanitize_report_error(exc: Exception) -> str:
         return f"Drive error: {status} {reason}"
 
     return "Report failed"
+
+
+def _audit_drive_check(user_id: int | None, chat_id: int | None, auth_mode: str, outcome: str, detail: str) -> None:
+    event = {
+        "event": "drive_check",
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "auth_mode": auth_mode,
+        "outcome": outcome,
+        "detail": detail,
+    }
+
+    log_event = getattr(audit, "log_event", None)
+    if callable(log_event):
+        log_event(event)
+        return
+
+    logger.info("drive_check", extra=event)
+
+
+def _safe_drive_check_error(exc: Exception) -> str:
+    if isinstance(exc, DriveNotConfigured):
+        return "drive_not_configured"
+
+    if isinstance(exc, HttpError):
+        return _sanitize_drive_http_error(exc)
+
+    return "drive_check_failed"
 
 
 @app.get("/healthz")
@@ -235,6 +261,20 @@ async def telegram_webhook(
             reply_text = f"user_id={user_id}, chat_id={chat_id}"
         elif not allowlist_configured:
             reply_text = "Allowlist not configured. Set ALLOWED_TELEGRAM_USER_IDS."
+        elif text.startswith("/reports"):
+            try:
+                files = await list_recent_files(limit=5)
+                if not files:
+                    reply_text = "No reports found"
+                else:
+                    lines = ["Latest reports:"]
+                    for drive_file in files:
+                        link = drive_file.web_view_link or drive_file.file_id
+                        lines.append(f"- {drive_file.name}: {link}")
+                    reply_text = "\n".join(lines)
+            except Exception as exc:
+                reply_text = _sanitize_report_error(exc)
+                logger.exception("report_list_failed")
         elif text.startswith("/report"):
             report_text = text[len("/report") :].strip()
             action_id = f"act-{uuid4().hex[:12]}"
@@ -300,6 +340,18 @@ async def telegram_webhook(
                         user_id=user_id,
                         chat_id=chat_id,
                     )
+        elif text.startswith("/drive_check"):
+            auth_mode = get_drive_auth_mode()
+
+            try:
+                await check_drive_folder_access()
+                reply_text = f"OK (auth={auth_mode}, folder ok)"
+                _audit_drive_check(user_id=user_id, chat_id=chat_id, auth_mode=auth_mode, outcome="success", detail="folder ok")
+            except Exception as exc:
+                detail = _safe_drive_check_error(exc)
+                reply_text = detail
+                logger.exception("drive_check_command_failed")
+                _audit_drive_check(user_id=user_id, chat_id=chat_id, auth_mode=auth_mode, outcome="error", detail=detail)
         elif text.startswith("/help") or text.startswith("/start"):
             reply_text = "Commands: /status, /oauth_status, /report <text>"
         else:
