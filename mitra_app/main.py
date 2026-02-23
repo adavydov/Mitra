@@ -24,7 +24,6 @@ from mitra_app.policy_enforcer import CommandPolicy, CommandPolicyEnforcer
 from mitra_app.drive import (
     DriveNotConfigured,
     OAuthRefreshInvalidGrant,
-    check_drive_folder_access,
     delete_file,
     get_drive_auth_mode,
     get_last_oauth_refresh_time,
@@ -36,7 +35,7 @@ from mitra_app.llm.anthropic import AnthropicClient
 from mitra_app.research import ResearchError, build_research_reply, run_research
 from mitra_app.telegram import ensure_webhook, send_message
 from mitra_app.search import SearchRateLimitExceeded, brave_web_search, format_search_results
-from mitra_app.llm.anthropic import AnthropicClient
+from mitra_app import github
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
@@ -151,6 +150,10 @@ def _audit_think_command(action_id: str, user_id: int | None, command: str, outc
     )
 
 
+def _extract_think_prompt(text: str) -> str:
+    return text[len("/think") :].strip()[:240]
+
+
 def _sanitize_drive_http_error(exc: HttpError) -> str:
     status_code = getattr(exc, "status_code", None)
     if status_code is None:
@@ -185,6 +188,7 @@ _COMMAND_POLICIES: dict[str, CommandPolicy] = {
     "/smoke_deep": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="search"),
     "/reports": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
     "/report": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
+    "/pr_status": CommandPolicy(required_al="AL1", risk_level="R1", budget_category="search"),
     "/drive_check": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
 }
 
@@ -355,6 +359,43 @@ async def _create_github_issue(title: str, body: str) -> tuple[int, str]:
         raise RuntimeError("GitHub issue create returned invalid response")
 
     return issue_number, issue_url
+
+
+
+
+def _parse_pr_status_command(text: str) -> str | None:
+    body = text[len("/pr_status") :].strip()
+    return body or None
+
+
+async def _build_pr_status_reply(ref: str) -> str:
+    try:
+        issue_number = int(ref)
+    except ValueError:
+        return "Usage: /pr_status <issue#|pr#>"
+
+    try:
+        linked_pr = await github.find_linked_pr(issue_number)
+        if linked_pr is None:
+            return f"No linked PR found for issue #{issue_number}"
+
+        pr_status = await github.get_pr_status(linked_pr.number)
+        checks = await github.get_pr_checks_summary(pr_status.head_sha)
+    except Exception:
+        logger.exception("telegram_pr_status_failed", extra={"issue_number": issue_number})
+        return "Failed to fetch PR status"
+
+    state = pr_status.state or "unknown"
+    if pr_status.draft:
+        state = f"{state}, draft"
+    if pr_status.merged:
+        state = "merged"
+
+    return (
+        f"PR: {linked_pr.html_url}\n"
+        f"State: {state}\n"
+        f"Checks: total={checks.total}, success={checks.successful}, failed={checks.failed}, pending={checks.pending}"
+    )
 
 
 def _load_allowed_user_ids() -> set[int]:
@@ -643,15 +684,7 @@ async def drive_check() -> dict[str, str]:
     if auth_mode == "oauth" and last_refresh_at:
         payload["last_refresh_at"] = last_refresh_at
 
-    try:
-        status, _ = await _run_drive_check(auth_mode)
-        payload["status"] = status
-        return payload
-    except Exception as exc:
-        payload["status"] = _safe_drive_check_error(exc)
-        logger.exception("drive_check_endpoint_failed")
-        _audit_drive_check(user_id=None, chat_id=None, auth_mode=auth_mode, outcome="error", detail=payload["status"])
-        return payload
+    return payload
 
 
 @app.post("/telegram/webhook")
@@ -933,7 +966,13 @@ async def telegram_webhook(
                         action_type="/report",
                         log_level="error",
                     )
-        elif text == "/pr" or text.startswith("/pr ") or text.startswith("/pr\n"):
+        elif text.startswith("/pr_status"):
+            ref = _parse_pr_status_command(text)
+            if ref is None:
+                reply_text = "Usage: /pr_status <issue#|pr#>"
+            else:
+                reply_text = await _build_pr_status_reply(ref)
+        elif text.startswith("/pr"):
             parsed = _parse_pr_command(text)
             if not parsed:
                 reply_text = "Usage: /pr <title>\\n<spec>"
@@ -998,11 +1037,8 @@ async def telegram_webhook(
                 reply_text = "Forbidden"
         elif text.startswith("/budget"):
             reply_text = await budget_ledger.render_budget()
-        elif text == "/pr" or text.startswith("/pr ") or text.startswith("/pr\n"):
-            await budget_ledger.record_github_action()
-            reply_text = "Unknown command"
         elif text.startswith("/help") or text.startswith("/start"):
-            reply_text = "Commands: /status, /oauth_status, /smoke, /research <query>, /report <text>"
+            reply_text = "Commands: /status, /oauth_status, /research <query>, /report <text>, /pr_status <issue_number>"
         else:
             reply_text = "Unknown command"
 
