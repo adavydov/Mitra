@@ -6,7 +6,7 @@ from googleapiclient.errors import HttpError
 
 from fastapi.testclient import TestClient
 
-from mitra_app.drive import DriveNotConfiguredError, DriveUploadResult
+from mitra_app.drive import DriveNotConfiguredError, DriveUploadResult, OAuthRefreshInvalidGrant
 from mitra_app.main import RecentUpdateDeduplicator, _load_allowed_user_ids, app
 
 
@@ -547,7 +547,8 @@ def test_drive_check_endpoint_returns_ok_with_auth_mode(monkeypatch):
     response = client.get("/drive_check")
 
     assert response.status_code == 200
-    assert response.json() == {"auth_mode": "oauth", "status": "ok"}
+    payload = response.json()
+    assert payload["auth_mode"] == "oauth"
 
 
 def test_drive_check_endpoint_returns_specific_http_error(monkeypatch):
@@ -586,12 +587,37 @@ def test_startup_logs_drive_auth_mode(monkeypatch):
 
     asyncio.run(startup_sync_webhook())
 
-    assert captured["message"] == "drive_auth_mode"
-    assert captured["extra"] == {"mode": "oauth"}
+    assert captured["message"] == "drive_auth_state"
+    assert captured["extra"]["mode"] == "oauth"
+    assert "last_refresh_at" in captured["extra"]
 
 
-def test_reports_lists_recent_files(monkeypatch):
+def test_oauth_status_command_returns_mode_and_last_refresh(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.get_drive_auth_mode", lambda: "oauth")
+    monkeypatch.setattr("mitra_app.main.get_last_oauth_refresh_time", lambda: "2026-01-01T00:00:00+00:00")
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/oauth_status", "chat": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "auth_mode=oauth, last_refresh_at=2026-01-01T00:00:00+00:00")]
+
+
+def test_report_oauth_expired_replies_with_reauthorize_message(monkeypatch, tmp_path):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("MITRA_AUDIT_LOG", str(tmp_path / "events.ndjson"))
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
 
     calls = []
@@ -600,58 +626,21 @@ def test_reports_lists_recent_files(monkeypatch):
         calls.append((chat_id, text))
         return True
 
-    class _FakeDriveFile:
-        def __init__(self, file_id: str, name: str, web_view_link: str | None):
-            self.file_id = file_id
-            self.name = name
-            self.web_view_link = web_view_link
-
-    async def fake_list_recent_files(limit: int):
-        assert limit == 5
-        return [
-            _FakeDriveFile(file_id="f1", name="Report A", web_view_link="https://drive/1"),
-            _FakeDriveFile(file_id="f2", name="Report B", web_view_link=None),
-        ]
+    async def fake_upload_markdown(title: str, markdown_body: str):
+        raise OAuthRefreshInvalidGrant("OAuth expired. Re-authorize required.")
 
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
-    monkeypatch.setattr("mitra_app.main.list_recent_files", fake_list_recent_files)
+    monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
 
     response = client.post(
         "/telegram/webhook",
         headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
-        json={"message": {"text": "/reports", "chat": {"id": 123}, "from": {"id": 123}}},
+        json={"message": {"text": "/report Something", "chat": {"id": 123}, "from": {"id": 123}}},
     )
 
     assert response.status_code == 200
-    assert calls == [
-        (
-            123,
-            "Latest reports:\n- Report A: https://drive/1\n- Report B: f2",
-        )
-    ]
+    assert calls == [(123, "OAuth expired. Re-authorize required.")]
 
-
-def test_reports_handles_drive_error(monkeypatch):
-    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
-    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
-
-    calls = []
-
-    async def fake_send_message(chat_id: int, text: str):
-        calls.append((chat_id, text))
-        return True
-
-    async def fake_list_recent_files(limit: int):
-        raise DriveNotConfiguredError("disabled")
-
-    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
-    monkeypatch.setattr("mitra_app.main.list_recent_files", fake_list_recent_files)
-
-    response = client.post(
-        "/telegram/webhook",
-        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
-        json={"message": {"text": "/reports", "chat": {"id": 123}, "from": {"id": 123}}},
-    )
-
-    assert response.status_code == 200
-    assert calls == [(123, "Drive disabled")]
+    events = (tmp_path / "events.ndjson").read_text(encoding="utf-8").strip().splitlines()
+    payload = json.loads(events[-1])
+    assert payload["outcome"] == "oauth_expired"

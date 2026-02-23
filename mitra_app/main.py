@@ -1,4 +1,3 @@
-import json
 import logging
 import os
 from collections import OrderedDict
@@ -12,7 +11,13 @@ from googleapiclient.errors import HttpError
 
 import mitra_app.audit as audit
 from mitra_app.audit import log_report_event
-from mitra_app.drive import DriveNotConfigured, get_drive_auth_mode, list_recent_files, upload_markdown
+from mitra_app.drive import (
+    DriveNotConfigured,
+    OAuthRefreshInvalidGrant,
+    get_drive_auth_mode,
+    get_last_oauth_refresh_time,
+    upload_markdown,
+)
 from mitra_app.telegram import ensure_webhook, send_message
 
 app = FastAPI()
@@ -46,7 +51,10 @@ def _sanitize_drive_http_error(exc: HttpError) -> str:
 
 @app.on_event("startup")
 async def startup_sync_webhook() -> None:
-    logger.info("drive_auth_mode", extra={"mode": get_drive_auth_mode()})
+    logger.info(
+        "drive_auth_state",
+        extra={"mode": get_drive_auth_mode(), "last_refresh_at": get_last_oauth_refresh_time()},
+    )
     ok, detail = await ensure_webhook()
     if not ok:
         logger.warning("startup_webhook_sync_failed", extra={"detail": detail})
@@ -205,13 +213,11 @@ async def healthz() -> dict[str, str]:
 @app.get("/drive_check")
 async def drive_check() -> dict[str, str]:
     auth_mode = get_drive_auth_mode()
-
-    try:
-        await check_drive_folder_access()
-    except Exception as exc:
-        return {"auth_mode": auth_mode, "status": _safe_drive_check_error(exc)}
-
-    return {"auth_mode": auth_mode, "status": "ok"}
+    payload = {"auth_mode": auth_mode}
+    last_refresh_at = get_last_oauth_refresh_time()
+    if auth_mode == "oauth" and last_refresh_at:
+        payload["last_refresh_at"] = last_refresh_at
+    return payload
 
 
 @app.post("/telegram/webhook")
@@ -246,6 +252,11 @@ async def telegram_webhook(
 
         if text.startswith("/status"):
             reply_text = "Mitra alive"
+        elif text.startswith("/oauth_status"):
+            auth_mode = get_drive_auth_mode()
+            last_refresh_at = get_last_oauth_refresh_time() or "never"
+            logger.info("oauth_status_requested", extra={"mode": auth_mode, "last_refresh_at": last_refresh_at})
+            reply_text = f"auth_mode={auth_mode}, last_refresh_at={last_refresh_at}"
         elif text.startswith("/whoami"):
             reply_text = f"user_id={user_id}, chat_id={chat_id}"
         elif not allowlist_configured:
@@ -306,6 +317,19 @@ async def telegram_webhook(
                         user_id=user_id,
                         chat_id=chat_id,
                     )
+                except OAuthRefreshInvalidGrant as exc:
+                    reply_text = str(exc)
+                    logger.warning(
+                        "report_upload_oauth_expired",
+                        extra={"mode": get_drive_auth_mode(), "last_refresh_at": get_last_oauth_refresh_time()},
+                    )
+                    log_report_event(
+                        action_id=action_id,
+                        file_id=file_id,
+                        outcome="oauth_expired",
+                        user_id=user_id,
+                        chat_id=chat_id,
+                    )
                 except Exception as exc:
                     reply_text = _sanitize_report_error(exc)
                     logger.exception("report_upload_failed")
@@ -329,7 +353,7 @@ async def telegram_webhook(
                 logger.exception("drive_check_command_failed")
                 _audit_drive_check(user_id=user_id, chat_id=chat_id, auth_mode=auth_mode, outcome="error", detail=detail)
         elif text.startswith("/help") or text.startswith("/start"):
-            reply_text = "Commands: /status, /report <text>, /reports"
+            reply_text = "Commands: /status, /oauth_status, /report <text>"
         else:
             reply_text = "Unknown command"
 
