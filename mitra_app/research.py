@@ -6,6 +6,8 @@ from typing import Any
 
 import httpx
 
+from mitra_app.budget_ledger import budget_ledger
+
 
 class ResearchError(RuntimeError):
     """Raised when research pipeline cannot complete."""
@@ -86,6 +88,7 @@ async def summarize_with_sonnet(query: str, items: list[SearchItem]) -> str:
             response = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
             response.raise_for_status()
         payload = response.json()
+        await budget_ledger.record_llm_usage(payload.get("usage"))
         content = payload.get("content") or []
         text_parts = [part.get("text", "") for part in content if part.get("type") == "text"]
         summary = "\n".join(part.strip() for part in text_parts if part.strip()).strip()

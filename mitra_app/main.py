@@ -125,6 +125,7 @@ _COMMAND_POLICIES: dict[str, CommandPolicy] = {
     "/reports": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
     "/report": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
     "/drive_check": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
+    "/budget": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
 }
 
 _policy_enforcer = CommandPolicyEnforcer(Path(__file__).resolve().parents[1])
@@ -629,6 +630,7 @@ async def telegram_webhook(
                     file_id = upload.file_id
                     link = upload.web_view_link or upload.file_id
                     reply_text = f"Saved: {link}"
+                    await budget_ledger.record_drive_write()
                     log_report_event(
                         action_id=action_id,
                         telegram_update_id=telegram_update_id,
@@ -707,6 +709,7 @@ async def telegram_webhook(
 
                 try:
                     issue_number, issue_url = await _create_github_issue(title=title, body=issue_body)
+                    await budget_ledger.record_github_write()
                     reply_text = f"Created: {issue_url}"
                     outcome = "success"
                 except Exception:
@@ -748,9 +751,6 @@ async def telegram_webhook(
                 reply_text = "Forbidden"
         elif text.startswith("/budget"):
             reply_text = await budget_ledger.render_budget()
-        elif text.startswith("/pr"):
-            await budget_ledger.record_github_action()
-            reply_text = "Unknown command"
         elif text.startswith("/help") or text.startswith("/start"):
             reply_text = "Commands: /status, /oauth_status, /research <query>, /report <text>"
         else:
