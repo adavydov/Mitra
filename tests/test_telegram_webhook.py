@@ -113,8 +113,30 @@ def test_think_command_returns_short_read_only_response(monkeypatch):
     async def forbidden_upload_markdown(*args, **kwargs):
         raise AssertionError("/think must not touch Drive")
 
+    async def forbidden_brave_web_search(*args, **kwargs):
+        raise AssertionError("/think must not touch web search")
+
+    async def forbidden_create_github_issue(*args, **kwargs):
+        raise AssertionError("/think must not touch GitHub")
+
+    class FakeThinkLlm:
+        def create_message(self, *, messages, system):
+            assert "Не используйте веб" in system
+            assert messages[0]["content"] == "Составь план запуска"
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Короткий ответ: Сделать dry-run.\nДопущения: данные доступны.\nСледующие шаги: проверить риски.",
+                    }
+                ]
+            }
+
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
     monkeypatch.setattr("mitra_app.main.upload_markdown", forbidden_upload_markdown)
+    monkeypatch.setattr("mitra_app.main.brave_web_search", forbidden_brave_web_search)
+    monkeypatch.setattr("mitra_app.main._create_github_issue", forbidden_create_github_issue)
+    monkeypatch.setattr("mitra_app.main.AnthropicClient", FakeThinkLlm)
 
     response = client.post(
         "/telegram/webhook",
@@ -126,9 +148,9 @@ def test_think_command_returns_short_read_only_response(monkeypatch):
     assert response.json() == {"status": "ok"}
     assert len(calls) == 1
     reply = calls[0][1]
-    assert "Что сделал:" in reply
+    assert "Короткий ответ:" in reply
     assert "Допущения:" in reply
-    assert "Риск:" in reply
+    assert "Следующие шаги:" in reply
 
 
 def test_think_command_redacts_secret_assignments_and_limits_prompt(monkeypatch):
@@ -141,7 +163,15 @@ def test_think_command_redacts_secret_assignments_and_limits_prompt(monkeypatch)
         calls.append((chat_id, text))
         return True
 
+    prompts = []
+
+    class FakeThinkLlm:
+        def create_message(self, *, messages, system):
+            prompts.append(messages[0]["content"])
+            return {"content": [{"type": "text", "text": "Короткий ответ: ok\nДопущения: ok\nСледующие шаги: ok"}]}
+
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.AnthropicClient", FakeThinkLlm)
 
     long_tail = "x" * 1200
     response = client.post(
@@ -157,10 +187,43 @@ def test_think_command_redacts_secret_assignments_and_limits_prompt(monkeypatch)
     )
 
     assert response.status_code == 200
+    assert len(prompts) == 1
+    assert "12345" not in prompts[0]
+    assert "[REDACTED]" in prompts[0]
     reply = calls[0][1]
-    assert "12345" not in reply
-    assert "[REDACTED]" in reply
-    assert len(reply) < 450
+    assert len(reply) <= 900
+
+
+def test_think_command_without_text_returns_usage_and_audits(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+    audits = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    def fake_log_event(event: dict[str, object]):
+        audits.append(event)
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/think", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Usage: /think <вопрос/задача>")]
+    event = [entry for entry in audits if entry.get("event") == "telegram_think"][0]
+    assert event["action_id"].startswith("act-")
+    assert event["user_id"] == 123
+    assert event["command"] == "/think"
+    assert event["outcome"] == "usage"
 
 
 def test_allowlist_denied_user_returns_200_without_sending_message(monkeypatch):
