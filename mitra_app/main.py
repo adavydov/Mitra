@@ -614,8 +614,9 @@ async def telegram_webhook(
                     reply_text = build_research_reply(query, items, summary)
                 except ResearchError as exc:
                     reply_text = str(exc)
-                except Exception:
-                    reply_text = "Research failed"
+                except Exception as exc:
+                    short_reason = " ".join(str(exc).splitlines()).strip()[:160] or exc.__class__.__name__
+                    reply_text = f"Research failed: {short_reason}"
                     logger.exception("research_command_failed")
         elif text.startswith("/report"):
             report_text = text[len("/report") :].strip()
