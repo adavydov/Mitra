@@ -15,9 +15,9 @@
 - `policy/data_handling.md`
 
 ## How CI works
-- Workflow: `.github/workflows/ci.yml`
-- Triggers: every `pull_request` and pushes to `main`.
-- Stable status checks exposed for branch protection:
-  - `ci/lint`
-  - `ci/tests`
-  - `ci/config-validate`
+- GitHub Actions workflow: `.github/workflows/ci.yml`.
+- Triggers: every pull request and every push to `main`.
+- Stable branch-protection checks:
+  - `ci/lint` — validates IDs.
+  - `ci/config-validate` — validates config schemas.
+  - `ci/tests` — runs regression evals after lint/config checks.
