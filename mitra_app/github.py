@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from typing import Any
+import re
 
 import httpx
 
@@ -39,6 +40,21 @@ class GitHubPullRequestStatus:
     mergeable: bool | None
     head_sha: str
     html_url: str
+
+
+@dataclass
+class GitHubChecksSummary:
+    total: int
+    successful: int
+    failed: int
+    pending: int
+
+
+@dataclass
+class GitHubLinkedPullRequest:
+    number: int
+    html_url: str
+    title: str
 
 
 def _read_config() -> tuple[str, str]:
@@ -147,3 +163,131 @@ async def get_pr_status(number: int) -> GitHubPullRequestStatus:
         head_sha=str(head.get("sha", "")),
         html_url=str(payload.get("html_url", "")),
     )
+
+
+def _mentions_issue(text: str | None, issue_number: int) -> bool:
+    if not text:
+        return False
+
+    patterns = [
+        rf"#{issue_number}\b",
+        rf"GH-{issue_number}\b",
+        rf"issues/{issue_number}\b",
+    ]
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def _extract_pr_number(value: str) -> int | None:
+    match = re.search(r"/pull/(\d+)\b", value)
+    if match:
+        return int(match.group(1))
+
+    hash_match = re.search(r"#(\d+)\b", value)
+    if hash_match:
+        return int(hash_match.group(1))
+
+    return None
+
+
+async def find_linked_pr(issue_number: int) -> GitHubLinkedPullRequest | None:
+    token, repo = _read_config()
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.get(
+            f"https://api.github.com/repos/{repo}/pulls",
+            params={"state": "all", "per_page": 100},
+            headers=_headers(token),
+        )
+        response.raise_for_status()
+        pulls_payload = response.json()
+
+        for raw_pr in pulls_payload:
+            if not isinstance(raw_pr, dict):
+                continue
+            title = str(raw_pr.get("title", ""))
+            body = str(raw_pr.get("body") or "")
+            if _mentions_issue(title, issue_number) or _mentions_issue(body, issue_number):
+                return GitHubLinkedPullRequest(
+                    number=int(raw_pr.get("number", 0)),
+                    html_url=str(raw_pr.get("html_url", "")),
+                    title=title,
+                )
+
+        comments_response = await client.get(
+            f"https://api.github.com/repos/{repo}/issues/{issue_number}/comments",
+            params={"per_page": 100},
+            headers=_headers(token),
+        )
+        comments_response.raise_for_status()
+        comments_payload = comments_response.json()
+
+        for comment in comments_payload:
+            if not isinstance(comment, dict):
+                continue
+            body = str(comment.get("body") or "")
+            pr_number = _extract_pr_number(body)
+            if not pr_number:
+                continue
+
+            pr_response = await client.get(
+                f"https://api.github.com/repos/{repo}/pulls/{pr_number}",
+                headers=_headers(token),
+            )
+            pr_response.raise_for_status()
+            pr_payload: dict[str, Any] = pr_response.json()
+            return GitHubLinkedPullRequest(
+                number=int(pr_payload.get("number", pr_number)),
+                html_url=str(pr_payload.get("html_url", "")),
+                title=str(pr_payload.get("title", "")),
+            )
+
+    return None
+
+
+async def get_pr_checks_summary(head_sha: str) -> GitHubChecksSummary:
+    token, repo = _read_config()
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        checks_response = await client.get(
+            f"https://api.github.com/repos/{repo}/commits/{head_sha}/check-runs",
+            headers={**_headers(token), "Accept": "application/vnd.github+json"},
+        )
+        checks_response.raise_for_status()
+        checks_payload: dict[str, Any] = checks_response.json()
+
+        status_response = await client.get(
+            f"https://api.github.com/repos/{repo}/commits/{head_sha}/status",
+            headers=_headers(token),
+        )
+        status_response.raise_for_status()
+        status_payload: dict[str, Any] = status_response.json()
+
+    successful = 0
+    failed = 0
+    pending = 0
+
+    for run in checks_payload.get("check_runs", []):
+        if not isinstance(run, dict):
+            continue
+        status = str(run.get("status", ""))
+        conclusion = str(run.get("conclusion", ""))
+        if status != "completed":
+            pending += 1
+        elif conclusion == "success":
+            successful += 1
+        else:
+            failed += 1
+
+    for status_item in status_payload.get("statuses", []):
+        if not isinstance(status_item, dict):
+            continue
+        state = str(status_item.get("state", ""))
+        if state == "success":
+            successful += 1
+        elif state in {"pending", "queued"}:
+            pending += 1
+        else:
+            failed += 1
+
+    total = successful + failed + pending
+    return GitHubChecksSummary(total=total, successful=successful, failed=failed, pending=pending)

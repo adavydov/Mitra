@@ -10,6 +10,8 @@ from mitra_app.github import (
     GitHubNotConfigured,
     create_issue,
     get_issue,
+    find_linked_pr,
+    get_pr_checks_summary,
     get_pr_status,
     list_prs,
 )
@@ -175,3 +177,98 @@ def test_github_requires_token_and_repo(monkeypatch):
 
     with pytest.raises(GitHubNotConfigured):
         asyncio.run(list_prs())
+
+
+def test_find_linked_pr_in_pr_body(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "token")
+    monkeypatch.setenv("GITHUB_REPO", "owner/repo")
+
+    def fake_get(url: str, params: dict[str, Any], headers: dict[str, str]) -> FakeResponse:
+        if url.endswith("/pulls"):
+            assert params["state"] == "all"
+            return FakeResponse([
+                {
+                    "number": 55,
+                    "title": "feat: support issue refs",
+                    "body": "Fixes #42",
+                    "html_url": "https://github.com/owner/repo/pull/55",
+                }
+            ])
+
+        raise AssertionError(f"unexpected URL: {url}")
+
+    monkeypatch.setattr(
+        "mitra_app.github.httpx.AsyncClient",
+        lambda *args, **kwargs: FakeAsyncClient(*args, _get_handler=fake_get, **kwargs),
+    )
+
+    pr = asyncio.run(find_linked_pr(42))
+
+    assert pr is not None
+    assert pr.number == 55
+    assert pr.html_url.endswith("/pull/55")
+
+
+def test_find_linked_pr_from_issue_comments(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "token")
+    monkeypatch.setenv("GITHUB_REPO", "owner/repo")
+
+    def fake_get(url: str, params: dict[str, Any], headers: dict[str, str]) -> FakeResponse:
+        if url.endswith("/pulls"):
+            return FakeResponse([])
+        if url.endswith("/issues/99/comments"):
+            return FakeResponse([{"body": "tracked in https://github.com/owner/repo/pull/21"}])
+        if url.endswith("/pulls/21"):
+            return FakeResponse({"number": 21, "title": "PR 21", "html_url": "https://github.com/owner/repo/pull/21"})
+
+        raise AssertionError(f"unexpected URL: {url}")
+
+    monkeypatch.setattr(
+        "mitra_app.github.httpx.AsyncClient",
+        lambda *args, **kwargs: FakeAsyncClient(*args, _get_handler=fake_get, **kwargs),
+    )
+
+    pr = asyncio.run(find_linked_pr(99))
+
+    assert pr is not None
+    assert pr.number == 21
+
+
+def test_get_pr_checks_summary(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "token")
+    monkeypatch.setenv("GITHUB_REPO", "owner/repo")
+
+    def fake_get(url: str, params: dict[str, Any], headers: dict[str, str]) -> FakeResponse:
+        if url.endswith("/check-runs"):
+            return FakeResponse(
+                {
+                    "check_runs": [
+                        {"status": "completed", "conclusion": "success"},
+                        {"status": "completed", "conclusion": "failure"},
+                        {"status": "in_progress", "conclusion": None},
+                    ]
+                }
+            )
+        if url.endswith("/status"):
+            return FakeResponse(
+                {
+                    "statuses": [
+                        {"state": "success"},
+                        {"state": "pending"},
+                    ]
+                }
+            )
+
+        raise AssertionError(f"unexpected URL: {url}")
+
+    monkeypatch.setattr(
+        "mitra_app.github.httpx.AsyncClient",
+        lambda *args, **kwargs: FakeAsyncClient(*args, _get_handler=fake_get, **kwargs),
+    )
+
+    summary = asyncio.run(get_pr_checks_summary("abc123"))
+
+    assert summary.total == 5
+    assert summary.successful == 2
+    assert summary.failed == 1
+    assert summary.pending == 2

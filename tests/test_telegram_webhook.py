@@ -841,3 +841,86 @@ def test_research_returns_search_results_and_summary(monkeypatch):
     assert "Top 5 results" in calls[0][1]
     assert "Что нашёл:" in calls[0][1]
     assert "/report <text>" in calls[0][1]
+
+
+def test_pr_status_returns_link_and_checks(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    class LinkedPR:
+        def __init__(self):
+            self.number = 77
+            self.html_url = "https://github.com/owner/repo/pull/77"
+
+    class PRStatus:
+        def __init__(self):
+            self.state = "open"
+            self.draft = False
+            self.merged = False
+            self.head_sha = "abc123"
+
+    class CheckSummary:
+        def __init__(self):
+            self.total = 3
+            self.successful = 2
+            self.failed = 1
+            self.pending = 0
+
+    async def fake_find_linked_pr(issue_number: int):
+        assert issue_number == 42
+        return LinkedPR()
+
+    async def fake_get_pr_status(number: int):
+        assert number == 77
+        return PRStatus()
+
+    async def fake_get_pr_checks_summary(head_sha: str):
+        assert head_sha == "abc123"
+        return CheckSummary()
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.github.find_linked_pr", fake_find_linked_pr)
+    monkeypatch.setattr("mitra_app.main.github.get_pr_status", fake_get_pr_status)
+    monkeypatch.setattr("mitra_app.main.github.get_pr_checks_summary", fake_get_pr_checks_summary)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/pr_status 42", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [
+        (
+            123,
+            "PR: https://github.com/owner/repo/pull/77\nState: open\nChecks: total=3, success=2, failed=1, pending=0",
+        )
+    ]
+
+
+def test_pr_status_invalid_usage(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/pr_status abc", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Usage: /pr_status <issue#|pr#>")]
