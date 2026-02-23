@@ -3,7 +3,7 @@ import base64
 import json
 
 import pytest
-from mitra_app.drive import DriveNotConfigured, check_drive_folder_access, upload_markdown
+from mitra_app.drive import DriveNotConfigured, list_recent_files, upload_markdown
 
 
 def _service_account_payload() -> dict[str, str]:
@@ -149,20 +149,28 @@ def test_upload_markdown_oauth_requires_client_credentials(monkeypatch):
         asyncio.run(upload_markdown("Report", "# hello"))
 
 
-def test_check_drive_folder_access_uses_minimal_metadata_call(monkeypatch):
+
+def test_list_recent_files_uses_drive_query_and_limit(monkeypatch):
     monkeypatch.setenv("DRIVE_ROOT_FOLDER_ID", "root-folder")
-    monkeypatch.setenv("DRIVE_SERVICE_ACCOUNT_JSON", json.dumps(_service_account_payload()))
+    monkeypatch.setenv(
+        "DRIVE_SERVICE_ACCOUNT_JSON_B64",
+        base64.b64encode(json.dumps(_service_account_payload()).encode("utf-8")).decode("utf-8"),
+    )
 
     captured: dict[str, object] = {}
 
     class _FakeFilesResource:
-        def get(self, fileId, fields):
-            captured["fileId"] = fileId
-            captured["fields"] = fields
+        def list(self, **kwargs):
+            captured.update(kwargs)
             return self
 
         def execute(self):
-            return {"id": "root-folder"}
+            return {
+                "files": [
+                    {"id": "f1", "name": "One", "webViewLink": "https://drive/1"},
+                    {"id": "f2", "name": "Two"},
+                ]
+            }
 
     class _FakeService:
         def files(self):
@@ -174,40 +182,45 @@ def test_check_drive_folder_access_uses_minimal_metadata_call(monkeypatch):
     )
     monkeypatch.setattr("mitra_app.drive.build", lambda *args, **kwargs: _FakeService())
 
-    result = asyncio.run(check_drive_folder_access())
+    results = asyncio.run(list_recent_files(limit=5))
 
-    assert result.auth_mode == "service_account"
-    assert result.folder_id == "root-folder"
-    assert captured == {"fileId": "root-folder", "fields": "id"}
+    assert [f.file_id for f in results] == ["f1", "f2"]
+    assert captured["q"] == "'root-folder' in parents and trashed = false"
+    assert captured["pageSize"] == 5
+    assert captured["orderBy"] == "modifiedTime desc"
+    assert captured["supportsAllDrives"] is True
+    assert captured["includeItemsFromAllDrives"] is True
 
 
-def test_check_drive_folder_access_prefers_oauth(monkeypatch):
+def test_list_recent_files_adds_shared_drive_parameters(monkeypatch):
     monkeypatch.setenv("DRIVE_ROOT_FOLDER_ID", "root-folder")
-    monkeypatch.setenv("DRIVE_OAUTH_REFRESH_TOKEN", "refresh-token")
-    monkeypatch.setenv("DRIVE_OAUTH_CLIENT_ID", "client-id")
-    monkeypatch.setenv("DRIVE_OAUTH_CLIENT_SECRET", "client-secret")
+    monkeypatch.setenv("DRIVE_SHARED_DRIVE_ID", "shared-123")
+    monkeypatch.setenv(
+        "DRIVE_SERVICE_ACCOUNT_JSON_B64",
+        base64.b64encode(json.dumps(_service_account_payload()).encode("utf-8")).decode("utf-8"),
+    )
 
     captured: dict[str, object] = {}
 
     class _FakeFilesResource:
-        def get(self, fileId, fields):
+        def list(self, **kwargs):
+            captured.update(kwargs)
             return self
 
         def execute(self):
-            return {"id": "root-folder"}
+            return {"files": []}
 
     class _FakeService:
         def files(self):
             return _FakeFilesResource()
 
-    def _fake_oauth_credentials(*args, **kwargs):
-        captured["refresh_token"] = kwargs["refresh_token"]
-        return object()
-
-    monkeypatch.setattr("mitra_app.drive.OAuthCredentials", _fake_oauth_credentials)
+    monkeypatch.setattr(
+        "mitra_app.drive.service_account.Credentials.from_service_account_info",
+        lambda info, scopes: object(),
+    )
     monkeypatch.setattr("mitra_app.drive.build", lambda *args, **kwargs: _FakeService())
 
-    result = asyncio.run(check_drive_folder_access())
+    asyncio.run(list_recent_files(limit=5))
 
-    assert result.auth_mode == "oauth"
-    assert captured["refresh_token"] == "refresh-token"
+    assert captured["corpora"] == "drive"
+    assert captured["driveId"] == "shared-123"

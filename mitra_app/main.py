@@ -12,7 +12,7 @@ from googleapiclient.errors import HttpError
 
 import mitra_app.audit as audit
 from mitra_app.audit import log_report_event
-from mitra_app.drive import DriveNotConfigured, check_drive_folder_access, get_drive_auth_mode, upload_markdown
+from mitra_app.drive import DriveNotConfigured, get_drive_auth_mode, list_recent_files, upload_markdown
 from mitra_app.telegram import ensure_webhook, send_message
 
 app = FastAPI()
@@ -250,6 +250,20 @@ async def telegram_webhook(
             reply_text = f"user_id={user_id}, chat_id={chat_id}"
         elif not allowlist_configured:
             reply_text = "Allowlist not configured. Set ALLOWED_TELEGRAM_USER_IDS."
+        elif text.startswith("/reports"):
+            try:
+                files = await list_recent_files(limit=5)
+                if not files:
+                    reply_text = "No reports found"
+                else:
+                    lines = ["Latest reports:"]
+                    for drive_file in files:
+                        link = drive_file.web_view_link or drive_file.file_id
+                        lines.append(f"- {drive_file.name}: {link}")
+                    reply_text = "\n".join(lines)
+            except Exception as exc:
+                reply_text = _sanitize_report_error(exc)
+                logger.exception("report_list_failed")
         elif text.startswith("/report"):
             report_text = text[len("/report") :].strip()
             action_id = f"act-{uuid4().hex[:12]}"
@@ -315,7 +329,7 @@ async def telegram_webhook(
                 logger.exception("drive_check_command_failed")
                 _audit_drive_check(user_id=user_id, chat_id=chat_id, auth_mode=auth_mode, outcome="error", detail=detail)
         elif text.startswith("/help") or text.startswith("/start"):
-            reply_text = "Commands: /status, /report <text>, /drive_check"
+            reply_text = "Commands: /status, /report <text>, /reports"
         else:
             reply_text = "Unknown command"
 
