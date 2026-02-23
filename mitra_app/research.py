@@ -6,8 +6,7 @@ from typing import Any
 
 import httpx
 
-from mitra_app.llm.anthropic import AnthropicClient
-from mitra_app.search import SearchRateLimitExceeded, brave_web_search
+from mitra_app.search import brave_web_search
 
 
 class ResearchError(RuntimeError):
@@ -113,31 +112,19 @@ async def run_research(query: str) -> tuple[list[SearchItem], str]:
     if not cleaned:
         raise ResearchError("Usage: /research <query>")
 
-    try:
-        raw_results = await brave_web_search(cleaned)
-    except RuntimeError as exc:
-        if "BRAVE_SEARCH_API_KEY" in str(exc):
-            raise ResearchError("Search not configured (missing BRAVE_SEARCH_API_KEY)") from exc
-        raise ResearchError(f"Research failed: {_short_reason(exc)}") from exc
-    except SearchRateLimitExceeded as exc:
-        raise ResearchError(f"Denied by budget/rate limit: {_short_reason(exc)}") from exc
-    except Exception as exc:
-        if _is_budget_or_rate_limit_error(exc):
-            raise ResearchError(f"Denied by budget/rate limit: {_short_reason(exc)}") from exc
-        raise ResearchError(f"Research failed: {_short_reason(exc)}") from exc
+    if os.getenv("BRAVE_SEARCH_API_KEY", "").strip():
+        results = await brave_web_search(cleaned)
+        items = [
+            SearchItem(title=result.title, url=result.url, snippet=result.description)
+            for result in results
+        ]
+    else:
+        items = []
 
-    items = [SearchItem(title=item.title, url=item.url, snippet=item.description) for item in raw_results[:5]]
+    summary = await summarize_with_sonnet(cleaned, items)
 
-    try:
-        summary = await summarize_with_sonnet(cleaned, items)
-    except ValueError as exc:
-        if "ANTHROPIC_API_KEY" in str(exc):
-            raise ResearchError("LLM not configured") from exc
-        raise ResearchError(f"Research failed: {_short_reason(exc)}") from exc
-    except Exception as exc:
-        if _is_budget_or_rate_limit_error(exc):
-            raise ResearchError(f"Denied by budget/rate limit: {_short_reason(exc)}") from exc
-        raise ResearchError(f"Research failed: {_short_reason(exc)}") from exc
+    if not os.getenv("BRAVE_SEARCH_API_KEY", "").strip():
+        summary = "\n".join(["No web search (search not configured).", summary])
 
     return items, summary
 

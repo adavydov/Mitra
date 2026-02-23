@@ -3,7 +3,7 @@ import logging
 import os
 import re
 import json
-import time
+import traceback
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -470,6 +470,17 @@ def _sanitize_report_error(exc: Exception) -> str:
     return "Report failed"
 
 
+def _sanitize_research_error(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        return f"Research failed ({status})"
+
+    if isinstance(exc, httpx.HTTPError):
+        return "Research failed (network error)"
+
+    return "Research failed"
+
+
 def _audit_drive_check(user_id: int | None, chat_id: int | None, auth_mode: str, outcome: str, detail: str) -> None:
     event = {
         "event": "drive_check",
@@ -828,9 +839,22 @@ async def telegram_webhook(
                 except ResearchError as exc:
                     reply_text = str(exc)
                 except Exception as exc:
-                    short_reason = " ".join(str(exc).splitlines()).strip()[:160] or exc.__class__.__name__
-                    reply_text = f"Research failed: {short_reason}"
+                    reply_text = _sanitize_research_error(exc)
                     logger.exception("research_command_failed")
+                    _safe_audit_event(
+                        {
+                            "event": "research_command_failed",
+                            "action_id": action_id,
+                            "telegram_update_id": telegram_update_id,
+                            "user_id": user_id,
+                            "chat_id": chat_id,
+                            "action_type": "/research",
+                            "outcome": "error",
+                            "error": str(exc),
+                            "traceback": traceback.format_exc(),
+                            "log_level": "error",
+                        }
+                    )
         elif text.startswith("/report"):
             report_text = text[len("/report") :].strip()
             file_id = ""
