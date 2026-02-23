@@ -15,6 +15,7 @@ from fastapi import FastAPI, Header, HTTPException
 from googleapiclient.errors import HttpError
 
 import mitra_app.audit as audit
+import mitra_app.github as github
 from mitra_app.audit import log_report_event
 from mitra_app.budget_ledger import budget_ledger
 from mitra_app.policy_enforcer import CommandPolicy, CommandPolicyEnforcer
@@ -287,33 +288,9 @@ def _parse_pr_command(text: str) -> tuple[str, str] | None:
 
 
 async def _create_github_issue(title: str, body: str) -> tuple[int, str]:
-    token = os.getenv("GITHUB_TOKEN")
-    repository = os.getenv("GITHUB_REPOSITORY")
-    if not token or not repository:
-        raise RuntimeError("GitHub integration is not configured")
-
-    if "/" not in repository:
-        raise RuntimeError("GITHUB_REPOSITORY must be owner/repo")
-
-    api_url = f"https://api.github.com/repos/{repository}/issues"
-    payload = {
-        "title": title,
-        "body": body,
-        "labels": ["mitra:codex"],
-    }
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        response = await client.post(api_url, json=payload, headers=headers)
-        response.raise_for_status()
-        response_payload: dict[str, Any] = response.json()
-
-    issue_number = int(response_payload.get("number", 0))
-    issue_url = str(response_payload.get("html_url", ""))
+    issue = await github.create_issue(title=title, body=body, labels=["mitra:codex"])
+    issue_number = issue.number
+    issue_url = issue.html_url
     if issue_number <= 0 or not issue_url:
         raise RuntimeError("GitHub issue create returned invalid response")
 
@@ -681,7 +658,7 @@ async def telegram_webhook(
                         action_type="/report",
                         log_level="error",
                     )
-        elif text.startswith("/pr"):
+        elif text == "/pr" or text.startswith("/pr ") or text.startswith("/pr\n"):
             parsed = _parse_pr_command(text)
             if not parsed:
                 reply_text = "Usage: /pr <title>\\n<spec>"
@@ -748,7 +725,7 @@ async def telegram_webhook(
                 reply_text = "Forbidden"
         elif text.startswith("/budget"):
             reply_text = await budget_ledger.render_budget()
-        elif text.startswith("/pr"):
+        elif text == "/pr" or text.startswith("/pr ") or text.startswith("/pr\n"):
             await budget_ledger.record_github_action()
             reply_text = "Unknown command"
         elif text.startswith("/help") or text.startswith("/start"):

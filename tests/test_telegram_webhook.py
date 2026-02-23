@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from dataclasses import dataclass
 
 import httplib2
 from googleapiclient.errors import HttpError
@@ -753,6 +754,114 @@ def test_pr_status_command_without_argument_returns_usage(monkeypatch):
 
     assert response.status_code == 200
     assert calls == [(123, "Usage: /pr_status <issue#|pr#>")]
+
+
+def test_pr_command_creates_issue_with_mitra_codex_label_and_returns_url(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+    audits = []
+
+    @dataclass
+    class FakeIssue:
+        number: int
+        html_url: str
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_create_issue(title: str, body: str, labels: list[str] | None = None):
+        assert title == "Need better onboarding"
+        assert body == "Step 1\nStep 2"
+        assert labels == ["mitra:codex"]
+        return FakeIssue(number=77, html_url="https://github.com/o/r/issues/77")
+
+    def fake_log_event(event: dict[str, object]):
+        audits.append(event)
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.github.create_issue", fake_create_issue)
+    monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={
+            "message": {
+                "text": "/pr Need better onboarding\nStep 1\nStep 2",
+                "chat": {"id": 123},
+                "from": {"id": 123},
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Created: https://github.com/o/r/issues/77")]
+
+    pr_audit = next(event for event in audits if event.get("event") == "telegram_pr_open_issue")
+    assert pr_audit["issue_number"] == 77
+    assert pr_audit["outcome"] == "success"
+
+
+def test_pr_command_denied_for_non_allowlisted_user(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    called = False
+
+    async def fake_create_issue(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("must not be called")
+
+    monkeypatch.setattr("mitra_app.main.github.create_issue", fake_create_issue)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/pr blocked\nspec", "chat": {"id": 123}, "from": {"id": 999}}},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert called is False
+
+
+def test_pr_command_audits_error_when_github_create_fails(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+    audits = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_create_issue(title: str, body: str, labels: list[str] | None = None):
+        raise RuntimeError("boom")
+
+    def fake_log_event(event: dict[str, object]):
+        audits.append(event)
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.github.create_issue", fake_create_issue)
+    monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/pr Broken\nSpec", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Failed to create issue")]
+
+    pr_audit = next(event for event in audits if event.get("event") == "telegram_pr_open_issue")
+    assert pr_audit["issue_number"] is None
+    assert pr_audit["outcome"] == "error"
 
 
 def test_report_oauth_expired_replies_with_reauthorize_message(monkeypatch, tmp_path):
