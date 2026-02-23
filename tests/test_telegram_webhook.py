@@ -2,6 +2,8 @@ import json
 import logging
 import os
 
+import httpx
+
 import httplib2
 from googleapiclient.errors import HttpError
 
@@ -841,3 +843,154 @@ def test_research_returns_search_results_and_summary(monkeypatch):
     assert "Top 5 results" in calls[0][1]
     assert "Что нашёл:" in calls[0][1]
     assert "/report <text>" in calls[0][1]
+
+
+def test_llm_check_not_configured(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/llm_check", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "LLM not configured")]
+
+
+def test_llm_check_success_with_mocked_httpx(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "claude-sonnet-test")
+
+    calls = []
+    posted = {}
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            posted["url"] = url
+            posted["headers"] = headers
+            posted["json"] = json
+            return TestResponse(200, {"content": [{"type": "text", "text": "PONG"}]})
+
+    class TestResponse:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.httpx.AsyncClient", FakeAsyncClient)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/llm_check", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert posted["url"] == "https://api.anthropic.com/v1/messages"
+    assert posted["headers"]["x-api-key"] == "test-key"
+    assert posted["json"]["max_tokens"] == 8
+    assert posted["json"]["temperature"] == 0
+    assert posted["json"]["messages"] == [{"role": "user", "content": "Reply with PONG"}]
+    assert calls and calls[0][0] == 123
+    assert calls[0][1].startswith("LLM OK model=claude-sonnet-test latency_ms=")
+    assert calls[0][1].endswith(" result=PONG")
+
+
+def test_llm_check_error_is_sanitized_and_audited(monkeypatch, tmp_path):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("MITRA_AUDIT_LOG", str(tmp_path / "events.ndjson"))
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            request = httpx.Request("POST", url)
+            response = httpx.Response(401, json={"error": {"type": "invalid_request_error"}}, request=request)
+            raise httpx.HTTPStatusError("Unauthorized", request=request, response=response)
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.httpx.AsyncClient", FakeAsyncClient)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/llm_check", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "LLM error: 401 invalid_request_error")]
+
+    events = (tmp_path / "events.ndjson").read_text(encoding="utf-8").strip().splitlines()
+    payload = [json.loads(line) for line in events if json.loads(line).get("event") == "llm_check"][-1]
+    assert payload["action_type"] == "/llm_check"
+    assert payload["outcome"] == "error"
+    assert "HTTPStatusError" in payload["detail"]
+
+
+def test_start_lists_llm_check(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/start", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Commands: /status, /oauth_status, /llm_check, /research <query>, /report <text>")]
