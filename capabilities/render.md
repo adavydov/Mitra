@@ -1,18 +1,10 @@
-# CAP-RENDER-01 — Развертывание на Render Web Service
+ID: CAP-RENDER-01
+Level: H
+Owner: User
+Status: active
+Depends on: C-TOOLS-01, P-ACCESS-01
+Config keys: CFG-TOOLS-01
+Required evals: EVAL-REG-HEALTH-01
 
-## Ограничения среды
-- Сервис запускается в stateless-контейнере Render Web Service, поэтому долгоживущие данные нельзя хранить локально (кроме временного кэша).
-- Входящий HTTP-трафик проксируется через Render; bind обязателен на `0.0.0.0:$PORT`.
-- Эфемерная файловая система сбрасывается при рестарте/редеплое, поэтому evidence-логи должны быть экспортированы во внешний storage или log sink.
-- Учитывать cold start и ограничение CPU/RAM выбранного плана.
-
-## Секреты
-- `SERVICE_SHARED_SECRET` — обязательный секрет для авторизации webhook-событий.
-- `EVIDENCE_LOG_PATH` — путь к локальному audit-файлу (по умолчанию `./data/evidence.log`), не содержит секретов, но влияет на forensic-процедуры.
-- Секреты задаются только через Render Environment Variables и не коммитятся в репозиторий.
-
-## Rollback-стратегия
-1. Использовать deploy history в Render и выполнить rollback на последний стабильный deploy.
-2. Проверить `/healthz` и пробный signed webhook после отката.
-3. Сверить evidence-записи до/после rollback, убедиться в отсутствии дубликатов критических задач.
-4. Если rollback не стабилизирует сервис — активировать quarantine по `protocols/quarantine.md`.
+# Render Capability
+Runtime размещается на Render и слушает `$PORT`.

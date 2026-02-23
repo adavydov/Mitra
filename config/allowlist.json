@@ -1,0 +1,5 @@
+{
+  "telegram": {
+    "allowed_user_ids": ["__SET_ME__"]
+  }
+}

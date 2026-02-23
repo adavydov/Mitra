@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "required": ["id", "telegram", "drive", "github", "render"],
+  "properties": {
+    "id": {"type": "string"},
+    "telegram": {"type": "boolean"},
+    "drive": {"type": "boolean"},
+    "github": {"type": "boolean"},
+    "render": {"type": "boolean"}
+  },
+  "additionalProperties": false
+}

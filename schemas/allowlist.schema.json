@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "required": ["telegram"],
+  "properties": {
+    "telegram": {
+      "type": "object",
+      "required": ["allowed_user_ids"],
+      "properties": {
+        "allowed_user_ids": {
+          "type": "array",
+          "items": {
+            "anyOf": [
+              {"type": "integer"},
+              {"type": "string"}
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
