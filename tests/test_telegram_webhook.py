@@ -305,6 +305,69 @@ def test_report_without_text_returns_usage_and_does_not_crash(monkeypatch):
     assert response.json() == {"status": "ok"}
     assert calls == [(123, "Usage: /report <text>")]
 
+
+
+def test_report_http_error_replies_with_sanitized_reason_and_logs_traceback(monkeypatch, caplog):
+    from googleapiclient.errors import HttpError
+
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    class FakeResp:
+        status = 403
+        reason = "Forbidden"
+
+    async def fake_upload_markdown(title: str, markdown_body: str):
+        raise HttpError(FakeResp(), b'{"error":{"errors":[{"reason":"insufficientFilePermissions"}]}}', uri="https://drive.test")
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
+
+    with caplog.at_level("ERROR"):
+        response = client.post(
+            "/telegram/webhook",
+            headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+            json={"message": {"text": "/report Something", "chat": {"id": 123}, "from": {"id": 123}}},
+        )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Drive error: 403 insufficientFilePermissions")]
+    assert any(record.message == "report_upload_failed" and record.exc_info for record in caplog.records)
+
+
+def test_report_drive_disabled_logs_traceback(monkeypatch, caplog):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_upload_markdown(title: str, markdown_body: str):
+        raise DriveNotConfiguredError("disabled")
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
+
+    with caplog.at_level("ERROR"):
+        response = client.post(
+            "/telegram/webhook",
+            headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+            json={"message": {"text": "/report Something", "chat": {"id": 123}, "from": {"id": 123}}},
+        )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Drive disabled")]
+    assert any(record.message == "report_upload_drive_not_configured" and record.exc_info for record in caplog.records)
+
 def test_webhook_returns_200_when_send_message_raises(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
 
