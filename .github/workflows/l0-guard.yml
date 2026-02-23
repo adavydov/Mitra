@@ -1,0 +1,35 @@
+name: L0 Guard
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+jobs:
+  l0-guard:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: tj-actions/changed-files@v34
+        id: changed
+
+      - name: Check for protected files
+        run: |
+          PROTECTED="governance/constitution.md governance/identity.md governance/normative_hierarchy.md"
+          CHANGED="${{ steps.changed.outputs.all_changed_files }}"
+          FAIL=false
+
+          for p in $PROTECTED; do
+            if echo "$CHANGED" | grep -E "$p"; then
+              FAIL=true
+            fi
+          done
+
+          if [ "$FAIL" = true ]; then
+            if [[ "${{ github.event.pull_request.labels.*.name }}" =~ "l0-approved" ]]; then
+              echo "L0 override label found. Allowing."
+            else
+              echo "Protected files changed. Add label 'l0-approved' to merge."
+              exit 1
+            fi
+          fi
