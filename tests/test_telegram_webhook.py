@@ -3,7 +3,7 @@ import json
 from fastapi.testclient import TestClient
 
 from mitra_app.drive import DriveNotConfiguredError, DriveUploadResult
-from mitra_app.main import _load_allowed_user_ids, app
+from mitra_app.main import RecentUpdateDeduplicator, _load_allowed_user_ids, app
 
 
 client = TestClient(app)
@@ -113,6 +113,56 @@ def test_allowlist_denied_user_returns_200_without_sending_message(monkeypatch):
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
     assert calls == []
+
+
+def test_recent_update_deduplicator_evicts_oldest_entries():
+    deduplicator = RecentUpdateDeduplicator(max_size=2)
+
+    assert deduplicator.is_duplicate(100) is False
+    assert deduplicator.is_duplicate(101) is False
+    assert deduplicator.is_duplicate(100) is True
+
+    assert deduplicator.is_duplicate(102) is False
+    assert deduplicator.is_duplicate(101) is False
+
+
+def test_duplicate_update_id_returns_200_without_sending_message_and_audits(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+
+    calls = []
+    audits = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    def fake_audit_dedup(update_id: int, user_id: int | None, chat_id: int | None):
+        audits.append((update_id, user_id, chat_id))
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main._audit_dedup", fake_audit_dedup)
+    monkeypatch.setattr("mitra_app.main._recent_update_deduplicator", RecentUpdateDeduplicator(max_size=10))
+
+    payload = {
+        "update_id": 555,
+        "message": {"text": "/status", "chat": {"id": 123}, "from": {"id": 987}},
+    }
+
+    first_response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json=payload,
+    )
+    second_response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json=payload,
+    )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert calls == [(123, "Mitra alive")]
+    assert audits == [(555, 987, 123)]
 
 
 def test_report_upload_success_replies_with_link_and_audits(monkeypatch, tmp_path):

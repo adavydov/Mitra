@@ -1,6 +1,8 @@
 import logging
 import os
+from collections import OrderedDict
 from datetime import datetime, timezone
+from threading import Lock
 from uuid import uuid4
 from typing import Any
 
@@ -12,6 +14,27 @@ from mitra_app.telegram import send_message
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
+
+
+class RecentUpdateDeduplicator:
+    def __init__(self, max_size: int = 1000) -> None:
+        self._max_size = max_size
+        self._seen_update_ids: OrderedDict[int, None] = OrderedDict()
+        self._lock = Lock()
+
+    def is_duplicate(self, update_id: int) -> bool:
+        with self._lock:
+            if update_id in self._seen_update_ids:
+                self._seen_update_ids.move_to_end(update_id)
+                return True
+
+            self._seen_update_ids[update_id] = None
+            if len(self._seen_update_ids) > self._max_size:
+                self._seen_update_ids.popitem(last=False)
+            return False
+
+
+_recent_update_deduplicator = RecentUpdateDeduplicator(max_size=1000)
 
 
 def _load_allowed_user_ids() -> set[int]:
@@ -41,6 +64,19 @@ def _audit_allowlist_denied(user_id: int | None, chat_id: int | None) -> None:
             "event": "telegram_allowlist_denied",
             "user_id": user_id,
             "chat_id": chat_id,
+        },
+    )
+
+
+def _audit_dedup(update_id: int, user_id: int | None, chat_id: int | None) -> None:
+    logger.info(
+        "telegram_dedup",
+        extra={
+            "event": "telegram_dedup",
+            "update_id": update_id,
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "outcome": "dedup",
         },
     )
 
@@ -76,11 +112,16 @@ async def telegram_webhook(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     message = update.get("message") or {}
+    update_id = update.get("update_id")
     text = message.get("text", "")
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
     from_user = message.get("from") or {}
     user_id = from_user.get("id")
+
+    if isinstance(update_id, int) and _recent_update_deduplicator.is_duplicate(update_id):
+        _audit_dedup(update_id=update_id, user_id=user_id, chat_id=chat_id)
+        return {"status": "ok"}
 
     allowed_user_ids_raw = os.getenv("ALLOWED_TELEGRAM_USER_IDS")
     allowed_user_ids = _load_allowed_user_ids()
