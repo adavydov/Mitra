@@ -21,6 +21,7 @@ def log_event(event: dict[str, object]) -> None:
 def log_report_event(action_id: str, file_id: str, outcome: str, link: str | None = None) -> None:
     event = {
         "action_id": action_id,
+        "user_id": user_id,
         "file_id": file_id,
         "outcome": outcome,
     }

@@ -200,18 +200,18 @@ def test_report_upload_success_replies_with_link_and_audits(monkeypatch, tmp_pat
     )
 
     assert response.status_code == 200
-    assert calls == [(123, "Report uploaded: https://drive.test/view")]
-    assert captured["title"].startswith("report-")
-    assert "quarterly-risk-update" in captured["title"]
+    assert calls == [(123, "Saved: https://drive.test/view")]
+    assert captured["title"].startswith("mitra-report ")
     assert "Quarterly risk update" in captured["body"]
     assert "timestamp:" in captured["body"]
-    assert "action_id:" in captured["body"]
+    assert "user_id: 123" in captured["body"]
 
     events = (tmp_path / "events.ndjson").read_text(encoding="utf-8").strip().splitlines()
     payload = json.loads(events[-1])
     assert payload["file_id"] == "file-123"
     assert payload["outcome"] == "success"
     assert payload["action_id"].startswith("act-")
+    assert payload["user_id"] == 123
     assert payload["link"] == "https://drive.test/view"
 
 
@@ -227,7 +227,7 @@ def test_report_drive_disabled_replies_and_audits(monkeypatch, tmp_path):
         return True
 
     async def fake_upload_markdown(title: str, markdown_body: str):
-        raise DriveNotConfigured("disabled")
+        raise DriveNotConfiguredError("disabled")
 
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
     monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
@@ -244,6 +244,7 @@ def test_report_drive_disabled_replies_and_audits(monkeypatch, tmp_path):
     events = (tmp_path / "events.ndjson").read_text(encoding="utf-8").strip().splitlines()
     payload = json.loads(events[-1])
     assert payload["file_id"] == ""
+    assert payload["user_id"] == 123
     assert payload["outcome"] == "drive_disabled"
 
 
@@ -271,10 +272,58 @@ def test_report_upload_without_web_view_link_uses_file_id(monkeypatch, tmp_path)
     )
 
     assert response.status_code == 200
-    assert calls == [(123, "Report uploaded: file-xyz")]
+    assert calls == [(123, "Saved: file-xyz")]
 
     events = (tmp_path / "events.ndjson").read_text(encoding="utf-8").strip().splitlines()
     payload = json.loads(events[-1])
     assert payload["file_id"] == "file-xyz"
     assert payload["link"] == "file-xyz"
     assert payload["outcome"] == "success"
+
+
+def test_report_without_text_returns_usage(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/report", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Usage: /report <text>")]
+
+
+def test_report_upload_failure_returns_short_summary(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_upload_markdown(title: str, markdown_body: str):
+        raise RuntimeError("quota exceeded")
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/report Something", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Report failed: quota exceeded")]
