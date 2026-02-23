@@ -3,7 +3,7 @@ import base64
 import json
 
 import pytest
-from mitra_app.drive import DriveNotConfigured, upload_markdown
+from mitra_app.drive import DriveNotConfigured, list_recent_files, upload_markdown
 
 
 def _service_account_payload() -> dict[str, str]:
@@ -147,3 +147,80 @@ def test_upload_markdown_oauth_requires_client_credentials(monkeypatch):
 
     with pytest.raises(DriveNotConfigured, match="Missing OAuth credentials"):
         asyncio.run(upload_markdown("Report", "# hello"))
+
+
+
+def test_list_recent_files_uses_drive_query_and_limit(monkeypatch):
+    monkeypatch.setenv("DRIVE_ROOT_FOLDER_ID", "root-folder")
+    monkeypatch.setenv(
+        "DRIVE_SERVICE_ACCOUNT_JSON_B64",
+        base64.b64encode(json.dumps(_service_account_payload()).encode("utf-8")).decode("utf-8"),
+    )
+
+    captured: dict[str, object] = {}
+
+    class _FakeFilesResource:
+        def list(self, **kwargs):
+            captured.update(kwargs)
+            return self
+
+        def execute(self):
+            return {
+                "files": [
+                    {"id": "f1", "name": "One", "webViewLink": "https://drive/1"},
+                    {"id": "f2", "name": "Two"},
+                ]
+            }
+
+    class _FakeService:
+        def files(self):
+            return _FakeFilesResource()
+
+    monkeypatch.setattr(
+        "mitra_app.drive.service_account.Credentials.from_service_account_info",
+        lambda info, scopes: object(),
+    )
+    monkeypatch.setattr("mitra_app.drive.build", lambda *args, **kwargs: _FakeService())
+
+    results = asyncio.run(list_recent_files(limit=5))
+
+    assert [f.file_id for f in results] == ["f1", "f2"]
+    assert captured["q"] == "'root-folder' in parents and trashed = false"
+    assert captured["pageSize"] == 5
+    assert captured["orderBy"] == "modifiedTime desc"
+    assert captured["supportsAllDrives"] is True
+    assert captured["includeItemsFromAllDrives"] is True
+
+
+def test_list_recent_files_adds_shared_drive_parameters(monkeypatch):
+    monkeypatch.setenv("DRIVE_ROOT_FOLDER_ID", "root-folder")
+    monkeypatch.setenv("DRIVE_SHARED_DRIVE_ID", "shared-123")
+    monkeypatch.setenv(
+        "DRIVE_SERVICE_ACCOUNT_JSON_B64",
+        base64.b64encode(json.dumps(_service_account_payload()).encode("utf-8")).decode("utf-8"),
+    )
+
+    captured: dict[str, object] = {}
+
+    class _FakeFilesResource:
+        def list(self, **kwargs):
+            captured.update(kwargs)
+            return self
+
+        def execute(self):
+            return {"files": []}
+
+    class _FakeService:
+        def files(self):
+            return _FakeFilesResource()
+
+    monkeypatch.setattr(
+        "mitra_app.drive.service_account.Credentials.from_service_account_info",
+        lambda info, scopes: object(),
+    )
+    monkeypatch.setattr("mitra_app.drive.build", lambda *args, **kwargs: _FakeService())
+
+    asyncio.run(list_recent_files(limit=5))
+
+    assert captured["corpora"] == "drive"
+    assert captured["driveId"] == "shared-123"
