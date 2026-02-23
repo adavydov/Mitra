@@ -787,6 +787,8 @@ async def telegram_webhook(
             query = text[len("/search") :].strip()
             if not query:
                 reply_text = "Usage: /search <query>"
+            elif not os.getenv("BRAVE_SEARCH_API_KEY", "").strip():
+                reply_text = "Search not configured"
             else:
                 try:
                     search_results = await brave_web_search(query)
@@ -1041,7 +1043,7 @@ async def telegram_webhook(
         elif text.startswith("/budget"):
             reply_text = await budget_ledger.render_budget()
         elif text.startswith("/help") or text.startswith("/start"):
-            reply_text = "Commands: /status, /oauth_status, /research <query>, /report <text>, /pr_status <issue_number>"
+            reply_text = "Commands: /status, /oauth_status, /search <query>, /research <query>, /report <text>"
         else:
             reply_text = "Unknown command"
 
