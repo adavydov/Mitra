@@ -121,71 +121,72 @@ async def healthz() -> dict[str, str]:
 async def telegram_webhook(
     update: dict[str, Any],
     x_telegram_bot_api_secret_token: str | None = Header(default=None),
-) -> dict[str, str]:
+) -> dict[str, Any]:
     expected_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET")
     if not expected_secret or x_telegram_bot_api_secret_token != expected_secret:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    message = update.get("message") or {}
-    update_id = update.get("update_id")
-    text = message.get("text", "")
-    chat = message.get("chat") or {}
-    chat_id = chat.get("id")
-    from_user = message.get("from") or {}
-    user_id = from_user.get("id")
+    try:
+        message = update.get("message") or {}
+        update_id = update.get("update_id")
+        text = message.get("text", "")
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+        from_user = message.get("from") or {}
+        user_id = from_user.get("id")
 
-    if isinstance(update_id, int) and _recent_update_deduplicator.is_duplicate(update_id):
-        _audit_dedup(update_id=update_id, user_id=user_id, chat_id=chat_id)
-        return {"status": "ok"}
+        if isinstance(update_id, int) and _recent_update_deduplicator.is_duplicate(update_id):
+            _audit_dedup(update_id=update_id, user_id=user_id, chat_id=chat_id)
+            return {"status": "ok"}
 
-    allowed_user_ids_raw = os.getenv("ALLOWED_TELEGRAM_USER_IDS")
-    allowed_user_ids = _load_allowed_user_ids()
-    allowlist_configured = _is_allowlist_configured(allowed_user_ids_raw)
+        allowed_user_ids_raw = os.getenv("ALLOWED_TELEGRAM_USER_IDS")
+        allowed_user_ids = _load_allowed_user_ids()
+        allowlist_configured = _is_allowlist_configured(allowed_user_ids_raw)
 
-    if allowlist_configured and user_id not in allowed_user_ids:
-        _audit_allowlist_denied(user_id=user_id, chat_id=chat_id)
-        return {"status": "ok"}
+        if allowlist_configured and user_id not in allowed_user_ids:
+            _audit_allowlist_denied(user_id=user_id, chat_id=chat_id)
+            return {"status": "ok"}
 
-    if text.startswith("/status"):
-        reply_text = "Mitra alive"
-    elif text.startswith("/whoami"):
-        reply_text = f"user_id={user_id}, chat_id={chat_id}"
-    elif not allowlist_configured:
-        reply_text = "Allowlist not configured. Set ALLOWED_TELEGRAM_USER_IDS."
-    elif text.startswith("/report"):
-        report_text = text[len("/report") :].strip()
-        action_id = f"act-{uuid4().hex[:12]}"
-        file_id = ""
+        if text.startswith("/status"):
+            reply_text = "Mitra alive"
+        elif text.startswith("/whoami"):
+            reply_text = f"user_id={user_id}, chat_id={chat_id}"
+        elif not allowlist_configured:
+            reply_text = "Allowlist not configured. Set ALLOWED_TELEGRAM_USER_IDS."
+        elif text.startswith("/report"):
+            report_text = text[len("/report") :].strip()
+            action_id = f"act-{uuid4().hex[:12]}"
+            file_id = ""
 
-        if not report_text:
-            reply_text = "Usage: /report <text>"
-            log_report_event(action_id=action_id, file_id=file_id, outcome="invalid")
+            if not report_text:
+                reply_text = "Usage: /report <text>"
+                log_report_event(action_id=action_id, file_id=file_id, outcome="invalid")
+            else:
+                now = datetime.now(timezone.utc)
+                title = _build_report_title(report_text, now)
+                body = _build_report_body(report_text, now, action_id=action_id)
+
+                try:
+                    upload = await upload_markdown(title=title, markdown_body=body)
+                    file_id = upload.file_id
+                    link = upload.web_view_link or upload.file_id
+                    reply_text = f"Report uploaded: {link}"
+                    log_report_event(action_id=action_id, file_id=file_id, outcome="success", link=link)
+                except DriveNotConfigured:
+                    reply_text = "Drive disabled"
+                    log_report_event(action_id=action_id, file_id=file_id, outcome="drive_disabled")
+                except Exception:
+                    reply_text = "Report failed"
+                    log_report_event(action_id=action_id, file_id=file_id, outcome="error")
+        elif text.startswith("/help") or text.startswith("/start"):
+            reply_text = "Commands: /status, /report <text>"
         else:
-            now = datetime.now(timezone.utc)
-            title = _build_report_title(report_text, now)
-            body = _build_report_body(report_text, now, action_id=action_id)
+            reply_text = "Unknown command"
 
-            try:
-                upload = await upload_markdown(title=title, markdown_body=body)
-                file_id = upload.file_id
-                link = upload.web_view_link or upload.file_id
-                reply_text = f"Report uploaded: {link}"
-                log_report_event(action_id=action_id, file_id=file_id, outcome="success", link=link)
-            except DriveNotConfigured:
-                reply_text = "Drive disabled"
-                log_report_event(action_id=action_id, file_id=file_id, outcome="drive_disabled")
-            except Exception:
-                reply_text = "Report failed"
-                log_report_event(action_id=action_id, file_id=file_id, outcome="error")
-    elif text.startswith("/help") or text.startswith("/start"):
-        reply_text = "Commands: /status, /report <text>"
-    else:
-        reply_text = "Unknown command"
-
-    if chat_id is not None:
-        try:
+        if chat_id is not None:
             await send_message(chat_id=chat_id, text=reply_text)
-        except Exception:
-            logger.exception("telegram_send_message_failed", extra={"chat_id": chat_id})
 
-    return {"status": "ok"}
+        return {"status": "ok"}
+    except Exception:
+        logger.exception("telegram_webhook_failed")
+        return {"ok": True}
