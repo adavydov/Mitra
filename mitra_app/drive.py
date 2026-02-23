@@ -182,6 +182,14 @@ async def delete_file(file_id: str) -> None:
     service.files().delete(fileId=file_id).execute()
 
 
+async def trash_file(file_id: str) -> None:
+    credentials_info = {}
+    if get_drive_auth_mode() == "service_account":
+        credentials_info = _load_service_account_info()
+    service = _build_drive_service(credentials_info)
+    service.files().update(fileId=file_id, body={"trashed": True}, supportsAllDrives=True).execute()
+
+
 async def list_recent_files(limit: int = 5) -> list[DriveFile]:
     folder_id = os.getenv("DRIVE_ROOT_FOLDER_ID")
     if not folder_id:
@@ -218,15 +226,3 @@ async def list_recent_files(limit: int = 5) -> list[DriveFile]:
         for item in files
     ]
 
-
-async def check_drive_folder_access() -> None:
-    folder_id = os.getenv("DRIVE_ROOT_FOLDER_ID")
-    if not folder_id:
-        raise DriveNotConfigured("Missing DRIVE_ROOT_FOLDER_ID")
-
-    credentials_info = {}
-    if get_drive_auth_mode() == "service_account":
-        credentials_info = _load_service_account_info()
-    service = _build_drive_service(credentials_info)
-
-    service.files().get(fileId=folder_id, fields="id", supportsAllDrives=True).execute()
