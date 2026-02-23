@@ -1,29 +1,11 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://mitra.local/schemas/autonomy.schema.json",
   "type": "object",
-  "required": ["current_level", "levels"],
+  "required": ["id", "default_level", "safe_mode", "levels"],
   "properties": {
-    "current_level": {"type": "string", "pattern": "^AL[0-9]+$"},
-    "levels": {
-      "type": "object",
-      "minProperties": 1,
-      "additionalProperties": {
-        "type": "object",
-        "required": ["description", "max_risk", "max_budget_per_action", "allowed_tools"],
-        "properties": {
-          "description": {"type": "string"},
-          "max_risk": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"]},
-          "max_budget_per_action": {"type": "number", "minimum": 0},
-          "allowed_tools": {
-            "type": "array",
-            "items": {"type": "string"},
-            "uniqueItems": true
-          }
-        },
-        "additionalProperties": false
-      }
-    }
+    "id": {"type": "string"},
+    "default_level": {"type": "string", "enum": ["AL0", "AL1", "AL2", "AL3", "AL4"]},
+    "safe_mode": {"type": "boolean"},
+    "levels": {"type": "array", "items": {"type": "string"}}
   },
   "additionalProperties": false
 }

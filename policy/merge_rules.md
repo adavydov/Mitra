@@ -1,15 +1,10 @@
+ID: P-MERGE-01
+Level: L2
+Owner: User (merge)
+Status: active
+Depends on: L0-CONST, L0-HIER-01
+Config keys: (empty)
+Required evals: EVAL-REG-HEALTH-01
+
 # Merge Rules
-
-ID: POLICY-MERGE-RULES
-
-1. Any change in `policy/**` or `codex/**` requires User approval (CODEOWNERS: `@user`).
-2. Required CI checks for merge:
-   - `lint-ids`
-   - `schema-config`
-   - `evals-security`
-   - `evals-finance`
-   - `evals-privacy`
-   - `evals-scheduling`
-   - `evals-regression`
-3. Branch protection/ruleset must require up-to-date branches and block merge on failing required checks.
-REF: GOV-CONSTITUTION
+L0/L1 merge only by user; policy/codex require user approval.

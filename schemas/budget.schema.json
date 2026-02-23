@@ -1,18 +1,11 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://mitra.local/schemas/budget.schema.json",
   "type": "object",
-  "required": ["currency", "window", "hard_limit", "soft_limit", "tool_costs"],
+  "required": ["id", "daily_limit", "weekly_limit", "monthly_limit"],
   "properties": {
-    "currency": {"type": "string"},
-    "window": {"type": "string"},
-    "hard_limit": {"type": "number", "minimum": 0},
-    "soft_limit": {"type": "number", "minimum": 0},
-    "tool_costs": {
-      "type": "object",
-      "minProperties": 1,
-      "additionalProperties": {"type": "number", "minimum": 0}
-    }
+    "id": {"type": "string"},
+    "daily_limit": {"type": "integer"},
+    "weekly_limit": {"type": "integer"},
+    "monthly_limit": {"type": "integer"}
   },
   "additionalProperties": false
 }

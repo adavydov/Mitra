@@ -1,0 +1,7 @@
+{
+  "id": "CFG-TOOLS-01",
+  "telegram": true,
+  "drive": true,
+  "github": false,
+  "render": false
+}
