@@ -2,7 +2,7 @@ import json
 
 from fastapi.testclient import TestClient
 
-from mitra_app.drive import DriveNotConfiguredError, DriveUploadResult
+from mitra_app.drive import DriveNotConfigured, DriveUploadResult
 from mitra_app.main import _load_allowed_user_ids, app
 
 
@@ -172,13 +172,13 @@ def test_report_upload_success_replies_with_link_and_audits(monkeypatch, tmp_pat
         calls.append((chat_id, text))
         return True
 
-    async def fake_upload_markdown_document(title: str, markdown_body: str):
+    async def fake_upload_markdown(title: str, markdown_body: str):
         captured["title"] = title
         captured["body"] = markdown_body
         return DriveUploadResult(file_id="file-123", web_view_link="https://drive.test/view")
 
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
-    monkeypatch.setattr("mitra_app.main.upload_markdown_document", fake_upload_markdown_document)
+    monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
 
     response = client.post(
         "/telegram/webhook",
@@ -192,12 +192,14 @@ def test_report_upload_success_replies_with_link_and_audits(monkeypatch, tmp_pat
     assert "quarterly-risk-update" in captured["title"]
     assert "Quarterly risk update" in captured["body"]
     assert "timestamp:" in captured["body"]
+    assert "action_id:" in captured["body"]
 
     events = (tmp_path / "events.ndjson").read_text(encoding="utf-8").strip().splitlines()
     payload = json.loads(events[-1])
     assert payload["file_id"] == "file-123"
     assert payload["outcome"] == "success"
     assert payload["action_id"].startswith("act-")
+    assert payload["link"] == "https://drive.test/view"
 
 
 def test_report_drive_disabled_replies_and_audits(monkeypatch, tmp_path):
@@ -211,11 +213,11 @@ def test_report_drive_disabled_replies_and_audits(monkeypatch, tmp_path):
         calls.append((chat_id, text))
         return True
 
-    async def fake_upload_markdown_document(title: str, markdown_body: str):
-        raise DriveNotConfiguredError("disabled")
+    async def fake_upload_markdown(title: str, markdown_body: str):
+        raise DriveNotConfigured("disabled")
 
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
-    monkeypatch.setattr("mitra_app.main.upload_markdown_document", fake_upload_markdown_document)
+    monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
 
     response = client.post(
         "/telegram/webhook",
@@ -230,3 +232,36 @@ def test_report_drive_disabled_replies_and_audits(monkeypatch, tmp_path):
     payload = json.loads(events[-1])
     assert payload["file_id"] == ""
     assert payload["outcome"] == "drive_disabled"
+
+
+def test_report_upload_without_web_view_link_uses_file_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("MITRA_AUDIT_LOG", str(tmp_path / "events.ndjson"))
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_upload_markdown(title: str, markdown_body: str):
+        return DriveUploadResult(file_id="file-xyz", web_view_link=None)
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/report Something", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Report uploaded: file-xyz")]
+
+    events = (tmp_path / "events.ndjson").read_text(encoding="utf-8").strip().splitlines()
+    payload = json.loads(events[-1])
+    assert payload["file_id"] == "file-xyz"
+    assert payload["link"] == "file-xyz"
+    assert payload["outcome"] == "success"
