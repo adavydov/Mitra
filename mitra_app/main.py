@@ -3,10 +3,12 @@ import logging
 import os
 import re
 import json
+import traceback
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
+from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
@@ -15,28 +17,40 @@ from fastapi import FastAPI, Header, HTTPException
 from googleapiclient.errors import HttpError
 
 import mitra_app.audit as audit
+import mitra_app.github as github
 from mitra_app.audit import log_report_event
 from mitra_app.budget_ledger import budget_ledger
 from mitra_app.policy_enforcer import CommandPolicy, CommandPolicyEnforcer
 from mitra_app.drive import (
     DriveNotConfigured,
-    check_drive_folder_access,
     OAuthRefreshInvalidGrant,
-    check_drive_folder_access,
+    delete_file,
     get_drive_auth_mode,
     get_last_oauth_refresh_time,
     list_recent_files,
+    trash_file,
     upload_markdown,
 )
+from mitra_app.llm.anthropic import AnthropicClient
 from mitra_app.research import ResearchError, build_research_reply, run_research
 from mitra_app.telegram import ensure_webhook, send_message
 from mitra_app.search import SearchRateLimitExceeded, brave_web_search, format_search_results
+from mitra_app import github
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
 
 _THINK_PROMPT_MAX_CHARS = 1200
+_THINK_OUTPUT_MAX_CHARS = 900
 _SECRET_ENV_NAME_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|PRIVATE|API_KEY|ACCESS_KEY|CLIENT_SECRET)", re.IGNORECASE)
+_THINK_SYSTEM_PROMPT = (
+    "Ты помощник в режиме /think. Нужен только анализ текста пользователя без внешних действий. "
+    "Не используйте веб, GitHub, Drive, интеграции, инструменты или вызовы функций. "
+    "Верни ответ в формате:\n"
+    "Короткий ответ: ...\n"
+    "Допущения: ...\n"
+    "Следующие шаги: ..."
+)
 
 
 def _sensitive_env_names() -> set[str]:
@@ -83,13 +97,61 @@ def _build_think_reply(question: str) -> str:
     if not sanitized:
         return "Usage: /think <вопрос/задача>"
 
-    return "\n".join(
-        [
-            f"Что сделал: дал read-only разбор запроса «{sanitized}».",
-            "Допущения: внешние действия и интернет не используются; ответ только по тексту запроса.",
-            "Риск: без доп. контекста план может быть неполным.",
-        ]
+    llm_reply = _invoke_think_llm(sanitized)
+    if not llm_reply:
+        return "Не удалось получить ответ LLM для /think"
+
+    return _cap_output_chars(llm_reply, _THINK_OUTPUT_MAX_CHARS)
+
+
+def _invoke_think_llm(prompt: str, llm_client: AnthropicClient | None = None) -> str:
+    client = llm_client or AnthropicClient()
+    response = client.create_message(
+        messages=[{"role": "user", "content": prompt}],
+        system=_THINK_SYSTEM_PROMPT,
     )
+    content = response.get("content")
+    if not isinstance(content, list):
+        return ""
+
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+
+    return "\n".join(parts).strip()
+
+
+def _cap_output_chars(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit].rstrip()}…"
+
+
+def _extract_think_prompt(text: str) -> str:
+    command, _, remainder = text.partition(" ")
+    if command.startswith("/think"):
+        return remainder.strip()
+    return ""
+
+
+def _audit_think_command(action_id: str, user_id: int | None, command: str, outcome: str) -> None:
+    _safe_audit_event(
+        {
+            "event": "telegram_think",
+            "action_id": action_id,
+            "user_id": user_id,
+            "command": command,
+            "outcome": outcome,
+            "log_level": "info" if outcome in {"success", "usage"} else "error",
+        }
+    )
+
+
+def _extract_think_prompt(text: str) -> str:
+    return text[len("/think") :].strip()[:240]
 
 
 def _sanitize_drive_http_error(exc: HttpError) -> str:
@@ -122,8 +184,11 @@ _COMMAND_POLICIES: dict[str, CommandPolicy] = {
     "/whoami": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
     "/help": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
     "/start": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
+    "/smoke": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
+    "/smoke_deep": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="search"),
     "/reports": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
     "/report": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
+    "/pr_status": CommandPolicy(required_al="AL1", risk_level="R1", budget_category="search"),
     "/drive_check": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
     "/budget": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
 }
@@ -288,37 +353,50 @@ def _parse_pr_command(text: str) -> tuple[str, str] | None:
 
 
 async def _create_github_issue(title: str, body: str) -> tuple[int, str]:
-    token = os.getenv("GITHUB_TOKEN")
-    repository = os.getenv("GITHUB_REPOSITORY")
-    if not token or not repository:
-        raise RuntimeError("GitHub integration is not configured")
-
-    if "/" not in repository:
-        raise RuntimeError("GITHUB_REPOSITORY must be owner/repo")
-
-    api_url = f"https://api.github.com/repos/{repository}/issues"
-    payload = {
-        "title": title,
-        "body": body,
-        "labels": ["mitra:codex"],
-    }
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        response = await client.post(api_url, json=payload, headers=headers)
-        response.raise_for_status()
-        response_payload: dict[str, Any] = response.json()
-
-    issue_number = int(response_payload.get("number", 0))
-    issue_url = str(response_payload.get("html_url", ""))
+    issue = await github.create_issue(title=title, body=body, labels=["mitra:codex"])
+    issue_number = issue.number
+    issue_url = issue.html_url
     if issue_number <= 0 or not issue_url:
         raise RuntimeError("GitHub issue create returned invalid response")
 
     return issue_number, issue_url
+
+
+
+
+def _parse_pr_status_command(text: str) -> str | None:
+    body = text[len("/pr_status") :].strip()
+    return body or None
+
+
+async def _build_pr_status_reply(ref: str) -> str:
+    try:
+        issue_number = int(ref)
+    except ValueError:
+        return "Usage: /pr_status <issue#|pr#>"
+
+    try:
+        linked_pr = await github.find_linked_pr(issue_number)
+        if linked_pr is None:
+            return f"No linked PR found for issue #{issue_number}"
+
+        pr_status = await github.get_pr_status(linked_pr.number)
+        checks = await github.get_pr_checks_summary(pr_status.head_sha)
+    except Exception:
+        logger.exception("telegram_pr_status_failed", extra={"issue_number": issue_number})
+        return "Failed to fetch PR status"
+
+    state = pr_status.state or "unknown"
+    if pr_status.draft:
+        state = f"{state}, draft"
+    if pr_status.merged:
+        state = "merged"
+
+    return (
+        f"PR: {linked_pr.html_url}\n"
+        f"State: {state}\n"
+        f"Checks: total={checks.total}, success={checks.successful}, failed={checks.failed}, pending={checks.pending}"
+    )
 
 
 def _load_allowed_user_ids() -> set[int]:
@@ -434,6 +512,17 @@ def _sanitize_report_error(exc: Exception) -> str:
     return "Report failed"
 
 
+def _sanitize_research_error(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        return f"Research failed ({status})"
+
+    if isinstance(exc, httpx.HTTPError):
+        return "Research failed (network error)"
+
+    return "Research failed"
+
+
 def _audit_drive_check(user_id: int | None, chat_id: int | None, auth_mode: str, outcome: str, detail: str) -> None:
     event = {
         "event": "drive_check",
@@ -454,12 +543,23 @@ def _audit_drive_check(user_id: int | None, chat_id: int | None, auth_mode: str,
 
 def _safe_drive_check_error(exc: Exception) -> str:
     if isinstance(exc, DriveNotConfigured):
-        return "drive_not_configured"
+        return "Drive error: drive_not_configured"
 
     if isinstance(exc, HttpError):
         return _sanitize_drive_http_error(exc)
 
-    return "drive_check_failed"
+    return "Drive error: unknown drive_check_failed"
+
+
+async def _run_drive_check(auth_mode: str) -> tuple[str, str]:
+    started_at = perf_counter()
+    check_body = "# mitra drive check\n\nhealth ping"
+    upload = await upload_markdown(title="mitra-drive-check", markdown_body=check_body)
+    file_id = upload.file_id or "unknown"
+    await trash_file(file_id)
+    latency_ms = int((perf_counter() - started_at) * 1000)
+    reply = f"Drive OK (auth={auth_mode}) latency_ms={latency_ms} file_id={file_id} (deleted)"
+    return reply, "upload+trash ok"
 
 
 def _is_budget_admin(user_id: int | None) -> bool:
@@ -469,6 +569,107 @@ def _is_budget_admin(user_id: int | None) -> bool:
     if owner_id is None:
         return False
     return str(user_id) == owner_id.strip()
+
+
+def _smoke_line(name: str, status: str, reason: str) -> str:
+    return f"- {name}: {status} ({reason})"
+
+
+def _is_drive_configured() -> bool:
+    if not os.getenv("DRIVE_ROOT_FOLDER_ID"):
+        return False
+    if get_drive_auth_mode() == "oauth":
+        return bool(os.getenv("DRIVE_OAUTH_CLIENT_ID") and os.getenv("DRIVE_OAUTH_CLIENT_SECRET") and os.getenv("DRIVE_OAUTH_REFRESH_TOKEN"))
+    return bool(os.getenv("DRIVE_SERVICE_ACCOUNT_JSON") or os.getenv("DRIVE_SERVICE_ACCOUNT_JSON_B64"))
+
+
+def _is_budget_ledger_loaded() -> bool | None:
+    if budget_ledger is None:
+        return None
+    state = getattr(budget_ledger, "_state", None)
+    return isinstance(state, dict) and bool(state)
+
+
+def _build_smoke_reply(*, user_id: int | None, allowlist_configured: bool, allowed_user_ids: set[int]) -> str:
+    lines = [
+        _smoke_line("telegram", "OK", "webhook command processed"),
+    ]
+
+    if not allowlist_configured:
+        lines.append(_smoke_line("allowlist", "FAIL", "ALLOWED_TELEGRAM_USER_IDS missing"))
+    elif user_id in allowed_user_ids:
+        lines.append(_smoke_line("allowlist", "OK", f"user_id={user_id} allowed"))
+    else:
+        lines.append(_smoke_line("allowlist", "FAIL", f"user_id={user_id} not in allowlist"))
+
+    auth_mode = get_drive_auth_mode()
+    last_refresh_at = get_last_oauth_refresh_time() or "never"
+    lines.append(_smoke_line("oauth", "OK", f"auth_mode={auth_mode}, last_refresh_at={last_refresh_at}"))
+
+    lines.append(_smoke_line("drive", "OK" if _is_drive_configured() else "FAIL", "configured" if _is_drive_configured() else "env missing"))
+
+    ledger_loaded = _is_budget_ledger_loaded()
+    if ledger_loaded is None:
+        lines.append(_smoke_line("budgets", "NA", "ledger disabled"))
+    elif ledger_loaded:
+        lines.append(_smoke_line("budgets", "OK", "ledger loaded"))
+    else:
+        lines.append(_smoke_line("budgets", "FAIL", "ledger not loaded"))
+
+    lines.append(_smoke_line("llm", "OK" if os.getenv("ANTHROPIC_API_KEY") else "FAIL", "configured" if os.getenv("ANTHROPIC_API_KEY") else "ANTHROPIC_API_KEY missing"))
+    lines.append(_smoke_line("search", "OK" if os.getenv("BRAVE_SEARCH_API_KEY") else "FAIL", "configured" if os.getenv("BRAVE_SEARCH_API_KEY") else "BRAVE_SEARCH_API_KEY missing"))
+    return "\n".join(lines)
+
+
+async def _run_smoke_deep_checks() -> tuple[str, dict[str, object]]:
+    lines: list[str] = []
+    audit_payload: dict[str, object] = {"event": "smoke_deep"}
+
+    drive_start = time.perf_counter()
+    try:
+        upload = await upload_markdown(title="mitra-smoke-deep", markdown_body="ok")
+        await delete_file(upload.file_id)
+        drive_latency_ms = int((time.perf_counter() - drive_start) * 1000)
+        lines.append(_smoke_line("drive_deep", "OK", f"latency_ms={drive_latency_ms}"))
+        audit_payload["drive"] = {"status": "ok", "latency_ms": drive_latency_ms}
+    except Exception as exc:
+        drive_latency_ms = int((time.perf_counter() - drive_start) * 1000)
+        detail = _sanitize_report_error(exc)
+        lines.append(_smoke_line("drive_deep", "FAIL", f"{detail}, latency_ms={drive_latency_ms}"))
+        audit_payload["drive"] = {"status": "fail", "detail": detail, "latency_ms": drive_latency_ms}
+
+    llm_start = time.perf_counter()
+    try:
+        llm_payload = AnthropicClient(max_tokens_out=8).create_message([{"role": "user", "content": "Reply with PONG"}])
+        response_text = json.dumps(llm_payload).upper()
+        llm_latency_ms = int((time.perf_counter() - llm_start) * 1000)
+        if "PONG" in response_text:
+            lines.append(_smoke_line("llm_deep", "OK", f"latency_ms={llm_latency_ms}"))
+            audit_payload["llm"] = {"status": "ok", "latency_ms": llm_latency_ms}
+        else:
+            lines.append(_smoke_line("llm_deep", "FAIL", f"unexpected_response, latency_ms={llm_latency_ms}"))
+            audit_payload["llm"] = {"status": "fail", "detail": "unexpected_response", "latency_ms": llm_latency_ms}
+    except Exception:
+        llm_latency_ms = int((time.perf_counter() - llm_start) * 1000)
+        lines.append(_smoke_line("llm_deep", "FAIL", f"request_failed, latency_ms={llm_latency_ms}"))
+        audit_payload["llm"] = {"status": "fail", "detail": "request_failed", "latency_ms": llm_latency_ms}
+
+    if not os.getenv("BRAVE_SEARCH_API_KEY"):
+        lines.append(_smoke_line("search_deep", "NA", "BRAVE_SEARCH_API_KEY missing"))
+        audit_payload["search"] = {"status": "na", "detail": "api_key_missing"}
+    else:
+        search_start = time.perf_counter()
+        try:
+            await brave_web_search("mitra smoke ping")
+            search_latency_ms = int((time.perf_counter() - search_start) * 1000)
+            lines.append(_smoke_line("search_deep", "OK", f"latency_ms={search_latency_ms}"))
+            audit_payload["search"] = {"status": "ok", "latency_ms": search_latency_ms}
+        except Exception:
+            search_latency_ms = int((time.perf_counter() - search_start) * 1000)
+            lines.append(_smoke_line("search_deep", "FAIL", f"request_failed, latency_ms={search_latency_ms}"))
+            audit_payload["search"] = {"status": "fail", "detail": "request_failed", "latency_ms": search_latency_ms}
+
+    return "\n".join(lines), audit_payload
 
 
 @app.get("/healthz")
@@ -484,12 +685,7 @@ async def drive_check() -> dict[str, str]:
     if auth_mode == "oauth" and last_refresh_at:
         payload["last_refresh_at"] = last_refresh_at
 
-    try:
-        await check_drive_folder_access()
-        return payload
-    except Exception as exc:
-        payload["status"] = _safe_drive_check_error(exc)
-        return payload
+    return payload
 
 
 @app.post("/telegram/webhook")
@@ -531,7 +727,7 @@ async def telegram_webhook(
             )
             return {"status": "ok"}
 
-        policy_bypass_commands = {"/status", "/oauth_status", "/whoami", "/help", "/start"}
+        policy_bypass_commands = {"/status", "/oauth_status", "/whoami", "/help", "/start", "/smoke"}
         if allowlist_configured or action_type in policy_bypass_commands:
             deny_reason = _enforce_command_policy(
                 action_type=action_type,
@@ -547,6 +743,39 @@ async def telegram_webhook(
 
         if text.startswith("/status"):
             reply_text = "Mitra alive"
+        elif text.startswith("/smoke_deep"):
+            reply_text, smoke_audit = await _run_smoke_deep_checks()
+            _safe_audit_event(
+                {
+                    "event": "telegram_smoke_deep",
+                    "action_id": action_id,
+                    "telegram_update_id": telegram_update_id,
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "action_type": "/smoke_deep",
+                    "outcome": "completed",
+                    "checks": smoke_audit,
+                    "log_level": "info",
+                }
+            )
+        elif text.startswith("/smoke"):
+            reply_text = _build_smoke_reply(
+                user_id=user_id if isinstance(user_id, int) else None,
+                allowlist_configured=allowlist_configured,
+                allowed_user_ids=allowed_user_ids,
+            )
+            _safe_audit_event(
+                {
+                    "event": "telegram_smoke",
+                    "action_id": action_id,
+                    "telegram_update_id": telegram_update_id,
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "action_type": "/smoke",
+                    "outcome": "completed",
+                    "log_level": "info",
+                }
+            )
         elif text.startswith("/oauth_status"):
             auth_mode = get_drive_auth_mode()
             last_refresh_at = get_last_oauth_refresh_time() or "never"
@@ -572,11 +801,53 @@ async def telegram_webhook(
                 except Exception:
                     reply_text = "Search failed"
                     logger.exception("search_command_failed")
+        elif text.startswith("/llm_check"):
+            try:
+                reply_text = await _run_llm_check()
+                _safe_audit_event(
+                    {
+                        "event": "llm_check",
+                        "action_id": action_id,
+                        "telegram_update_id": telegram_update_id,
+                        "user_id": user_id,
+                        "chat_id": chat_id,
+                        "action_type": "/llm_check",
+                        "outcome": "ok" if reply_text.startswith("LLM OK") else "not_configured",
+                        "detail": reply_text,
+                        "log_level": "info",
+                    }
+                )
+            except Exception as exc:
+                logger.exception("llm_check_failed")
+                reply_text = _sanitize_llm_error(exc)
+                _safe_audit_event(
+                    {
+                        "event": "llm_check",
+                        "action_id": action_id,
+                        "telegram_update_id": telegram_update_id,
+                        "user_id": user_id,
+                        "chat_id": chat_id,
+                        "action_type": "/llm_check",
+                        "outcome": "error",
+                        "detail": repr(exc),
+                        "log_level": "error",
+                    }
+                )
         elif not allowlist_configured:
             reply_text = "Allowlist not configured. Set ALLOWED_TELEGRAM_USER_IDS."
         elif text.startswith("/think"):
             think_prompt = _extract_think_prompt(text)
-            reply_text = _build_think_reply(think_prompt)
+            if not think_prompt:
+                reply_text = "Usage: /think <вопрос/задача>"
+                _audit_think_command(action_id=action_id, user_id=user_id, command="/think", outcome="usage")
+            else:
+                try:
+                    reply_text = _build_think_reply(think_prompt)
+                    _audit_think_command(action_id=action_id, user_id=user_id, command="/think", outcome="success")
+                except Exception:
+                    logger.exception("think_command_failed")
+                    reply_text = "Не удалось получить ответ LLM для /think"
+                    _audit_think_command(action_id=action_id, user_id=user_id, command="/think", outcome="error")
         elif text.startswith("/reports"):
             try:
                 files = await list_recent_files(limit=5)
@@ -601,9 +872,23 @@ async def telegram_webhook(
                     reply_text = build_research_reply(query, items, summary)
                 except ResearchError as exc:
                     reply_text = str(exc)
-                except Exception:
-                    reply_text = "Research failed"
+                except Exception as exc:
+                    reply_text = _sanitize_research_error(exc)
                     logger.exception("research_command_failed")
+                    _safe_audit_event(
+                        {
+                            "event": "research_command_failed",
+                            "action_id": action_id,
+                            "telegram_update_id": telegram_update_id,
+                            "user_id": user_id,
+                            "chat_id": chat_id,
+                            "action_type": "/research",
+                            "outcome": "error",
+                            "error": str(exc),
+                            "traceback": traceback.format_exc(),
+                            "log_level": "error",
+                        }
+                    )
         elif text.startswith("/report"):
             report_text = text[len("/report") :].strip()
             file_id = ""
@@ -683,6 +968,12 @@ async def telegram_webhook(
                         action_type="/report",
                         log_level="error",
                     )
+        elif text.startswith("/pr_status"):
+            ref = _parse_pr_status_command(text)
+            if ref is None:
+                reply_text = "Usage: /pr_status <issue#|pr#>"
+            else:
+                reply_text = await _build_pr_status_reply(ref)
         elif text.startswith("/pr"):
             parsed = _parse_pr_command(text)
             if not parsed:
@@ -727,17 +1018,15 @@ async def telegram_webhook(
                         "action_type": "/pr",
                         "issue_number": issue_number,
                         "outcome": outcome,
-                        "log_level": "info" if outcome == "success" else "error",
+                        "log_level": "info" if outcome in {"success", "usage"} else "error",
                     }
                 )
         elif text.startswith("/drive_check"):
             auth_mode = get_drive_auth_mode()
 
             try:
-                upload = await upload_markdown(title="mitra-drive-check", markdown_body="test")
-                await delete_file(upload.file_id)
-                reply_text = "Drive OK (auth=oauth)"
-                _audit_drive_check(user_id=user_id, chat_id=chat_id, auth_mode=auth_mode, outcome="success", detail="upload+delete ok")
+                reply_text, detail = await _run_drive_check(auth_mode)
+                _audit_drive_check(user_id=user_id, chat_id=chat_id, auth_mode=auth_mode, outcome="success", detail=detail)
             except Exception as exc:
                 detail = _safe_drive_check_error(exc)
                 reply_text = detail
@@ -752,7 +1041,7 @@ async def telegram_webhook(
         elif text.startswith("/budget"):
             reply_text = await budget_ledger.render_budget()
         elif text.startswith("/help") or text.startswith("/start"):
-            reply_text = "Commands: /status, /oauth_status, /research <query>, /report <text>"
+            reply_text = "Commands: /status, /oauth_status, /research <query>, /report <text>, /pr_status <issue_number>"
         else:
             reply_text = "Unknown command"
 
