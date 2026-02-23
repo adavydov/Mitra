@@ -81,16 +81,20 @@ def _audit_allowlist_denied(user_id: int | None, chat_id: int | None) -> None:
 
 
 def _audit_dedup(update_id: int, user_id: int | None, chat_id: int | None) -> None:
-    logger.info(
-        "telegram_dedup",
-        extra={
-            "event": "telegram_dedup",
-            "update_id": update_id,
-            "user_id": user_id,
-            "chat_id": chat_id,
-            "outcome": "dedup",
-        },
-    )
+    event = {
+        "event": "telegram_dedup",
+        "update_id": update_id,
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "outcome": "dedup",
+    }
+
+    log_event = getattr(audit, "log_event", None)
+    if callable(log_event):
+        log_event(event)
+        return
+
+    logger.info("telegram_dedup", extra=event)
 
 
 def _build_report_title(now: datetime) -> str:
