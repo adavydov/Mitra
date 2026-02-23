@@ -1,4 +1,8 @@
 import json
+import logging
+
+import httplib2
+from googleapiclient.errors import HttpError
 
 from fastapi.testclient import TestClient
 
@@ -246,6 +250,63 @@ def test_report_drive_disabled_replies_and_audits(monkeypatch, tmp_path):
     assert payload["file_id"] == ""
     assert payload["user_id"] == 123
     assert payload["outcome"] == "drive_disabled"
+
+
+def test_report_http_error_replies_with_sanitized_status_and_reason(monkeypatch, tmp_path, caplog):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("MITRA_AUDIT_LOG", str(tmp_path / "events.ndjson"))
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_upload_markdown(title: str, markdown_body: str):
+        response = httplib2.Response({"status": "403", "reason": "Forbidden"})
+        content = b'{"error": {"errors": [{"reason": "insufficientFilePermissions"}]}}'
+        raise HttpError(resp=response, content=content)
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
+
+    with caplog.at_level(logging.ERROR):
+        response = client.post(
+            "/telegram/webhook",
+            headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+            json={"message": {"text": "/report Something", "chat": {"id": 123}, "from": {"id": 123}}},
+        )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Drive error: 403 insufficientFilePermissions")]
+    assert any(record.message == "report_upload_failed" and record.exc_info for record in caplog.records)
+
+
+def test_report_generic_error_does_not_leak_exception_message(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_upload_markdown(title: str, markdown_body: str):
+        raise RuntimeError("api_key=secret-token")
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/report Something", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Report failed")]
 
 
 def test_report_upload_without_web_view_link_uses_file_id(monkeypatch, tmp_path):
