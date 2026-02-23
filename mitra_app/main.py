@@ -16,6 +16,7 @@ from googleapiclient.errors import HttpError
 
 import mitra_app.audit as audit
 from mitra_app.audit import log_report_event
+from mitra_app.budget_ledger import budget_ledger
 from mitra_app.policy_enforcer import CommandPolicy, CommandPolicyEnforcer
 from mitra_app.drive import (
     DriveNotConfigured,
@@ -201,14 +202,22 @@ def _enforce_command_policy(
 
 @app.on_event("startup")
 async def startup_sync_webhook() -> None:
-    await budget_ledger.load()
-    logger.info(
-        "drive_auth_state",
-        extra={"mode": get_drive_auth_mode(), "last_refresh_at": get_last_oauth_refresh_time()},
-    )
-    ok, detail = await ensure_webhook()
-    if not ok:
-        logger.warning("startup_webhook_sync_failed", extra={"detail": detail})
+    try:
+        if budget_ledger:
+            await budget_ledger.load()
+    except Exception:
+        logger.exception("startup_budget_ledger_failed")
+
+    try:
+        logger.info(
+            "drive_auth_state",
+            extra={"mode": get_drive_auth_mode(), "last_refresh_at": get_last_oauth_refresh_time()},
+        )
+        ok, detail = await ensure_webhook()
+        if not ok:
+            logger.warning("startup_webhook_sync_failed", extra={"detail": detail})
+    except Exception:
+        logger.exception("startup_webhook_sync_failed")
 
 
 class RecentUpdateDeduplicator:
