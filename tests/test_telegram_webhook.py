@@ -97,6 +97,57 @@ def test_allowlist_not_configured_allows_whoami(monkeypatch):
     assert calls == [(123, "user_id=999, chat_id=123")]
 
 
+def test_search_without_brave_api_key_returns_not_configured(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def forbidden_search(query: str):
+        raise AssertionError("Search provider should not be called without API key")
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.brave_web_search", forbidden_search)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/search ai news", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Search not configured")]
+
+
+def test_start_command_lists_search(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "999")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/start", "chat": {"id": 123}, "from": {"id": 999}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [
+        (123, "Commands: /status, /oauth_status, /search <query>, /research <query>, /report <text>")
+    ]
+
+
 def test_think_command_returns_short_read_only_response(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
