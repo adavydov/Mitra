@@ -25,14 +25,20 @@ def log_report_event(
     user_id: int | None = None,
     chat_id: int | None = None,
     link: str | None = None,
+    telegram_update_id: int | None = None,
+    action_type: str = "/report",
+    log_level: str = "info",
 ) -> None:
     try:
         event: dict[str, object] = {
             "action_id": action_id,
+            "telegram_update_id": telegram_update_id,
             "user_id": user_id,
             "chat_id": chat_id,
+            "action_type": action_type,
             "file_id": file_id,
             "outcome": outcome,
+            "log_level": log_level,
         }
         if link:
             event["link"] = link
@@ -47,6 +53,9 @@ def log_report_event(
                 "file_id": file_id,
                 "outcome": outcome,
                 "link": link,
+                "telegram_update_id": telegram_update_id,
+                "action_type": action_type,
+                "log_level": "error",
                 "error": str(exc),
             }
         )

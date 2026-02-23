@@ -101,35 +101,52 @@ def _is_allowlist_configured(raw_value: str | None) -> bool:
     return bool(raw_value and raw_value.strip())
 
 
-def _audit_allowlist_denied(user_id: int | None, chat_id: int | None) -> None:
-    event = {
-        "event": "telegram_allowlist_denied",
-        "user_id": user_id,
-        "chat_id": chat_id,
-    }
+def _audit_allowlist_denied(
+    user_id: int | None,
+    chat_id: int | None,
+    action_id: str,
+    telegram_update_id: int | None,
+    action_type: str,
+) -> None:
+    _safe_audit_event(
+        {
+            "event": "telegram_allowlist_denied",
+            "action_id": action_id,
+            "telegram_update_id": telegram_update_id,
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "action_type": action_type,
+            "outcome": "denied",
+            "log_level": "info",
+        }
+    )
 
-    log_event = getattr(audit, "log_event", None)
-    if callable(log_event):
-        log_event(event)
-        return
 
-    print(event)
-
-
-def _audit_dedup(update_id: int, user_id: int | None, chat_id: int | None) -> None:
+def _audit_dedup(update_id: int, user_id: int | None, chat_id: int | None, action_id: str) -> None:
     event = {
         "event": "telegram_dedup",
-        "update_id": update_id,
+        "action_id": action_id,
+        "telegram_update_id": update_id,
         "user_id": user_id,
         "chat_id": chat_id,
+        "action_type": "dedup_check",
         "outcome": "dedup",
+        "log_level": "info",
     }
 
-    logger.info("telegram_dedup", extra=event)
+    _safe_audit_event(event)
 
+
+def _safe_audit_event(event: dict[str, object]) -> None:
     log_event = getattr(audit, "log_event", None)
     if callable(log_event):
-        log_event(event)
+        try:
+            log_event(event)
+        except Exception:
+            logger.exception("telegram_audit_failed", extra={"event": event})
+        return
+
+    logger.info("telegram_audit_event", extra=event)
 
 
 def _build_report_title(now: datetime) -> str:
@@ -232,14 +249,17 @@ async def telegram_webhook(
     try:
         message = update.get("message") or {}
         update_id = update.get("update_id")
+        action_id = f"act-{uuid4().hex[:12]}"
+        telegram_update_id = update_id if isinstance(update_id, int) else None
         text = message.get("text", "")
         chat = message.get("chat") or {}
         chat_id = chat.get("id")
         from_user = message.get("from") or {}
         user_id = from_user.get("id")
+        action_type = text.split()[0] if isinstance(text, str) and text else "no_command"
 
         if isinstance(update_id, int) and _recent_update_deduplicator.is_duplicate(update_id):
-            _audit_dedup(update_id=update_id, user_id=user_id, chat_id=chat_id)
+            _audit_dedup(update_id=update_id, user_id=user_id, chat_id=chat_id, action_id=action_id)
             return {"status": "ok"}
 
         allowed_user_ids_raw = os.getenv("ALLOWED_TELEGRAM_USER_IDS")
@@ -247,7 +267,13 @@ async def telegram_webhook(
         allowlist_configured = _is_allowlist_configured(allowed_user_ids_raw)
 
         if allowlist_configured and user_id not in allowed_user_ids:
-            _audit_allowlist_denied(user_id=user_id, chat_id=chat_id)
+            _audit_allowlist_denied(
+                user_id=user_id,
+                chat_id=chat_id,
+                action_id=action_id,
+                telegram_update_id=telegram_update_id,
+                action_type=action_type,
+            )
             return {"status": "ok"}
 
         if text.startswith("/status"):
@@ -277,17 +303,19 @@ async def telegram_webhook(
                 logger.exception("report_list_failed")
         elif text.startswith("/report"):
             report_text = text[len("/report") :].strip()
-            action_id = f"act-{uuid4().hex[:12]}"
             file_id = ""
 
             if not report_text:
                 reply_text = "Usage: /report <text>"
                 log_report_event(
                     action_id=action_id,
+                    telegram_update_id=telegram_update_id,
                     file_id=file_id,
                     outcome="invalid",
                     user_id=user_id,
                     chat_id=chat_id,
+                    action_type="/report",
+                    log_level="info",
                 )
             else:
                 now = datetime.now(timezone.utc)
@@ -301,21 +329,27 @@ async def telegram_webhook(
                     reply_text = f"Saved: {link}"
                     log_report_event(
                         action_id=action_id,
+                        telegram_update_id=telegram_update_id,
                         file_id=file_id,
                         outcome="success",
                         user_id=user_id,
                         chat_id=chat_id,
                         link=link,
+                        action_type="/report",
+                        log_level="info",
                     )
                 except DriveNotConfigured as exc:
                     reply_text = _sanitize_report_error(exc)
                     logger.exception("report_upload_drive_not_configured")
                     log_report_event(
                         action_id=action_id,
+                        telegram_update_id=telegram_update_id,
                         file_id=file_id,
                         outcome="drive_disabled",
                         user_id=user_id,
                         chat_id=chat_id,
+                        action_type="/report",
+                        log_level="error",
                     )
                 except OAuthRefreshInvalidGrant as exc:
                     reply_text = str(exc)
@@ -335,10 +369,13 @@ async def telegram_webhook(
                     logger.exception("report_upload_failed")
                     log_report_event(
                         action_id=action_id,
+                        telegram_update_id=telegram_update_id,
                         file_id=file_id,
                         outcome="error",
                         user_id=user_id,
                         chat_id=chat_id,
+                        action_type="/report",
+                        log_level="error",
                     )
         elif text.startswith("/drive_check"):
             auth_mode = get_drive_auth_mode()
@@ -356,6 +393,19 @@ async def telegram_webhook(
             reply_text = "Commands: /status, /oauth_status, /report <text>"
         else:
             reply_text = "Unknown command"
+
+        _safe_audit_event(
+            {
+                "event": "telegram_command",
+                "action_id": action_id,
+                "telegram_update_id": telegram_update_id,
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "action_type": action_type,
+                "outcome": "success",
+                "log_level": "info",
+            }
+        )
 
         if chat_id is not None:
             await send_message(chat_id=chat_id, text=reply_text)
