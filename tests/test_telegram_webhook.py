@@ -487,3 +487,70 @@ def test_startup_logs_drive_auth_mode(monkeypatch):
 
     assert captured["message"] == "drive_auth_mode"
     assert captured["extra"] == {"mode": "oauth"}
+
+
+def test_reports_lists_recent_files(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    class _FakeDriveFile:
+        def __init__(self, file_id: str, name: str, web_view_link: str | None):
+            self.file_id = file_id
+            self.name = name
+            self.web_view_link = web_view_link
+
+    async def fake_list_recent_files(limit: int):
+        assert limit == 5
+        return [
+            _FakeDriveFile(file_id="f1", name="Report A", web_view_link="https://drive/1"),
+            _FakeDriveFile(file_id="f2", name="Report B", web_view_link=None),
+        ]
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.list_recent_files", fake_list_recent_files)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/reports", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [
+        (
+            123,
+            "Latest reports:\n- Report A: https://drive/1\n- Report B: f2",
+        )
+    ]
+
+
+def test_reports_handles_drive_error(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_list_recent_files(limit: int):
+        raise DriveNotConfiguredError("disabled")
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.list_recent_files", fake_list_recent_files)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/reports", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Drive disabled")]
