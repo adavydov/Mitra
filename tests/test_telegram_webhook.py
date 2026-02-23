@@ -445,3 +445,45 @@ def test_webhook_returns_200_when_send_message_raises(monkeypatch):
 
     assert response.status_code == 200
     assert response.json() == {"ok": True}
+
+
+def test_drive_check_reports_service_account_mode(monkeypatch):
+    monkeypatch.delenv("DRIVE_OAUTH_REFRESH_TOKEN", raising=False)
+
+    response = client.get("/drive_check")
+
+    assert response.status_code == 200
+    assert response.json() == {"auth_mode": "service_account"}
+
+
+def test_drive_check_reports_oauth_mode(monkeypatch):
+    monkeypatch.setenv("DRIVE_OAUTH_REFRESH_TOKEN", "refresh-token")
+
+    response = client.get("/drive_check")
+
+    assert response.status_code == 200
+    assert response.json() == {"auth_mode": "oauth"}
+
+
+def test_startup_logs_drive_auth_mode(monkeypatch):
+    monkeypatch.setenv("DRIVE_OAUTH_REFRESH_TOKEN", "refresh-token")
+
+    captured: dict[str, object] = {}
+
+    async def fake_ensure_webhook():
+        return True, "ok"
+
+    def fake_info(message, extra=None):
+        captured["message"] = message
+        captured["extra"] = extra
+
+    monkeypatch.setattr("mitra_app.main.ensure_webhook", fake_ensure_webhook)
+    monkeypatch.setattr("mitra_app.main.logger.info", fake_info)
+
+    import asyncio
+    from mitra_app.main import startup_sync_webhook
+
+    asyncio.run(startup_sync_webhook())
+
+    assert captured["message"] == "drive_auth_mode"
+    assert captured["extra"] == {"mode": "oauth"}

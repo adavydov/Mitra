@@ -7,6 +7,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
+from google.oauth2.credentials import Credentials as OAuthCredentials
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload
@@ -19,6 +20,10 @@ class DriveNotConfigured(RuntimeError):
 
 
 DriveNotConfiguredError = DriveNotConfigured
+
+
+def get_drive_auth_mode() -> str:
+    return "oauth" if os.getenv("DRIVE_OAUTH_REFRESH_TOKEN") else "service_account"
 
 
 @dataclass
@@ -48,6 +53,25 @@ def _load_service_account_info() -> dict[str, Any]:
 
 
 def _build_drive_service(credentials_info: dict[str, Any]):
+    if get_drive_auth_mode() == "oauth":
+        client_id = os.getenv("DRIVE_OAUTH_CLIENT_ID")
+        client_secret = os.getenv("DRIVE_OAUTH_CLIENT_SECRET")
+        refresh_token = os.getenv("DRIVE_OAUTH_REFRESH_TOKEN")
+        token_uri = os.getenv("DRIVE_OAUTH_TOKEN_URI", "https://oauth2.googleapis.com/token")
+
+        if not client_id or not client_secret or not refresh_token:
+            raise DriveNotConfigured("Missing OAuth credentials")
+
+        credentials = OAuthCredentials(
+            token=None,
+            refresh_token=refresh_token,
+            token_uri=token_uri,
+            client_id=client_id,
+            client_secret=client_secret,
+            scopes=[_DRIVE_SCOPE],
+        )
+        return build("drive", "v3", credentials=credentials, cache_discovery=False)
+
     credentials = service_account.Credentials.from_service_account_info(
         credentials_info,
         scopes=[_DRIVE_SCOPE],
@@ -60,7 +84,9 @@ async def upload_markdown(title: str, markdown_body: str) -> DriveUploadResult:
     if not folder_id:
         raise DriveNotConfigured("Missing DRIVE_ROOT_FOLDER_ID")
 
-    credentials_info = _load_service_account_info()
+    credentials_info = {}
+    if get_drive_auth_mode() == "service_account":
+        credentials_info = _load_service_account_info()
     service = _build_drive_service(credentials_info)
 
     metadata = {

@@ -13,7 +13,7 @@ from googleapiclient.errors import HttpError
 
 import mitra_app.audit as audit
 from mitra_app.audit import log_report_event
-from mitra_app.drive import DriveNotConfigured, upload_markdown
+from mitra_app.drive import DriveNotConfigured, get_drive_auth_mode, upload_markdown
 from mitra_app.telegram import ensure_webhook, send_message
 
 app = FastAPI()
@@ -47,6 +47,7 @@ def _sanitize_drive_http_error(exc: HttpError) -> str:
 
 @app.on_event("startup")
 async def startup_sync_webhook() -> None:
+    logger.info("drive_auth_mode", extra={"mode": get_drive_auth_mode()})
     ok, detail = await ensure_webhook()
     if not ok:
         logger.warning("startup_webhook_sync_failed", extra={"detail": detail})
@@ -175,6 +176,11 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/drive_check")
+async def drive_check() -> dict[str, str]:
+    return {"auth_mode": get_drive_auth_mode()}
+
+
 @app.post("/telegram/webhook")
 async def telegram_webhook(
     update: dict[str, Any],
@@ -245,7 +251,7 @@ async def telegram_webhook(
                     )
                 except DriveNotConfigured as exc:
                     reply_text = _sanitize_report_error(exc)
-                    logger.exception("report_upload_failed")
+                    logger.exception("report_upload_drive_not_configured")
                     log_report_event(
                         action_id=action_id,
                         file_id=file_id,
