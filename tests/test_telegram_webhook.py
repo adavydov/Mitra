@@ -1,6 +1,9 @@
 import json
 import logging
 import os
+from dataclasses import dataclass
+
+import httpx
 
 import httplib2
 from googleapiclient.errors import HttpError
@@ -624,10 +627,10 @@ def test_drive_check_command_success_replies_with_auth_mode_and_audits(monkeypat
 
     async def fake_upload_markdown(title: str, markdown_body: str):
         assert title == "mitra-drive-check"
-        assert markdown_body == "test"
+        assert "mitra drive check" in markdown_body
         return DriveUploadResult(file_id="file-123", web_view_link="https://drive.test/view")
 
-    async def fake_delete_file(file_id: str):
+    async def fake_trash_file(file_id: str):
         assert file_id == "file-123"
         return None
 
@@ -636,7 +639,7 @@ def test_drive_check_command_success_replies_with_auth_mode_and_audits(monkeypat
 
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
     monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
-    monkeypatch.setattr("mitra_app.main.delete_file", fake_delete_file)
+    monkeypatch.setattr("mitra_app.main.trash_file", fake_trash_file)
     monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
 
     response = client.post(
@@ -646,7 +649,10 @@ def test_drive_check_command_success_replies_with_auth_mode_and_audits(monkeypat
     )
 
     assert response.status_code == 200
-    assert calls == [(123, "Drive OK (auth=oauth)")]
+    assert len(calls) == 1
+    assert calls[0][0] == 123
+    assert calls[0][1].startswith("Drive OK (auth=oauth) latency_ms=")
+    assert "file_id=file-123 (deleted)" in calls[0][1]
     drive_check_audit = next(event for event in audits if event.get("event") == "drive_check")
     assert drive_check_audit == {
         "event": "drive_check",
@@ -654,7 +660,7 @@ def test_drive_check_command_success_replies_with_auth_mode_and_audits(monkeypat
         "chat_id": 123,
         "auth_mode": "oauth",
         "outcome": "success",
-        "detail": "upload+delete ok",
+        "detail": "upload+trash ok",
     }
 
 
@@ -705,20 +711,70 @@ def test_drive_check_command_http_error_returns_sanitized_reason_and_audits(monk
 def test_drive_check_endpoint_returns_ok_with_auth_mode(monkeypatch):
     monkeypatch.setenv("DRIVE_OAUTH_REFRESH_TOKEN", "refresh-token")
 
+    async def fake_upload_markdown(title: str, markdown_body: str):
+        return DriveUploadResult(file_id="endpoint-file", web_view_link="https://drive.test/view")
+
+    async def fake_trash_file(file_id: str):
+        assert file_id == "endpoint-file"
+        return None
+
+    monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
+    monkeypatch.setattr("mitra_app.main.trash_file", fake_trash_file)
+
     response = client.get("/drive_check")
 
     assert response.status_code == 200
     payload = response.json()
     assert payload["auth_mode"] == "oauth"
+    assert payload["status"].startswith("Drive OK (auth=oauth) latency_ms=")
+    assert "file_id=endpoint-file (deleted)" in payload["status"]
 
 
 def test_drive_check_endpoint_returns_specific_http_error(monkeypatch):
     monkeypatch.delenv("DRIVE_OAUTH_REFRESH_TOKEN", raising=False)
 
+    class FakeResp:
+        status = 403
+        reason = "Forbidden"
+
+    async def failing_upload(*args, **kwargs):
+        raise HttpError(FakeResp(), b'{"error":{"errors":[{"reason":"insufficientPermissions"}]}}', uri="https://drive.test")
+
+    monkeypatch.setattr("mitra_app.main.upload_markdown", failing_upload)
+
     response = client.get("/drive_check")
 
     assert response.status_code == 200
-    assert response.json() == {"auth_mode": "service_account"}
+    assert response.json() == {
+        "auth_mode": "service_account",
+        "status": "Drive error: 403 insufficientPermissions",
+    }
+
+
+def test_drive_check_command_failure_still_returns_http_200(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_upload_markdown(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/drive_check", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Drive error: unknown drive_check_failed")]
 def test_startup_logs_drive_auth_mode(monkeypatch):
     monkeypatch.setenv("DRIVE_OAUTH_REFRESH_TOKEN", "refresh-token")
 
@@ -818,6 +874,114 @@ def test_pr_status_command_without_argument_returns_usage(monkeypatch):
     assert calls == [(123, "Usage: /pr_status <issue#|pr#>")]
 
 
+def test_pr_command_creates_issue_with_mitra_codex_label_and_returns_url(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+    audits = []
+
+    @dataclass
+    class FakeIssue:
+        number: int
+        html_url: str
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_create_issue(title: str, body: str, labels: list[str] | None = None):
+        assert title == "Need better onboarding"
+        assert body == "Step 1\nStep 2"
+        assert labels == ["mitra:codex"]
+        return FakeIssue(number=77, html_url="https://github.com/o/r/issues/77")
+
+    def fake_log_event(event: dict[str, object]):
+        audits.append(event)
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.github.create_issue", fake_create_issue)
+    monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={
+            "message": {
+                "text": "/pr Need better onboarding\nStep 1\nStep 2",
+                "chat": {"id": 123},
+                "from": {"id": 123},
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Created: https://github.com/o/r/issues/77")]
+
+    pr_audit = next(event for event in audits if event.get("event") == "telegram_pr_open_issue")
+    assert pr_audit["issue_number"] == 77
+    assert pr_audit["outcome"] == "success"
+
+
+def test_pr_command_denied_for_non_allowlisted_user(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    called = False
+
+    async def fake_create_issue(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("must not be called")
+
+    monkeypatch.setattr("mitra_app.main.github.create_issue", fake_create_issue)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/pr blocked\nspec", "chat": {"id": 123}, "from": {"id": 999}}},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert called is False
+
+
+def test_pr_command_audits_error_when_github_create_fails(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+    audits = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_create_issue(title: str, body: str, labels: list[str] | None = None):
+        raise RuntimeError("boom")
+
+    def fake_log_event(event: dict[str, object]):
+        audits.append(event)
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.github.create_issue", fake_create_issue)
+    monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/pr Broken\nSpec", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Failed to create issue")]
+
+    pr_audit = next(event for event in audits if event.get("event") == "telegram_pr_open_issue")
+    assert pr_audit["issue_number"] is None
+    assert pr_audit["outcome"] == "error"
+
+
 def test_report_oauth_expired_replies_with_reauthorize_message(monkeypatch, tmp_path):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("MITRA_AUDIT_LOG", str(tmp_path / "events.ndjson"))
@@ -871,6 +1035,31 @@ def test_research_without_query_returns_usage(monkeypatch):
     assert calls == [(123, "Usage: /research <query>")]
 
 
+
+def test_research_unexpected_error_is_sanitized(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_run_research(query: str):
+        raise RuntimeError("boom\nTraceback: internal")
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.run_research", fake_run_research)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/research ai agents", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Research failed: boom Traceback: internal")]
 def test_research_returns_search_results_and_summary(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
@@ -904,3 +1093,154 @@ def test_research_returns_search_results_and_summary(monkeypatch):
     assert "Top 5 results" in calls[0][1]
     assert "Что нашёл:" in calls[0][1]
     assert "/report <text>" in calls[0][1]
+
+
+def test_llm_check_not_configured(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/llm_check", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "LLM not configured")]
+
+
+def test_llm_check_success_with_mocked_httpx(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "claude-sonnet-test")
+
+    calls = []
+    posted = {}
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            posted["url"] = url
+            posted["headers"] = headers
+            posted["json"] = json
+            return TestResponse(200, {"content": [{"type": "text", "text": "PONG"}]})
+
+    class TestResponse:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.httpx.AsyncClient", FakeAsyncClient)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/llm_check", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert posted["url"] == "https://api.anthropic.com/v1/messages"
+    assert posted["headers"]["x-api-key"] == "test-key"
+    assert posted["json"]["max_tokens"] == 8
+    assert posted["json"]["temperature"] == 0
+    assert posted["json"]["messages"] == [{"role": "user", "content": "Reply with PONG"}]
+    assert calls and calls[0][0] == 123
+    assert calls[0][1].startswith("LLM OK model=claude-sonnet-test latency_ms=")
+    assert calls[0][1].endswith(" result=PONG")
+
+
+def test_llm_check_error_is_sanitized_and_audited(monkeypatch, tmp_path):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("MITRA_AUDIT_LOG", str(tmp_path / "events.ndjson"))
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            request = httpx.Request("POST", url)
+            response = httpx.Response(401, json={"error": {"type": "invalid_request_error"}}, request=request)
+            raise httpx.HTTPStatusError("Unauthorized", request=request, response=response)
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.httpx.AsyncClient", FakeAsyncClient)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/llm_check", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "LLM error: 401 invalid_request_error")]
+
+    events = (tmp_path / "events.ndjson").read_text(encoding="utf-8").strip().splitlines()
+    payload = [json.loads(line) for line in events if json.loads(line).get("event") == "llm_check"][-1]
+    assert payload["action_type"] == "/llm_check"
+    assert payload["outcome"] == "error"
+    assert "HTTPStatusError" in payload["detail"]
+
+
+def test_start_lists_llm_check(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/start", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Commands: /status, /oauth_status, /llm_check, /research <query>, /report <text>")]

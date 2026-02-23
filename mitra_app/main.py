@@ -3,10 +3,12 @@ import logging
 import os
 import re
 import json
+import time
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
+from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
@@ -15,17 +17,17 @@ from fastapi import FastAPI, Header, HTTPException
 from googleapiclient.errors import HttpError
 
 import mitra_app.audit as audit
+import mitra_app.github as github
 from mitra_app.audit import log_report_event
 from mitra_app.budget_ledger import budget_ledger
 from mitra_app.policy_enforcer import CommandPolicy, CommandPolicyEnforcer
 from mitra_app.drive import (
     DriveNotConfigured,
-    check_drive_folder_access,
     OAuthRefreshInvalidGrant,
-    check_drive_folder_access,
     get_drive_auth_mode,
     get_last_oauth_refresh_time,
     list_recent_files,
+    trash_file,
     upload_markdown,
 )
 from mitra_app.research import ResearchError, build_research_reply, run_research
@@ -176,6 +178,7 @@ _COMMAND_POLICIES: dict[str, CommandPolicy] = {
     "/whoami": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
     "/help": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
     "/start": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
+    "/llm_check": CommandPolicy(required_al="AL1", risk_level="R1", budget_category="search"),
     "/reports": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
     "/report": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
     "/drive_check": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
@@ -341,33 +344,9 @@ def _parse_pr_command(text: str) -> tuple[str, str] | None:
 
 
 async def _create_github_issue(title: str, body: str) -> tuple[int, str]:
-    token = os.getenv("GITHUB_TOKEN")
-    repository = os.getenv("GITHUB_REPOSITORY")
-    if not token or not repository:
-        raise RuntimeError("GitHub integration is not configured")
-
-    if "/" not in repository:
-        raise RuntimeError("GITHUB_REPOSITORY must be owner/repo")
-
-    api_url = f"https://api.github.com/repos/{repository}/issues"
-    payload = {
-        "title": title,
-        "body": body,
-        "labels": ["mitra:codex"],
-    }
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        response = await client.post(api_url, json=payload, headers=headers)
-        response.raise_for_status()
-        response_payload: dict[str, Any] = response.json()
-
-    issue_number = int(response_payload.get("number", 0))
-    issue_url = str(response_payload.get("html_url", ""))
+    issue = await github.create_issue(title=title, body=body, labels=["mitra:codex"])
+    issue_number = issue.number
+    issue_url = issue.html_url
     if issue_number <= 0 or not issue_url:
         raise RuntimeError("GitHub issue create returned invalid response")
 
@@ -507,12 +486,23 @@ def _audit_drive_check(user_id: int | None, chat_id: int | None, auth_mode: str,
 
 def _safe_drive_check_error(exc: Exception) -> str:
     if isinstance(exc, DriveNotConfigured):
-        return "drive_not_configured"
+        return "Drive error: drive_not_configured"
 
     if isinstance(exc, HttpError):
         return _sanitize_drive_http_error(exc)
 
-    return "drive_check_failed"
+    return "Drive error: unknown drive_check_failed"
+
+
+async def _run_drive_check(auth_mode: str) -> tuple[str, str]:
+    started_at = perf_counter()
+    check_body = "# mitra drive check\n\nhealth ping"
+    upload = await upload_markdown(title="mitra-drive-check", markdown_body=check_body)
+    file_id = upload.file_id or "unknown"
+    await trash_file(file_id)
+    latency_ms = int((perf_counter() - started_at) * 1000)
+    reply = f"Drive OK (auth={auth_mode}) latency_ms={latency_ms} file_id={file_id} (deleted)"
+    return reply, "upload+trash ok"
 
 
 def _is_budget_admin(user_id: int | None) -> bool:
@@ -522,6 +512,70 @@ def _is_budget_admin(user_id: int | None) -> bool:
     if owner_id is None:
         return False
     return str(user_id) == owner_id.strip()
+
+
+def _sanitize_llm_error(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        status_code = exc.response.status_code
+        short_reason = "http_error"
+        try:
+            payload = exc.response.json()
+            if isinstance(payload, dict):
+                error_payload = payload.get("error")
+                if isinstance(error_payload, dict):
+                    short_reason = str(error_payload.get("type") or error_payload.get("message") or short_reason)
+                elif isinstance(error_payload, str):
+                    short_reason = error_payload
+        except (ValueError, TypeError):
+            short_reason = "http_error"
+        return f"LLM error: {status_code} {short_reason}"
+
+    if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+        return f"LLM error: {exc.__class__.__name__}"
+
+    if isinstance(exc, ValueError):
+        return "LLM error: invalid_response"
+
+    return f"LLM error: {exc.__class__.__name__}"
+
+
+async def _run_llm_check() -> str:
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        return "LLM not configured"
+
+    model = os.getenv("ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL)
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+    }
+    payload: dict[str, Any] = {
+        "model": model,
+        "max_tokens": 8,
+        "temperature": 0,
+        "messages": [{"role": "user", "content": "Reply with PONG"}],
+    }
+
+    started = time.perf_counter()
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
+        response.raise_for_status()
+        response_payload: dict[str, Any] = response.json()
+
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    content = response_payload.get("content")
+    if not isinstance(content, list) or not content:
+        raise ValueError("missing_content")
+
+    first = content[0]
+    if not isinstance(first, dict):
+        raise ValueError("invalid_content")
+
+    result = str(first.get("text", "")).strip().upper()
+    if not result:
+        raise ValueError("empty_content")
+
+    return f"LLM OK model={model} latency_ms={latency_ms} result={result}"
 
 
 @app.get("/healthz")
@@ -538,10 +592,13 @@ async def drive_check() -> dict[str, str]:
         payload["last_refresh_at"] = last_refresh_at
 
     try:
-        await check_drive_folder_access()
+        status, _ = await _run_drive_check(auth_mode)
+        payload["status"] = status
         return payload
     except Exception as exc:
         payload["status"] = _safe_drive_check_error(exc)
+        logger.exception("drive_check_endpoint_failed")
+        _audit_drive_check(user_id=None, chat_id=None, auth_mode=auth_mode, outcome="error", detail=payload["status"])
         return payload
 
 
@@ -625,6 +682,38 @@ async def telegram_webhook(
                 except Exception:
                     reply_text = "Search failed"
                     logger.exception("search_command_failed")
+        elif text.startswith("/llm_check"):
+            try:
+                reply_text = await _run_llm_check()
+                _safe_audit_event(
+                    {
+                        "event": "llm_check",
+                        "action_id": action_id,
+                        "telegram_update_id": telegram_update_id,
+                        "user_id": user_id,
+                        "chat_id": chat_id,
+                        "action_type": "/llm_check",
+                        "outcome": "ok" if reply_text.startswith("LLM OK") else "not_configured",
+                        "detail": reply_text,
+                        "log_level": "info",
+                    }
+                )
+            except Exception as exc:
+                logger.exception("llm_check_failed")
+                reply_text = _sanitize_llm_error(exc)
+                _safe_audit_event(
+                    {
+                        "event": "llm_check",
+                        "action_id": action_id,
+                        "telegram_update_id": telegram_update_id,
+                        "user_id": user_id,
+                        "chat_id": chat_id,
+                        "action_type": "/llm_check",
+                        "outcome": "error",
+                        "detail": repr(exc),
+                        "log_level": "error",
+                    }
+                )
         elif not allowlist_configured:
             reply_text = "Allowlist not configured. Set ALLOWED_TELEGRAM_USER_IDS."
         elif text.startswith("/think"):
@@ -664,8 +753,9 @@ async def telegram_webhook(
                     reply_text = build_research_reply(query, items, summary)
                 except ResearchError as exc:
                     reply_text = str(exc)
-                except Exception:
-                    reply_text = "Research failed"
+                except Exception as exc:
+                    short_reason = " ".join(str(exc).splitlines()).strip()[:160] or exc.__class__.__name__
+                    reply_text = f"Research failed: {short_reason}"
                     logger.exception("research_command_failed")
         elif text.startswith("/report"):
             report_text = text[len("/report") :].strip()
@@ -745,7 +835,7 @@ async def telegram_webhook(
                         action_type="/report",
                         log_level="error",
                     )
-        elif text.startswith("/pr"):
+        elif text == "/pr" or text.startswith("/pr ") or text.startswith("/pr\n"):
             parsed = _parse_pr_command(text)
             if not parsed:
                 reply_text = "Usage: /pr <title>\\n<spec>"
@@ -795,10 +885,8 @@ async def telegram_webhook(
             auth_mode = get_drive_auth_mode()
 
             try:
-                upload = await upload_markdown(title="mitra-drive-check", markdown_body="test")
-                await delete_file(upload.file_id)
-                reply_text = "Drive OK (auth=oauth)"
-                _audit_drive_check(user_id=user_id, chat_id=chat_id, auth_mode=auth_mode, outcome="success", detail="upload+delete ok")
+                reply_text, detail = await _run_drive_check(auth_mode)
+                _audit_drive_check(user_id=user_id, chat_id=chat_id, auth_mode=auth_mode, outcome="success", detail=detail)
             except Exception as exc:
                 detail = _safe_drive_check_error(exc)
                 reply_text = detail
@@ -812,11 +900,11 @@ async def telegram_webhook(
                 reply_text = "Forbidden"
         elif text.startswith("/budget"):
             reply_text = await budget_ledger.render_budget()
-        elif text.startswith("/pr"):
+        elif text == "/pr" or text.startswith("/pr ") or text.startswith("/pr\n"):
             await budget_ledger.record_github_action()
             reply_text = "Unknown command"
         elif text.startswith("/help") or text.startswith("/start"):
-            reply_text = "Commands: /status, /oauth_status, /research <query>, /report <text>"
+            reply_text = "Commands: /status, /oauth_status, /llm_check, /research <query>, /report <text>"
         else:
             reply_text = "Unknown command"
 
