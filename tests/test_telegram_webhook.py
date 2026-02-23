@@ -115,6 +115,51 @@ def test_allowlist_denied_user_returns_200_without_sending_message(monkeypatch):
     assert calls == []
 
 
+def test_allowlist_denied_user_logs_audit_event(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123,456")
+
+    events = []
+
+    def fake_log_event(payload: dict):
+        events.append(payload)
+        return "logged"
+
+    async def fake_send_message(chat_id: int, text: str):
+        raise AssertionError("send_message should not be called for denied users")
+
+    monkeypatch.setattr("mitra_app.main.audit.log_event", fake_log_event, raising=False)
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/status", "chat": {"id": 777}, "from": {"id": 999}}},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert events == [{"event": "telegram_allowlist_denied", "user_id": 999, "chat_id": 777}]
+
+
+def test_send_message_exception_does_not_crash_webhook(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+
+    async def fake_send_message(chat_id: int, text: str):
+        raise RuntimeError("network issue")
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/status", "chat": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
 def test_report_upload_success_replies_with_link_and_audits(monkeypatch, tmp_path):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("MITRA_AUDIT_LOG", str(tmp_path / "events.ndjson"))
