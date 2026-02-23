@@ -11,10 +11,17 @@ from fastapi import FastAPI, Header, HTTPException
 import mitra_app.audit as audit
 from mitra_app.audit import log_report_event
 from mitra_app.drive import DriveNotConfigured, upload_markdown
-from mitra_app.telegram import send_message
+from mitra_app.telegram import ensure_webhook, send_message
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
+
+
+@app.on_event("startup")
+async def startup_sync_webhook() -> None:
+    ok, detail = await ensure_webhook()
+    if not ok:
+        logger.warning("startup_webhook_sync_failed", extra={"detail": detail})
 
 
 class RecentUpdateDeduplicator:
@@ -150,6 +157,9 @@ async def telegram_webhook(
         reply_text = "Mitra alive"
     elif text.startswith("/whoami"):
         reply_text = f"user_id={user_id}, chat_id={chat_id}"
+    elif text.startswith("/sync_webhook"):
+        ok, detail = await ensure_webhook()
+        reply_text = "ok" if ok else f"error: {detail}"
     elif not allowlist_configured:
         reply_text = "Allowlist not configured. Set ALLOWED_TELEGRAM_USER_IDS."
     elif text.startswith("/report"):
