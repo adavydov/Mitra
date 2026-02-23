@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from collections import OrderedDict
 from datetime import datetime, timezone
 from threading import Lock
@@ -22,6 +23,62 @@ from mitra_app.telegram import ensure_webhook, send_message
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
+
+_THINK_PROMPT_MAX_CHARS = 1200
+_SECRET_ENV_NAME_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|PRIVATE|API_KEY|ACCESS_KEY|CLIENT_SECRET)", re.IGNORECASE)
+
+
+def _sensitive_env_names() -> set[str]:
+    defaults = {
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_WEBHOOK_SECRET",
+        "DRIVE_OAUTH_CLIENT_SECRET",
+        "DRIVE_OAUTH_REFRESH_TOKEN",
+        "DRIVE_SERVICE_ACCOUNT_JSON",
+        "DRIVE_SERVICE_ACCOUNT_JSON_B64",
+        "GITHUB_TOKEN",
+        "OPENAI_API_KEY",
+    }
+    for key in os.environ:
+        if _SECRET_ENV_NAME_RE.search(key):
+            defaults.add(key)
+    return defaults
+
+
+def _sanitize_think_prompt(prompt: str) -> str:
+    sanitized = prompt.strip()
+
+    for env_name in _sensitive_env_names():
+        escaped_name = re.escape(env_name)
+        sanitized = re.sub(rf"(?i){escaped_name}\s*[:=]\s*[^\s,;]+", f"{env_name}=[REDACTED]", sanitized)
+        sanitized = re.sub(rf"(?i)\b{escaped_name}\b", f"{env_name}", sanitized)
+
+        secret_value = os.getenv(env_name)
+        if secret_value:
+            sanitized = sanitized.replace(secret_value, "[REDACTED]")
+
+    return sanitized
+
+
+def _trim_prompt(prompt: str, limit: int = _THINK_PROMPT_MAX_CHARS) -> str:
+    trimmed = prompt[:limit].strip()
+    if len(prompt) <= limit:
+        return trimmed
+    return f"{trimmed}…"
+
+
+def _build_think_reply(question: str) -> str:
+    sanitized = _trim_prompt(_sanitize_think_prompt(question))
+    if not sanitized:
+        return "Usage: /think <вопрос/задача>"
+
+    return "\n".join(
+        [
+            f"Что сделал: дал read-only разбор запроса «{sanitized}».",
+            "Допущения: внешние действия и интернет не используются; ответ только по тексту запроса.",
+            "Риск: без доп. контекста план может быть неполным.",
+        ]
+    )
 
 
 def _sanitize_drive_http_error(exc: HttpError) -> str:
@@ -285,6 +342,9 @@ async def telegram_webhook(
             reply_text = f"auth_mode={auth_mode}, last_refresh_at={last_refresh_at}"
         elif text.startswith("/whoami"):
             reply_text = f"user_id={user_id}, chat_id={chat_id}"
+        elif text.startswith("/think"):
+            prompt = text[len("/think") :]
+            reply_text = _build_think_reply(prompt)
         elif not allowlist_configured:
             reply_text = "Allowlist not configured. Set ALLOWED_TELEGRAM_USER_IDS."
         elif text.startswith("/reports"):
@@ -390,7 +450,7 @@ async def telegram_webhook(
                 logger.exception("drive_check_command_failed")
                 _audit_drive_check(user_id=user_id, chat_id=chat_id, auth_mode=auth_mode, outcome="error", detail=detail)
         elif text.startswith("/help") or text.startswith("/start"):
-            reply_text = "Commands: /status, /oauth_status, /report <text>"
+            reply_text = "Commands: /status, /oauth_status, /report <text>, /think <question>"
         else:
             reply_text = "Unknown command"
 
