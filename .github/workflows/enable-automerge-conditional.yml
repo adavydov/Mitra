@@ -1,0 +1,34 @@
+name: Conditional Auto‑Merge
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+jobs:
+  conditional-automerge:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check changed files
+        id: files
+        uses: tj-actions/changed-files@v34
+      - name: Determine if safe to auto‑merge
+        id: safe
+        run: |
+          echo "PROTECTED_PATTERNS=governance/constitution.md governance/identity.md governance/normative_hierarchy.md" >>$GITHUB_OUTPUT
+          SAFE="true"
+          for p in $PROTECTED_PATTERNS; do
+            if echo "${{ steps.files.changed_files }}" | grep -E "$p"; then
+              SAFE="false"
+              break
+            fi
+          done
+          echo "safe=$SAFE" >>$GITHUB_OUTPUT
+      - name: Enable auto‑merge when safe
+        if: steps.safe.outputs.safe == 'true'
+        uses: peter-evans/enable-pull-request-automerge@v3
+        with:
+          pull-request-number: ${{ github.event.pull_request.number }}
+          merge-method: merge
