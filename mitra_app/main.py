@@ -30,6 +30,10 @@ def _load_allowed_user_ids() -> set[int]:
     return allowed
 
 
+def _is_allowlist_configured(raw_value: str | None) -> bool:
+    return bool(raw_value and raw_value.strip())
+
+
 def _audit_allowlist_denied(user_id: int | None, chat_id: int | None) -> None:
     logger.info(
         "telegram_allowlist_denied",
@@ -78,13 +82,20 @@ async def telegram_webhook(
     from_user = message.get("from") or {}
     user_id = from_user.get("id")
 
+    allowed_user_ids_raw = os.getenv("ALLOWED_TELEGRAM_USER_IDS")
     allowed_user_ids = _load_allowed_user_ids()
-    if allowed_user_ids and user_id not in allowed_user_ids:
+    allowlist_configured = _is_allowlist_configured(allowed_user_ids_raw)
+
+    if allowlist_configured and user_id not in allowed_user_ids:
         _audit_allowlist_denied(user_id=user_id, chat_id=chat_id)
         return {"status": "ok"}
 
     if text.startswith("/status"):
         reply_text = "Mitra alive"
+    elif text.startswith("/whoami"):
+        reply_text = f"user_id={user_id}, chat_id={chat_id}"
+    elif not allowlist_configured:
+        reply_text = "Allowlist not configured. Set ALLOWED_TELEGRAM_USER_IDS."
     elif text.startswith("/report"):
         report_text = text[len("/report") :].strip()
         action_id = f"act-{uuid4().hex[:12]}"
