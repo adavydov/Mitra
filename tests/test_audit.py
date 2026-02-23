@@ -1,6 +1,6 @@
 import json
 
-from mitra_app.audit import log_event
+from mitra_app.audit import log_event, log_report_event
 
 
 def test_log_event_redacts_known_env_vars(monkeypatch, tmp_path, capsys):
@@ -51,3 +51,18 @@ def test_log_event_redacts_drive_keys_and_pem(monkeypatch, tmp_path):
     assert "b64-value" not in written
     assert "pem-value" not in written
     assert "-----BEGIN" not in written
+
+
+def test_log_report_event_does_not_raise_when_file_write_fails(monkeypatch):
+    def failing_open(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("builtins.open", failing_open)
+
+    log_report_event(
+        action_id="act-1",
+        user_id=123,
+        chat_id=456,
+        file_id="",
+        outcome="error",
+    )

@@ -162,24 +162,49 @@ async def telegram_webhook(
 
             if not report_text:
                 reply_text = "Usage: /report <text>"
-                log_report_event(action_id=action_id, file_id=file_id, outcome="invalid")
+                log_report_event(
+                    action_id=action_id,
+                    file_id=file_id,
+                    outcome="invalid",
+                    user_id=user_id,
+                    chat_id=chat_id,
+                )
             else:
                 now = datetime.now(timezone.utc)
-                title = _build_report_title(report_text, now)
-                body = _build_report_body(report_text, now, action_id=action_id)
+                title = _build_report_title(now)
+                body = _build_report_body(report_text, now, user_id=user_id)
 
                 try:
                     upload = await upload_markdown(title=title, markdown_body=body)
                     file_id = upload.file_id
                     link = upload.web_view_link or upload.file_id
-                    reply_text = f"Report uploaded: {link}"
-                    log_report_event(action_id=action_id, file_id=file_id, outcome="success", link=link)
+                    reply_text = f"Saved: {link}"
+                    log_report_event(
+                        action_id=action_id,
+                        file_id=file_id,
+                        outcome="success",
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        link=link,
+                    )
                 except DriveNotConfigured:
                     reply_text = "Drive disabled"
-                    log_report_event(action_id=action_id, file_id=file_id, outcome="drive_disabled")
+                    log_report_event(
+                        action_id=action_id,
+                        file_id=file_id,
+                        outcome="drive_disabled",
+                        user_id=user_id,
+                        chat_id=chat_id,
+                    )
                 except Exception:
                     reply_text = "Report failed"
-                    log_report_event(action_id=action_id, file_id=file_id, outcome="error")
+                    log_report_event(
+                        action_id=action_id,
+                        file_id=file_id,
+                        outcome="error",
+                        user_id=user_id,
+                        chat_id=chat_id,
+                    )
         elif text.startswith("/help") or text.startswith("/start"):
             reply_text = "Commands: /status, /report <text>"
         else:
