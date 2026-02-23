@@ -7,6 +7,7 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
+from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
@@ -20,12 +21,11 @@ from mitra_app.budget_ledger import budget_ledger
 from mitra_app.policy_enforcer import CommandPolicy, CommandPolicyEnforcer
 from mitra_app.drive import (
     DriveNotConfigured,
-    check_drive_folder_access,
     OAuthRefreshInvalidGrant,
-    check_drive_folder_access,
     get_drive_auth_mode,
     get_last_oauth_refresh_time,
     list_recent_files,
+    trash_file,
     upload_markdown,
 )
 from mitra_app.research import ResearchError, build_research_reply, run_research
@@ -453,12 +453,23 @@ def _audit_drive_check(user_id: int | None, chat_id: int | None, auth_mode: str,
 
 def _safe_drive_check_error(exc: Exception) -> str:
     if isinstance(exc, DriveNotConfigured):
-        return "drive_not_configured"
+        return "Drive error: drive_not_configured"
 
     if isinstance(exc, HttpError):
         return _sanitize_drive_http_error(exc)
 
-    return "drive_check_failed"
+    return "Drive error: unknown drive_check_failed"
+
+
+async def _run_drive_check(auth_mode: str) -> tuple[str, str]:
+    started_at = perf_counter()
+    check_body = "# mitra drive check\n\nhealth ping"
+    upload = await upload_markdown(title="mitra-drive-check", markdown_body=check_body)
+    file_id = upload.file_id or "unknown"
+    await trash_file(file_id)
+    latency_ms = int((perf_counter() - started_at) * 1000)
+    reply = f"Drive OK (auth={auth_mode}) latency_ms={latency_ms} file_id={file_id} (deleted)"
+    return reply, "upload+trash ok"
 
 
 def _is_budget_admin(user_id: int | None) -> bool:
@@ -484,10 +495,13 @@ async def drive_check() -> dict[str, str]:
         payload["last_refresh_at"] = last_refresh_at
 
     try:
-        await check_drive_folder_access()
+        status, _ = await _run_drive_check(auth_mode)
+        payload["status"] = status
         return payload
     except Exception as exc:
         payload["status"] = _safe_drive_check_error(exc)
+        logger.exception("drive_check_endpoint_failed")
+        _audit_drive_check(user_id=None, chat_id=None, auth_mode=auth_mode, outcome="error", detail=payload["status"])
         return payload
 
 
@@ -731,10 +745,8 @@ async def telegram_webhook(
             auth_mode = get_drive_auth_mode()
 
             try:
-                upload = await upload_markdown(title="mitra-drive-check", markdown_body="test")
-                await delete_file(upload.file_id)
-                reply_text = "Drive OK (auth=oauth)"
-                _audit_drive_check(user_id=user_id, chat_id=chat_id, auth_mode=auth_mode, outcome="success", detail="upload+delete ok")
+                reply_text, detail = await _run_drive_check(auth_mode)
+                _audit_drive_check(user_id=user_id, chat_id=chat_id, auth_mode=auth_mode, outcome="success", detail=detail)
             except Exception as exc:
                 detail = _safe_drive_check_error(exc)
                 reply_text = detail
