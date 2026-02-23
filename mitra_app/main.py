@@ -117,12 +117,11 @@ def _audit_dedup(update_id: int, user_id: int | None, chat_id: int | None) -> No
         "outcome": "dedup",
     }
 
+    logger.info("telegram_dedup", extra=event)
+
     log_event = getattr(audit, "log_event", None)
     if callable(log_event):
         log_event(event)
-        return
-
-    logger.info("telegram_dedup", extra=event)
 
 
 def _build_report_title(now: datetime) -> str:
