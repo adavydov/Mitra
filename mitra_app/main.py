@@ -6,6 +6,7 @@ from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException
 
+import mitra_app.audit as audit
 from mitra_app.audit import log_report_event
 from mitra_app.drive import DriveNotConfigured, upload_markdown
 from mitra_app.telegram import send_message
@@ -35,14 +36,18 @@ def _is_allowlist_configured(raw_value: str | None) -> bool:
 
 
 def _audit_allowlist_denied(user_id: int | None, chat_id: int | None) -> None:
-    logger.info(
-        "telegram_allowlist_denied",
-        extra={
-            "event": "telegram_allowlist_denied",
-            "user_id": user_id,
-            "chat_id": chat_id,
-        },
-    )
+    event = {
+        "event": "telegram_allowlist_denied",
+        "user_id": user_id,
+        "chat_id": chat_id,
+    }
+
+    log_event = getattr(audit, "log_event", None)
+    if callable(log_event):
+        log_event(event)
+        return
+
+    print(event)
 
 
 def _slugify(text: str, max_len: int = 24) -> str:
@@ -137,6 +142,9 @@ async def telegram_webhook(
         reply_text = "Unknown command"
 
     if chat_id is not None:
-        await send_message(chat_id=chat_id, text=reply_text)
+        try:
+            await send_message(chat_id=chat_id, text=reply_text)
+        except Exception:
+            logger.exception("telegram_send_message_failed", extra={"chat_id": chat_id})
 
     return {"status": "ok"}

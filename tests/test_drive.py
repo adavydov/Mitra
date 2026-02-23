@@ -1,7 +1,6 @@
 import asyncio
 
 import pytest
-
 from mitra_app.drive import DriveNotConfigured, upload_markdown
 
 

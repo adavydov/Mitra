@@ -3,36 +3,53 @@
   "$id": "https://mitra.local/schemas/risk.schema.json",
   "type": "object",
   "required": [
-    "risk_scale",
-    "categories",
-    "anomaly_triggers"
+    "id",
+    "default_level",
+    "levels",
+    "categories"
   ],
   "properties": {
-    "risk_scale": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      },
-      "minItems": 1,
-      "uniqueItems": true
+    "id": {
+      "type": "string"
+    },
+    "default_level": {
+      "type": "string",
+      "enum": [
+        "R0",
+        "R1",
+        "R2",
+        "R3",
+        "R4"
+      ],
+      "default": "R1"
+    },
+    "levels": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "description"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
     },
     "categories": {
       "type": "object",
-      "minProperties": 1,
       "additionalProperties": {
-        "type": "string"
+        "type": "string",
+        "enum": [
+          "R0",
+          "R1",
+          "R2",
+          "R3",
+          "R4"
+        ]
       }
-    },
-    "anomaly_triggers": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      },
-      "minItems": 1,
-      "uniqueItems": true
-    },
-    "id": {
-      "type": "string"
     }
   },
   "additionalProperties": false
