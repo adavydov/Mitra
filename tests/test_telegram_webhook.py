@@ -136,11 +136,11 @@ def test_duplicate_update_id_returns_200_without_sending_message_and_audits(monk
         calls.append((chat_id, text))
         return True
 
-    def fake_audit_dedup(update_id: int, user_id: int | None, chat_id: int | None):
-        audits.append((update_id, user_id, chat_id))
+    def fake_log_event(event: dict[str, object]):
+        audits.append(event)
 
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
-    monkeypatch.setattr("mitra_app.main._audit_dedup", fake_audit_dedup)
+    monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
     monkeypatch.setattr("mitra_app.main._recent_update_deduplicator", RecentUpdateDeduplicator(max_size=10))
 
     payload = {
@@ -162,7 +162,15 @@ def test_duplicate_update_id_returns_200_without_sending_message_and_audits(monk
     assert first_response.status_code == 200
     assert second_response.status_code == 200
     assert calls == [(123, "Mitra alive")]
-    assert audits == [(555, 987, 123)]
+    assert audits == [
+        {
+            "event": "telegram_dedup",
+            "update_id": 555,
+            "user_id": 987,
+            "chat_id": 123,
+            "outcome": "dedup",
+        }
+    ]
 
 
 def test_report_upload_success_replies_with_link_and_audits(monkeypatch, tmp_path):
@@ -192,18 +200,18 @@ def test_report_upload_success_replies_with_link_and_audits(monkeypatch, tmp_pat
     )
 
     assert response.status_code == 200
-    assert calls == [(123, "Report uploaded: https://drive.test/view")]
-    assert captured["title"].startswith("report-")
-    assert "quarterly-risk-update" in captured["title"]
+    assert calls == [(123, "Saved: https://drive.test/view")]
+    assert captured["title"].startswith("mitra-report ")
     assert "Quarterly risk update" in captured["body"]
     assert "timestamp:" in captured["body"]
-    assert "action_id:" in captured["body"]
+    assert "user_id: 123" in captured["body"]
 
     events = (tmp_path / "events.ndjson").read_text(encoding="utf-8").strip().splitlines()
     payload = json.loads(events[-1])
     assert payload["file_id"] == "file-123"
     assert payload["outcome"] == "success"
     assert payload["action_id"].startswith("act-")
+    assert payload["user_id"] == 123
     assert payload["link"] == "https://drive.test/view"
 
 
@@ -236,6 +244,7 @@ def test_report_drive_disabled_replies_and_audits(monkeypatch, tmp_path):
     events = (tmp_path / "events.ndjson").read_text(encoding="utf-8").strip().splitlines()
     payload = json.loads(events[-1])
     assert payload["file_id"] == ""
+    assert payload["user_id"] == 123
     assert payload["outcome"] == "drive_disabled"
 
 
@@ -263,7 +272,7 @@ def test_report_upload_without_web_view_link_uses_file_id(monkeypatch, tmp_path)
     )
 
     assert response.status_code == 200
-    assert calls == [(123, "Report uploaded: file-xyz")]
+    assert calls == [(123, "Saved: file-xyz")]
 
     events = (tmp_path / "events.ndjson").read_text(encoding="utf-8").strip().splitlines()
     payload = json.loads(events[-1])

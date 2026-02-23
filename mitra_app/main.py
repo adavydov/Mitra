@@ -11,10 +11,17 @@ from fastapi import FastAPI, Header, HTTPException
 import mitra_app.audit as audit
 from mitra_app.audit import log_report_event
 from mitra_app.drive import DriveNotConfigured, upload_markdown
-from mitra_app.telegram import send_message
+from mitra_app.telegram import ensure_webhook, send_message
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
+
+
+@app.on_event("startup")
+async def startup_sync_webhook() -> None:
+    ok, detail = await ensure_webhook()
+    if not ok:
+        logger.warning("startup_webhook_sync_failed", extra={"detail": detail})
 
 
 class RecentUpdateDeduplicator:
@@ -74,40 +81,35 @@ def _audit_allowlist_denied(user_id: int | None, chat_id: int | None) -> None:
 
 
 def _audit_dedup(update_id: int, user_id: int | None, chat_id: int | None) -> None:
-    logger.info(
-        "telegram_dedup",
-        extra={
-            "event": "telegram_dedup",
-            "update_id": update_id,
-            "user_id": user_id,
-            "chat_id": chat_id,
-            "outcome": "dedup",
-        },
-    )
+    event = {
+        "event": "telegram_dedup",
+        "update_id": update_id,
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "outcome": "dedup",
+    }
+
+    log_event = getattr(audit, "log_event", None)
+    if callable(log_event):
+        log_event(event)
+        return
+
+    logger.info("telegram_dedup", extra=event)
 
 
-def _slugify(text: str, max_len: int = 24) -> str:
-    cleaned = "".join(ch.lower() if ch.isalnum() else "-" for ch in text.strip())
-    cleaned = "-".join(part for part in cleaned.split("-") if part)
-    return cleaned[:max_len] or "report"
+def _build_report_title(now: datetime) -> str:
+    return f"mitra-report {now.strftime('%Y-%m-%d %H:%M')}"
 
 
-def _build_report_title(text: str, now: datetime) -> str:
-    stamp = now.strftime("%Y%m%d-%H%M%S")
-    return f"report-{stamp}-{_slugify(text)}"
-
-
-def _build_report_body(text: str, now: datetime, action_id: str) -> str:
+def _build_report_body(text: str, now: datetime, user_id: int | None) -> str:
     timestamp = now.isoformat()
     return "\n".join(
         [
-            "---",
-            f"action_id: {action_id}",
-            f"timestamp: {timestamp}",
-            "---",
-            "",
             text.strip(),
             "",
+            "---",
+            f"timestamp: {timestamp}",
+            f"user_id: {user_id}",
         ]
     )
 
