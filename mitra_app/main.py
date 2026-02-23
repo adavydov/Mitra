@@ -1,5 +1,6 @@
 import logging
 import os
+import json
 from collections import OrderedDict
 from datetime import datetime, timezone
 from threading import Lock
@@ -19,6 +20,7 @@ from mitra_app.drive import (
     upload_markdown,
 )
 from mitra_app.telegram import ensure_webhook, send_message
+from mitra_app.search import SearchRateLimitExceeded, brave_web_search, format_search_results
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
@@ -285,6 +287,24 @@ async def telegram_webhook(
             reply_text = f"auth_mode={auth_mode}, last_refresh_at={last_refresh_at}"
         elif text.startswith("/whoami"):
             reply_text = f"user_id={user_id}, chat_id={chat_id}"
+        elif text.startswith("/search"):
+            query = text[len("/search") :].strip()
+            if not query:
+                reply_text = "Usage: /search <query>"
+            else:
+                try:
+                    search_results = await brave_web_search(query)
+                    reply_text = format_search_results(search_results)
+                    audit.log_budget_usage(
+                        category="search_queries",
+                        amount=1,
+                        metadata={"user_id": user_id, "chat_id": chat_id, "query": query},
+                    )
+                except SearchRateLimitExceeded as exc:
+                    reply_text = str(exc)
+                except Exception:
+                    reply_text = "Search failed"
+                    logger.exception("search_command_failed")
         elif not allowlist_configured:
             reply_text = "Allowlist not configured. Set ALLOWED_TELEGRAM_USER_IDS."
         elif text.startswith("/reports"):
@@ -390,7 +410,7 @@ async def telegram_webhook(
                 logger.exception("drive_check_command_failed")
                 _audit_drive_check(user_id=user_id, chat_id=chat_id, auth_mode=auth_mode, outcome="error", detail=detail)
         elif text.startswith("/help") or text.startswith("/start"):
-            reply_text = "Commands: /status, /oauth_status, /report <text>"
+            reply_text = "Commands: /status, /oauth_status, /report <text>, /search <query>"
         else:
             reply_text = "Unknown command"
 
