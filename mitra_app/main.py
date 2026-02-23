@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import json
 from collections import OrderedDict
 from datetime import datetime, timezone
 from threading import Lock
@@ -17,6 +18,7 @@ from mitra_app.drive import (
     DriveNotConfigured,
     check_drive_folder_access,
     OAuthRefreshInvalidGrant,
+    check_drive_folder_access,
     get_drive_auth_mode,
     get_last_oauth_refresh_time,
     list_recent_files,
@@ -305,6 +307,86 @@ def _safe_drive_check_error(exc: Exception) -> str:
     return "drive_check_failed"
 
 
+async def _build_pr_status_reply(ref: str) -> str:
+    cleaned = ref.strip().lstrip("#")
+    if not cleaned.isdigit():
+        return "Usage: /pr_status <issue#|pr#>"
+
+    repo = os.getenv("GITHUB_REPO", "").strip()
+    if not repo:
+        return "PR status unavailable: set GITHUB_REPO=owner/repo"
+
+    number = int(cleaned)
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    base_url = f"https://api.github.com/repos/{repo}"
+    timeout = httpx.Timeout(15.0)
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+            pr_response = await client.get(f"{base_url}/pulls/{number}")
+            if pr_response.status_code == 404:
+                issue_response = await client.get(f"{base_url}/issues/{number}")
+                if issue_response.status_code != 200:
+                    return f"PR не найден для #{number}"
+                issue_payload = issue_response.json()
+                if not isinstance(issue_payload, dict) or "pull_request" not in issue_payload:
+                    return f"PR не найден для #{number}"
+                pr_response = await client.get(f"{base_url}/pulls/{number}")
+
+            if pr_response.status_code != 200:
+                return f"PR status failed: {pr_response.status_code}"
+
+            pr_payload = pr_response.json()
+            if not isinstance(pr_payload, dict):
+                return "PR status failed: invalid GitHub response"
+
+            head_sha = ((pr_payload.get("head") or {}).get("sha") if isinstance(pr_payload.get("head"), dict) else None)
+            checks_summary = "нет данных"
+            if isinstance(head_sha, str) and head_sha:
+                checks_response = await client.get(f"{base_url}/commits/{head_sha}/check-runs")
+                if checks_response.status_code == 200:
+                    checks_payload = checks_response.json()
+                    check_runs = checks_payload.get("check_runs", []) if isinstance(checks_payload, dict) else []
+                    if check_runs:
+                        success = 0
+                        failed = 0
+                        pending = 0
+                        for run in check_runs:
+                            if not isinstance(run, dict):
+                                continue
+                            conclusion = run.get("conclusion")
+                            status = run.get("status")
+                            if conclusion == "success":
+                                success += 1
+                            elif conclusion in {"failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale"}:
+                                failed += 1
+                            elif status != "completed":
+                                pending += 1
+                        checks_summary = f"success={success}, failed={failed}, pending={pending}"
+                    else:
+                        checks_summary = "нет checks"
+
+            auto_merge_enabled = "включён" if pr_payload.get("auto_merge") else "нет"
+            html_url = pr_payload.get("html_url", "")
+            pr_number = pr_payload.get("number", number)
+
+            return "\n".join(
+                [
+                    f"PR: #{pr_number} (есть)",
+                    f"checks: {checks_summary}",
+                    f"auto-merge: {auto_merge_enabled}",
+                    f"ссылка: {html_url}",
+                ]
+            )
+    except httpx.HTTPError:
+        logger.exception("pr_status_request_failed", extra={"repo": repo, "number": number})
+        return "PR status unavailable"
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
@@ -317,6 +399,12 @@ async def drive_check() -> dict[str, str]:
     last_refresh_at = get_last_oauth_refresh_time()
     if auth_mode == "oauth" and last_refresh_at:
         payload["last_refresh_at"] = last_refresh_at
+
+    try:
+        await check_drive_folder_access()
+    except Exception as exc:
+        payload["status"] = _safe_drive_check_error(exc)
+
     return payload
 
 
@@ -518,8 +606,14 @@ async def telegram_webhook(
                 reply_text = detail
                 logger.exception("drive_check_command_failed")
                 _audit_drive_check(user_id=user_id, chat_id=chat_id, auth_mode=auth_mode, outcome="error", detail=detail)
+        elif text.startswith("/pr_status"):
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                reply_text = "Usage: /pr_status <issue#|pr#>"
+            else:
+                reply_text = await _build_pr_status_reply(parts[1])
         elif text.startswith("/help") or text.startswith("/start"):
-            reply_text = "Commands: /status, /oauth_status, /report <text>"
+            reply_text = "Commands: /status, /oauth_status, /report <text>, /pr_status <issue#|pr#>"
         else:
             reply_text = "Unknown command"
 
