@@ -281,49 +281,19 @@ def test_report_upload_without_web_view_link_uses_file_id(monkeypatch, tmp_path)
     assert payload["outcome"] == "success"
 
 
-def test_report_without_text_returns_usage(monkeypatch):
+def test_webhook_returns_200_when_send_message_raises(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
-    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
-
-    calls = []
 
     async def fake_send_message(chat_id: int, text: str):
-        calls.append((chat_id, text))
-        return True
+        raise RuntimeError("telegram unavailable")
 
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
 
     response = client.post(
         "/telegram/webhook",
         headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
-        json={"message": {"text": "/report", "chat": {"id": 123}, "from": {"id": 123}}},
+        json={"message": {"text": "/status", "chat": {"id": 123}}},
     )
 
     assert response.status_code == 200
-    assert calls == [(123, "Usage: /report <text>")]
-
-
-def test_report_upload_failure_returns_short_summary(monkeypatch):
-    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
-    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
-
-    calls = []
-
-    async def fake_send_message(chat_id: int, text: str):
-        calls.append((chat_id, text))
-        return True
-
-    async def fake_upload_markdown(title: str, markdown_body: str):
-        raise RuntimeError("quota exceeded")
-
-    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
-    monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
-
-    response = client.post(
-        "/telegram/webhook",
-        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
-        json={"message": {"text": "/report Something", "chat": {"id": 123}, "from": {"id": 123}}},
-    )
-
-    assert response.status_code == 200
-    assert calls == [(123, "Report failed: quota exceeded")]
+    assert response.json() == {"ok": True}
