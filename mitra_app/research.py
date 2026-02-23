@@ -33,11 +33,7 @@ async def search_top5(query: str) -> list[SearchItem]:
 
 
 async def summarize_with_sonnet(query: str, items: list[SearchItem]) -> str:
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        return _fallback_summary(query, items)
-
-    model = os.getenv("RESEARCH_SONNET_MODEL", "claude-3-5-sonnet-latest")
+    model = os.getenv("RESEARCH_SONNET_MODEL", "claude-sonnet-4-6")
     max_tokens = int(os.getenv("RESEARCH_SONNET_MAX_TOKENS", "300"))
     prompt = _build_sonnet_prompt(query, items)
 
@@ -58,6 +54,7 @@ async def summarize_with_sonnet(query: str, items: list[SearchItem]) -> str:
             response = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
             response.raise_for_status()
         payload = response.json()
+        await budget_ledger.record_llm_usage(payload.get("usage"))
         content = payload.get("content") or []
         text_parts = [part.get("text", "") for part in content if part.get("type") == "text"]
         summary = "\n".join(part.strip() for part in text_parts if part.strip()).strip()
@@ -162,6 +159,17 @@ async def summarize_without_search(query: str) -> str:
             "LLM-only answer without fresh web sources. "
             f"For '{query}' provide domain, geography, and timeframe to improve quality."
         )
+
+
+def _is_budget_or_rate_limit_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "budget" in text or "rate limit" in text or "rate-limit" in text or "429" in text
+
+
+def _short_reason(exc: Exception) -> str:
+    reason = str(exc).strip() or exc.__class__.__name__
+    sanitized = " ".join(reason.splitlines())
+    return sanitized[:160]
 
 
 def build_research_reply(query: str, items: list[SearchItem], summary: str) -> str:
