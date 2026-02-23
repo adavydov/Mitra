@@ -1,23 +1,29 @@
 {
-  "risk_scale": [
-    "LOW",
-    "MEDIUM",
-    "HIGH",
-    "CRITICAL"
-  ],
-  "categories": {
-    "read": "LOW",
-    "write": "MEDIUM",
-    "exec_local": "MEDIUM",
-    "exec_network": "HIGH",
-    "deploy": "HIGH",
-    "self_modify": "CRITICAL"
+  "id": "CFG-RISK-01",
+  "default_level": "R1",
+  "levels": {
+    "R0": {
+      "description": "Negligible operational impact"
+    },
+    "R1": {
+      "description": "Low risk / reversible actions"
+    },
+    "R2": {
+      "description": "Moderate risk / bounded impact"
+    },
+    "R3": {
+      "description": "High risk / broad impact"
+    },
+    "R4": {
+      "description": "Critical risk / requires explicit approval"
+    }
   },
-  "anomaly_triggers": [
-    "policy_bypass_attempt",
-    "repeated_denied_actions",
-    "unexpected_self_modification",
-    "budget_tampering"
-  ],
-  "id": "CFG-RISK-01"
+  "categories": {
+    "read": "R1",
+    "write": "R2",
+    "exec_local": "R2",
+    "exec_network": "R3",
+    "deploy": "R3",
+    "self_modify": "R4"
+  }
 }

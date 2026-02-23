@@ -3,37 +3,39 @@
   "$id": "https://mitra.local/schemas/budget.schema.json",
   "type": "object",
   "required": [
+    "id",
     "currency",
     "window",
-    "hard_limit",
     "soft_limit",
+    "hard_limit",
     "tool_costs"
   ],
   "properties": {
-    "currency": {
+    "id": {
       "type": "string"
+    },
+    "currency": {
+      "type": "string",
+      "default": "tokens"
     },
     "window": {
-      "type": "string"
-    },
-    "hard_limit": {
-      "type": "number",
-      "minimum": 0
+      "type": "string",
+      "default": "daily"
     },
     "soft_limit": {
       "type": "number",
       "minimum": 0
     },
+    "hard_limit": {
+      "type": "number",
+      "minimum": 0
+    },
     "tool_costs": {
       "type": "object",
-      "minProperties": 1,
       "additionalProperties": {
         "type": "number",
         "minimum": 0
       }
-    },
-    "id": {
-      "type": "string"
     }
   },
   "additionalProperties": false
