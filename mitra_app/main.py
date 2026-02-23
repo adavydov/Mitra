@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import json
 from collections import OrderedDict
 from datetime import datetime, timezone
 from threading import Lock
@@ -141,6 +142,34 @@ def _build_report_body(text: str, now: datetime, user_id: int | None) -> str:
     )
 
 
+def _sanitize_report_error(exc: Exception) -> str:
+    if isinstance(exc, DriveNotConfigured):
+        return "Drive disabled"
+
+    if isinstance(exc, HttpError):
+        status = str(exc.status_code)
+        reason = "unknown"
+
+        if exc.content:
+            try:
+                payload = json.loads(exc.content.decode("utf-8"))
+                error_obj = payload.get("error", {}) if isinstance(payload, dict) else {}
+                if isinstance(error_obj, dict):
+                    errors = error_obj.get("errors")
+                    if isinstance(errors, list) and errors:
+                        first_error = errors[0]
+                        if isinstance(first_error, dict) and first_error.get("reason"):
+                            reason = str(first_error["reason"])
+                    elif error_obj.get("status"):
+                        reason = str(error_obj["status"])
+            except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+                reason = "unknown"
+
+        return f"Drive error: {status} {reason}"
+
+    return "Report failed"
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
@@ -214,9 +243,9 @@ async def telegram_webhook(
                         chat_id=chat_id,
                         link=link,
                     )
-                except DriveNotConfigured:
-                    logger.exception("report_upload_drive_not_configured")
-                    reply_text = "Drive disabled"
+                except DriveNotConfigured as exc:
+                    reply_text = _sanitize_report_error(exc)
+                    logger.exception("report_upload_failed")
                     log_report_event(
                         action_id=action_id,
                         file_id=file_id,
@@ -225,11 +254,8 @@ async def telegram_webhook(
                         chat_id=chat_id,
                     )
                 except Exception as exc:
+                    reply_text = _sanitize_report_error(exc)
                     logger.exception("report_upload_failed")
-                    if isinstance(exc, HttpError):
-                        reply_text = _sanitize_drive_http_error(exc)
-                    else:
-                        reply_text = "Report failed"
                     log_report_event(
                         action_id=action_id,
                         file_id=file_id,
