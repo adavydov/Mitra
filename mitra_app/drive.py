@@ -32,6 +32,12 @@ class DriveUploadResult:
     web_view_link: str | None
 
 
+@dataclass
+class DriveFolderCheckResult:
+    auth_mode: str
+    folder_id: str
+
+
 def _load_service_account_info() -> dict[str, Any]:
     payload_b64 = os.getenv("DRIVE_SERVICE_ACCOUNT_JSON_B64")
     payload_raw = os.getenv("DRIVE_SERVICE_ACCOUNT_JSON")
@@ -111,3 +117,20 @@ async def upload_markdown(title: str, markdown_body: str) -> DriveUploadResult:
 async def upload_markdown_document(title: str, markdown_body: str) -> DriveUploadResult:
     """Backward-compatible alias for older call sites."""
     return await upload_markdown(title=title, markdown_body=markdown_body)
+
+
+async def check_drive_folder_access() -> DriveFolderCheckResult:
+    folder_id = os.getenv("DRIVE_ROOT_FOLDER_ID")
+    if not folder_id:
+        raise DriveNotConfigured("Missing DRIVE_ROOT_FOLDER_ID")
+
+    auth_mode = get_drive_auth_mode()
+    credentials_info: dict[str, Any] = {}
+    if auth_mode == "service_account":
+        credentials_info = _load_service_account_info()
+
+    service = _build_drive_service(credentials_info)
+    # Minimal API call to validate auth and folder access.
+    service.files().get(fileId=folder_id, fields="id").execute()
+
+    return DriveFolderCheckResult(auth_mode=auth_mode, folder_id=folder_id)
