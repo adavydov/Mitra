@@ -678,3 +678,60 @@ def test_report_oauth_expired_replies_with_reauthorize_message(monkeypatch, tmp_
     events = (tmp_path / "events.ndjson").read_text(encoding="utf-8").strip().splitlines()
     payload = json.loads(events[-1])
     assert payload["outcome"] == "oauth_expired"
+
+
+def test_research_without_query_returns_usage(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/research", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Usage: /research <query>")]
+
+
+def test_research_returns_search_results_and_summary(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_run_research(query: str):
+        from mitra_app.research import SearchItem
+
+        return [
+            SearchItem(title="A", url="https://a.test", snippet="alpha"),
+            SearchItem(title="B", url="https://b.test", snippet="beta"),
+        ], "- Итог 1\n- Итог 2"
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.run_research", fake_run_research)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/research ai agents", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert calls[0][0] == 123
+    assert "Top 5 results" in calls[0][1]
+    assert "Что нашёл:" in calls[0][1]
+    assert "/report <text>" in calls[0][1]

@@ -1,0 +1,149 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from typing import Any
+
+import httpx
+
+
+class ResearchError(RuntimeError):
+    """Raised when research pipeline cannot complete."""
+
+
+@dataclass
+class SearchItem:
+    title: str
+    url: str
+    snippet: str
+
+
+async def search_top5(query: str) -> list[SearchItem]:
+    params = {"q": query, "format": "json", "no_html": 1, "skip_disambig": 1}
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.get("https://api.duckduckgo.com/", params=params)
+        response.raise_for_status()
+    payload = response.json()
+
+    candidates: list[SearchItem] = []
+    for topic in payload.get("RelatedTopics", []):
+        candidates.extend(_extract_topics(topic))
+        if len(candidates) >= 5:
+            break
+
+    if not candidates and payload.get("AbstractText"):
+        candidates.append(
+            SearchItem(
+                title=str(payload.get("Heading") or query),
+                url=str(payload.get("AbstractURL") or ""),
+                snippet=str(payload.get("AbstractText") or ""),
+            )
+        )
+
+    return candidates[:5]
+
+
+def _extract_topics(topic: dict[str, Any]) -> list[SearchItem]:
+    if "Topics" in topic:
+        nested: list[SearchItem] = []
+        for item in topic.get("Topics", []):
+            nested.extend(_extract_topics(item))
+        return nested
+
+    text = str(topic.get("Text") or "").strip()
+    url = str(topic.get("FirstURL") or "").strip()
+    if not text:
+        return []
+
+    title = text.split(" - ", 1)[0].strip()
+    snippet = text.split(" - ", 1)[1].strip() if " - " in text else text
+    return [SearchItem(title=title or "(untitled)", url=url, snippet=snippet)]
+
+
+async def summarize_with_sonnet(query: str, items: list[SearchItem]) -> str:
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        return _fallback_summary(query, items)
+
+    model = os.getenv("RESEARCH_SONNET_MODEL", "claude-3-5-sonnet-latest")
+    max_tokens = int(os.getenv("RESEARCH_SONNET_MAX_TOKENS", "300"))
+    prompt = _build_sonnet_prompt(query, items)
+
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    body = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": 0.2,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            response = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
+            response.raise_for_status()
+        payload = response.json()
+        content = payload.get("content") or []
+        text_parts = [part.get("text", "") for part in content if part.get("type") == "text"]
+        summary = "\n".join(part.strip() for part in text_parts if part.strip()).strip()
+        return summary or _fallback_summary(query, items)
+    except Exception:
+        return _fallback_summary(query, items)
+
+
+def _build_sonnet_prompt(query: str, items: list[SearchItem]) -> str:
+    lines = [f"Запрос: {query}", "", "Топ-5 результатов поиска (заголовок, ссылка, сниппет):"]
+    for idx, item in enumerate(items, start=1):
+        lines.append(f"{idx}. {item.title}")
+        lines.append(f"   URL: {item.url or 'n/a'}")
+        lines.append(f"   Snippet: {item.snippet}")
+
+    lines.extend(
+        [
+            "",
+            "Сделай короткое резюме на русском: 'что нашёл'.",
+            "Не придумывай факты, опирайся только на сниппеты выше.",
+            "Формат: 3-6 буллетов и строка 'Ограничения поиска: ...'.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _fallback_summary(query: str, items: list[SearchItem]) -> str:
+    if not items:
+        return f"По запросу '{query}' релевантных результатов не найдено."
+
+    bullets = [f"- {item.title}: {item.snippet}" for item in items[:5]]
+    return "\n".join(
+        [
+            "Кратко, что нашёл:",
+            *bullets,
+            "Ограничения поиска: использованы только поисковые сниппеты, без загрузки веб-страниц.",
+        ]
+    )
+
+
+async def run_research(query: str) -> tuple[list[SearchItem], str]:
+    cleaned = query.strip()
+    if not cleaned:
+        raise ResearchError("Usage: /research <query>")
+
+    items = await search_top5(cleaned)
+    summary = await summarize_with_sonnet(cleaned, items)
+    return items, summary
+
+
+def build_research_reply(query: str, items: list[SearchItem], summary: str) -> str:
+    lines = [f"Research: {query}", "", "Top 5 results:"]
+    if not items:
+        lines.append("- Ничего релевантного не найдено")
+    else:
+        for idx, item in enumerate(items, start=1):
+            lines.append(f"{idx}. {item.title}")
+            lines.append(f"   {item.url or 'n/a'}")
+
+    lines.extend(["", "Что нашёл:", summary.strip(), "", "Подсказка: можно отправить это в Drive через /report <text>."])
+    return "\n".join(lines)
