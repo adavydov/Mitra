@@ -467,6 +467,30 @@ def _safe_audit_event(event: dict[str, object]) -> None:
     logger.info("telegram_audit_event", extra=event)
 
 
+
+
+def _audit_research_failure(
+    *,
+    action_id: str,
+    telegram_update_id: int | None,
+    user_id: int | None,
+    chat_id: int | None,
+    reason: str,
+) -> None:
+    _safe_audit_event(
+        {
+            "event": "telegram_research_failed",
+            "action_id": action_id,
+            "telegram_update_id": telegram_update_id,
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "action_type": "/research",
+            "outcome": "error",
+            "reason": reason,
+            "log_level": "error",
+        }
+    )
+
 def _build_report_title(now: datetime) -> str:
     return f"mitra-report {now.strftime('%Y-%m-%d %H:%M')}"
 
@@ -874,22 +898,22 @@ async def telegram_webhook(
                     reply_text = build_research_reply(query, items, summary)
                 except ResearchError as exc:
                     reply_text = str(exc)
-                except Exception as exc:
-                    reply_text = _sanitize_research_error(exc)
+                    _audit_research_failure(
+                        action_id=action_id,
+                        telegram_update_id=telegram_update_id,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        reason="research_error",
+                    )
+                except Exception:
+                    reply_text = "Research failed. Please try again later."
                     logger.exception("research_command_failed")
-                    _safe_audit_event(
-                        {
-                            "event": "research_command_failed",
-                            "action_id": action_id,
-                            "telegram_update_id": telegram_update_id,
-                            "user_id": user_id,
-                            "chat_id": chat_id,
-                            "action_type": "/research",
-                            "outcome": "error",
-                            "error": str(exc),
-                            "traceback": traceback.format_exc(),
-                            "log_level": "error",
-                        }
+                    _audit_research_failure(
+                        action_id=action_id,
+                        telegram_update_id=telegram_update_id,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        reason="unexpected_error",
                     )
         elif text.startswith("/report"):
             report_text = text[len("/report") :].strip()
