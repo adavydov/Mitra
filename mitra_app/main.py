@@ -1,5 +1,7 @@
+import json
 import logging
 import os
+import re
 from collections import OrderedDict
 from datetime import datetime, timezone
 from threading import Lock
@@ -22,6 +24,20 @@ from mitra_app.telegram import ensure_webhook, send_message
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
+
+_THINK_PROMPT_MAX_LEN = 500
+_THINK_SUMMARY_MAX_LEN = 180
+_SECRET_ENV_NAME_PATTERNS = (
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_WEBHOOK_SECRET",
+    "GITHUB_TOKEN",
+    "DRIVE_SERVICE_ACCOUNT_JSON",
+    "DRIVE_SERVICE_ACCOUNT_JSON_B64",
+    "DRIVE_OAUTH_CLIENT_SECRET",
+    "DRIVE_OAUTH_REFRESH_TOKEN",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+)
 
 
 def _sanitize_drive_http_error(exc: HttpError) -> str:
@@ -222,6 +238,40 @@ def _safe_drive_check_error(exc: Exception) -> str:
     return "drive_check_failed"
 
 
+def _redact_secret_assignments(text: str) -> str:
+    redacted = text
+    for env_name in _SECRET_ENV_NAME_PATTERNS:
+        redacted = re.sub(
+            rf"(?i)({re.escape(env_name)}\s*[=:]\s*)([^\s,;]+)",
+            r"\1[REDACTED]",
+            redacted,
+        )
+    return redacted
+
+
+def _extract_think_prompt(text: str) -> str:
+    prompt = text[len("/think") :].strip()
+    prompt = _redact_secret_assignments(prompt)
+    return prompt[:_THINK_PROMPT_MAX_LEN]
+
+
+def _build_think_reply(prompt: str) -> str:
+    if not prompt:
+        return "Usage: /think <вопрос/задача>"
+
+    summary = prompt.replace("\n", " ").strip()
+    if len(summary) > _THINK_SUMMARY_MAX_LEN:
+        summary = summary[: _THINK_SUMMARY_MAX_LEN - 1].rstrip() + "…"
+
+    return "\n".join(
+        [
+            f"Что сделал: сформировал ответ/план по запросу «{summary}».",
+            "Допущения: работаю только с текстом сообщения, без внешних действий.",
+            "Риск: без доп. контекста ответ может быть неполным.",
+        ]
+    )
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
@@ -287,6 +337,9 @@ async def telegram_webhook(
             reply_text = f"user_id={user_id}, chat_id={chat_id}"
         elif not allowlist_configured:
             reply_text = "Allowlist not configured. Set ALLOWED_TELEGRAM_USER_IDS."
+        elif text.startswith("/think"):
+            think_prompt = _extract_think_prompt(text)
+            reply_text = _build_think_reply(think_prompt)
         elif text.startswith("/reports"):
             try:
                 files = await list_recent_files(limit=5)
