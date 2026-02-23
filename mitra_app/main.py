@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import json
+import time
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,14 +21,15 @@ from mitra_app.budget_ledger import budget_ledger
 from mitra_app.policy_enforcer import CommandPolicy, CommandPolicyEnforcer
 from mitra_app.drive import (
     DriveNotConfigured,
-    check_drive_folder_access,
     OAuthRefreshInvalidGrant,
     check_drive_folder_access,
+    delete_file,
     get_drive_auth_mode,
     get_last_oauth_refresh_time,
     list_recent_files,
     upload_markdown,
 )
+from mitra_app.llm.anthropic import AnthropicClient
 from mitra_app.research import ResearchError, build_research_reply, run_research
 from mitra_app.telegram import ensure_webhook, send_message
 from mitra_app.search import SearchRateLimitExceeded, brave_web_search, format_search_results
@@ -122,6 +124,8 @@ _COMMAND_POLICIES: dict[str, CommandPolicy] = {
     "/whoami": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
     "/help": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
     "/start": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
+    "/smoke": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
+    "/smoke_deep": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="search"),
     "/reports": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
     "/report": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
     "/drive_check": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
@@ -470,6 +474,107 @@ def _is_budget_admin(user_id: int | None) -> bool:
     return str(user_id) == owner_id.strip()
 
 
+def _smoke_line(name: str, status: str, reason: str) -> str:
+    return f"- {name}: {status} ({reason})"
+
+
+def _is_drive_configured() -> bool:
+    if not os.getenv("DRIVE_ROOT_FOLDER_ID"):
+        return False
+    if get_drive_auth_mode() == "oauth":
+        return bool(os.getenv("DRIVE_OAUTH_CLIENT_ID") and os.getenv("DRIVE_OAUTH_CLIENT_SECRET") and os.getenv("DRIVE_OAUTH_REFRESH_TOKEN"))
+    return bool(os.getenv("DRIVE_SERVICE_ACCOUNT_JSON") or os.getenv("DRIVE_SERVICE_ACCOUNT_JSON_B64"))
+
+
+def _is_budget_ledger_loaded() -> bool | None:
+    if budget_ledger is None:
+        return None
+    state = getattr(budget_ledger, "_state", None)
+    return isinstance(state, dict) and bool(state)
+
+
+def _build_smoke_reply(*, user_id: int | None, allowlist_configured: bool, allowed_user_ids: set[int]) -> str:
+    lines = [
+        _smoke_line("telegram", "OK", "webhook command processed"),
+    ]
+
+    if not allowlist_configured:
+        lines.append(_smoke_line("allowlist", "FAIL", "ALLOWED_TELEGRAM_USER_IDS missing"))
+    elif user_id in allowed_user_ids:
+        lines.append(_smoke_line("allowlist", "OK", f"user_id={user_id} allowed"))
+    else:
+        lines.append(_smoke_line("allowlist", "FAIL", f"user_id={user_id} not in allowlist"))
+
+    auth_mode = get_drive_auth_mode()
+    last_refresh_at = get_last_oauth_refresh_time() or "never"
+    lines.append(_smoke_line("oauth", "OK", f"auth_mode={auth_mode}, last_refresh_at={last_refresh_at}"))
+
+    lines.append(_smoke_line("drive", "OK" if _is_drive_configured() else "FAIL", "configured" if _is_drive_configured() else "env missing"))
+
+    ledger_loaded = _is_budget_ledger_loaded()
+    if ledger_loaded is None:
+        lines.append(_smoke_line("budgets", "NA", "ledger disabled"))
+    elif ledger_loaded:
+        lines.append(_smoke_line("budgets", "OK", "ledger loaded"))
+    else:
+        lines.append(_smoke_line("budgets", "FAIL", "ledger not loaded"))
+
+    lines.append(_smoke_line("llm", "OK" if os.getenv("ANTHROPIC_API_KEY") else "FAIL", "configured" if os.getenv("ANTHROPIC_API_KEY") else "ANTHROPIC_API_KEY missing"))
+    lines.append(_smoke_line("search", "OK" if os.getenv("BRAVE_SEARCH_API_KEY") else "FAIL", "configured" if os.getenv("BRAVE_SEARCH_API_KEY") else "BRAVE_SEARCH_API_KEY missing"))
+    return "\n".join(lines)
+
+
+async def _run_smoke_deep_checks() -> tuple[str, dict[str, object]]:
+    lines: list[str] = []
+    audit_payload: dict[str, object] = {"event": "smoke_deep"}
+
+    drive_start = time.perf_counter()
+    try:
+        upload = await upload_markdown(title="mitra-smoke-deep", markdown_body="ok")
+        await delete_file(upload.file_id)
+        drive_latency_ms = int((time.perf_counter() - drive_start) * 1000)
+        lines.append(_smoke_line("drive_deep", "OK", f"latency_ms={drive_latency_ms}"))
+        audit_payload["drive"] = {"status": "ok", "latency_ms": drive_latency_ms}
+    except Exception as exc:
+        drive_latency_ms = int((time.perf_counter() - drive_start) * 1000)
+        detail = _sanitize_report_error(exc)
+        lines.append(_smoke_line("drive_deep", "FAIL", f"{detail}, latency_ms={drive_latency_ms}"))
+        audit_payload["drive"] = {"status": "fail", "detail": detail, "latency_ms": drive_latency_ms}
+
+    llm_start = time.perf_counter()
+    try:
+        llm_payload = AnthropicClient(max_tokens_out=8).create_message([{"role": "user", "content": "Reply with PONG"}])
+        response_text = json.dumps(llm_payload).upper()
+        llm_latency_ms = int((time.perf_counter() - llm_start) * 1000)
+        if "PONG" in response_text:
+            lines.append(_smoke_line("llm_deep", "OK", f"latency_ms={llm_latency_ms}"))
+            audit_payload["llm"] = {"status": "ok", "latency_ms": llm_latency_ms}
+        else:
+            lines.append(_smoke_line("llm_deep", "FAIL", f"unexpected_response, latency_ms={llm_latency_ms}"))
+            audit_payload["llm"] = {"status": "fail", "detail": "unexpected_response", "latency_ms": llm_latency_ms}
+    except Exception:
+        llm_latency_ms = int((time.perf_counter() - llm_start) * 1000)
+        lines.append(_smoke_line("llm_deep", "FAIL", f"request_failed, latency_ms={llm_latency_ms}"))
+        audit_payload["llm"] = {"status": "fail", "detail": "request_failed", "latency_ms": llm_latency_ms}
+
+    if not os.getenv("BRAVE_SEARCH_API_KEY"):
+        lines.append(_smoke_line("search_deep", "NA", "BRAVE_SEARCH_API_KEY missing"))
+        audit_payload["search"] = {"status": "na", "detail": "api_key_missing"}
+    else:
+        search_start = time.perf_counter()
+        try:
+            await brave_web_search("mitra smoke ping")
+            search_latency_ms = int((time.perf_counter() - search_start) * 1000)
+            lines.append(_smoke_line("search_deep", "OK", f"latency_ms={search_latency_ms}"))
+            audit_payload["search"] = {"status": "ok", "latency_ms": search_latency_ms}
+        except Exception:
+            search_latency_ms = int((time.perf_counter() - search_start) * 1000)
+            lines.append(_smoke_line("search_deep", "FAIL", f"request_failed, latency_ms={search_latency_ms}"))
+            audit_payload["search"] = {"status": "fail", "detail": "request_failed", "latency_ms": search_latency_ms}
+
+    return "\n".join(lines), audit_payload
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
@@ -530,7 +635,7 @@ async def telegram_webhook(
             )
             return {"status": "ok"}
 
-        policy_bypass_commands = {"/status", "/oauth_status", "/whoami", "/help", "/start"}
+        policy_bypass_commands = {"/status", "/oauth_status", "/whoami", "/help", "/start", "/smoke"}
         if allowlist_configured or action_type in policy_bypass_commands:
             deny_reason = _enforce_command_policy(
                 action_type=action_type,
@@ -546,6 +651,39 @@ async def telegram_webhook(
 
         if text.startswith("/status"):
             reply_text = "Mitra alive"
+        elif text.startswith("/smoke_deep"):
+            reply_text, smoke_audit = await _run_smoke_deep_checks()
+            _safe_audit_event(
+                {
+                    "event": "telegram_smoke_deep",
+                    "action_id": action_id,
+                    "telegram_update_id": telegram_update_id,
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "action_type": "/smoke_deep",
+                    "outcome": "completed",
+                    "checks": smoke_audit,
+                    "log_level": "info",
+                }
+            )
+        elif text.startswith("/smoke"):
+            reply_text = _build_smoke_reply(
+                user_id=user_id if isinstance(user_id, int) else None,
+                allowlist_configured=allowlist_configured,
+                allowed_user_ids=allowed_user_ids,
+            )
+            _safe_audit_event(
+                {
+                    "event": "telegram_smoke",
+                    "action_id": action_id,
+                    "telegram_update_id": telegram_update_id,
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "action_type": "/smoke",
+                    "outcome": "completed",
+                    "log_level": "info",
+                }
+            )
         elif text.startswith("/oauth_status"):
             auth_mode = get_drive_auth_mode()
             last_refresh_at = get_last_oauth_refresh_time() or "never"
@@ -752,7 +890,7 @@ async def telegram_webhook(
             await budget_ledger.record_github_action()
             reply_text = "Unknown command"
         elif text.startswith("/help") or text.startswith("/start"):
-            reply_text = "Commands: /status, /oauth_status, /research <query>, /report <text>"
+            reply_text = "Commands: /status, /oauth_status, /smoke, /research <query>, /report <text>"
         else:
             reply_text = "Unknown command"
 

@@ -704,6 +704,122 @@ def test_oauth_status_command_returns_mode_and_last_refresh(monkeypatch):
     assert calls == [(123, "auth_mode=oauth, last_refresh_at=2026-01-01T00:00:00+00:00")]
 
 
+def test_smoke_command_formats_status_lines_and_audits(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brave-key")
+    monkeypatch.setenv("DRIVE_ROOT_FOLDER_ID", "folder-1")
+    monkeypatch.setenv("DRIVE_OAUTH_CLIENT_ID", "id")
+    monkeypatch.setenv("DRIVE_OAUTH_CLIENT_SECRET", "secret")
+    monkeypatch.setenv("DRIVE_OAUTH_REFRESH_TOKEN", "refresh")
+
+    calls = []
+    audits = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    def fake_log_event(event: dict[str, object]):
+        audits.append(event)
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
+    monkeypatch.setattr("mitra_app.main.get_drive_auth_mode", lambda: "oauth")
+    monkeypatch.setattr("mitra_app.main.get_last_oauth_refresh_time", lambda: "2026-01-01T00:00:00+00:00")
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/smoke", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls
+    reply = calls[0][1]
+    assert "- telegram: OK" in reply
+    assert "- allowlist: OK" in reply
+    assert "- oauth: OK (auth_mode=oauth, last_refresh_at=2026-01-01T00:00:00+00:00)" in reply
+    assert "- drive: OK" in reply
+    assert "- llm: OK" in reply
+    assert "- search: OK" in reply
+    smoke_audit = next(event for event in audits if event.get("event") == "telegram_smoke")
+    assert smoke_audit["action_type"] == "/smoke"
+    assert smoke_audit["outcome"] == "completed"
+
+
+def test_smoke_deep_captures_failures_instead_of_raising(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+
+    calls = []
+    audits = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_upload_markdown(title: str, markdown_body: str):
+        raise RuntimeError("drive down")
+
+    class FakeAnthropicClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def create_message(self, messages):
+            raise RuntimeError("llm down")
+
+    def fake_log_event(event: dict[str, object]):
+        audits.append(event)
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
+    monkeypatch.setattr("mitra_app.main.AnthropicClient", FakeAnthropicClient)
+    monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/smoke_deep", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    reply = calls[0][1]
+    assert "- drive_deep: FAIL" in reply
+    assert "- llm_deep: FAIL" in reply
+    assert "- search_deep: NA" in reply
+    smoke_audit = next(event for event in audits if event.get("event") == "telegram_smoke_deep")
+    assert smoke_audit["outcome"] == "completed"
+    assert smoke_audit["checks"]["drive"]["status"] == "fail"
+    assert smoke_audit["checks"]["llm"]["status"] == "fail"
+    assert smoke_audit["checks"]["search"]["status"] == "na"
+
+
+def test_start_help_lists_smoke_command(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/start", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert "/smoke" in calls[0][1]
+
+
 def test_pr_status_command_uses_builder_and_returns_result(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
