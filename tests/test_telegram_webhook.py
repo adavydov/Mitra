@@ -166,15 +166,15 @@ def test_duplicate_update_id_returns_200_without_sending_message_and_audits(monk
     assert first_response.status_code == 200
     assert second_response.status_code == 200
     assert calls == [(123, "Mitra alive")]
-    assert audits == [
-        {
-            "event": "telegram_dedup",
-            "update_id": 555,
-            "user_id": 987,
-            "chat_id": 123,
-            "outcome": "dedup",
-        }
-    ]
+    payload = [entry for entry in audits if entry.get("event") == "telegram_dedup"][0]
+    assert payload["event"] == "telegram_dedup"
+    assert payload["action_id"].startswith("act-")
+    assert payload["telegram_update_id"] == 555
+    assert payload["user_id"] == 987
+    assert payload["chat_id"] == 123
+    assert payload["action_type"] == "dedup_check"
+    assert payload["outcome"] == "dedup"
+    assert payload["log_level"] == "info"
 
 
 def test_report_upload_success_replies_with_link_and_audits(monkeypatch, tmp_path):
@@ -211,11 +211,14 @@ def test_report_upload_success_replies_with_link_and_audits(monkeypatch, tmp_pat
     assert "user_id: 123" in captured["body"]
 
     events = (tmp_path / "events.ndjson").read_text(encoding="utf-8").strip().splitlines()
-    payload = json.loads(events[-1])
+    payload = [json.loads(line) for line in events if "file_id" in json.loads(line)][-1]
     assert payload["file_id"] == "file-123"
     assert payload["outcome"] == "success"
     assert payload["action_id"].startswith("act-")
+    assert payload["telegram_update_id"] is None
     assert payload["user_id"] == 123
+    assert payload["action_type"] == "/report"
+    assert payload["log_level"] == "info"
     assert payload["link"] == "https://drive.test/view"
 
 
@@ -246,9 +249,11 @@ def test_report_drive_disabled_replies_and_audits(monkeypatch, tmp_path):
     assert calls == [(123, "Drive disabled")]
 
     events = (tmp_path / "events.ndjson").read_text(encoding="utf-8").strip().splitlines()
-    payload = json.loads(events[-1])
+    payload = [json.loads(line) for line in events if "file_id" in json.loads(line)][-1]
     assert payload["file_id"] == ""
     assert payload["user_id"] == 123
+    assert payload["action_type"] == "/report"
+    assert payload["log_level"] == "error"
     assert payload["outcome"] == "drive_disabled"
 
 
@@ -336,7 +341,7 @@ def test_report_upload_without_web_view_link_uses_file_id(monkeypatch, tmp_path)
     assert calls == [(123, "Saved: file-xyz")]
 
     events = (tmp_path / "events.ndjson").read_text(encoding="utf-8").strip().splitlines()
-    payload = json.loads(events[-1])
+    payload = [json.loads(line) for line in events if "file_id" in json.loads(line)][-1]
     assert payload["file_id"] == "file-xyz"
     assert payload["link"] == "file-xyz"
     assert payload["outcome"] == "success"
@@ -446,6 +451,33 @@ def test_webhook_returns_200_when_send_message_raises(monkeypatch):
     assert response.status_code == 200
     assert response.json() == {"ok": True}
 
+
+
+
+def test_webhook_returns_status_ok_when_audit_fails(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    def fake_log_event(event: dict[str, object]):
+        raise OSError("audit down")
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/status", "chat": {"id": 123}, "from": {"id": 111}}},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert calls == [(123, "Mitra alive")]
 
 def test_drive_check_reports_service_account_mode(monkeypatch):
     monkeypatch.delenv("DRIVE_OAUTH_REFRESH_TOKEN", raising=False)
