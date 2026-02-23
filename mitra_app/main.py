@@ -28,6 +28,7 @@ from mitra_app.drive import (
 )
 from mitra_app.budget_ledger import budget_ledger
 from mitra_app.telegram import ensure_webhook, send_message
+from mitra_app.search import SearchRateLimitExceeded, brave_web_search, format_search_results
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
@@ -540,9 +541,24 @@ async def telegram_webhook(
             reply_text = f"auth_mode={auth_mode}, last_refresh_at={last_refresh_at}"
         elif text.startswith("/whoami"):
             reply_text = f"user_id={user_id}, chat_id={chat_id}"
-        elif text.startswith("/think"):
-            prompt = text[len("/think") :]
-            reply_text = _build_think_reply(prompt)
+        elif text.startswith("/search"):
+            query = text[len("/search") :].strip()
+            if not query:
+                reply_text = "Usage: /search <query>"
+            else:
+                try:
+                    search_results = await brave_web_search(query)
+                    reply_text = format_search_results(search_results)
+                    audit.log_budget_usage(
+                        category="search_queries",
+                        amount=1,
+                        metadata={"user_id": user_id, "chat_id": chat_id, "query": query},
+                    )
+                except SearchRateLimitExceeded as exc:
+                    reply_text = str(exc)
+                except Exception:
+                    reply_text = "Search failed"
+                    logger.exception("search_command_failed")
         elif not allowlist_configured:
             reply_text = "Allowlist not configured. Set ALLOWED_TELEGRAM_USER_IDS."
         elif text.startswith("/think"):
@@ -708,7 +724,7 @@ async def telegram_webhook(
             await budget_ledger.record_github_action()
             reply_text = "Unknown command"
         elif text.startswith("/help") or text.startswith("/start"):
-            reply_text = "Commands: /status, /oauth_status, /report <text>, /budget"
+            reply_text = "Commands: /status, /oauth_status, /report <text>, /search <query>"
         else:
             reply_text = "Unknown command"
 
