@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 _STATE_FOLDER_NAME = "mitra_state"
 _STATE_FILE_NAME = "budget_ledger.json"
+_LOCAL_STATE_PATH = "state/budget_ledger.json"
 
 
 def _today_utc() -> str:
@@ -24,10 +25,11 @@ def _today_utc() -> str:
 
 def _default_limits() -> dict[str, int]:
     return {
-        "tokens_in": int(os.getenv("BUDGET_LIMIT_TOKENS_IN", "200000")),
-        "tokens_out": int(os.getenv("BUDGET_LIMIT_TOKENS_OUT", "200000")),
-        "web_search_queries": int(os.getenv("BUDGET_LIMIT_WEB_SEARCH_QUERIES", "100")),
-        "github_actions": int(os.getenv("BUDGET_LIMIT_GITHUB_ACTIONS", "20")),
+        "llm_calls": int(os.getenv("BUDGET_LIMIT_LLM_CALLS", "500")),
+        "llm_tokens_in": int(os.getenv("BUDGET_LIMIT_LLM_TOKENS_IN", "200000")),
+        "llm_tokens_out": int(os.getenv("BUDGET_LIMIT_LLM_TOKENS_OUT", "200000")),
+        "drive_writes": int(os.getenv("BUDGET_LIMIT_DRIVE_WRITES", "100")),
+        "github_writes": int(os.getenv("BUDGET_LIMIT_GITHUB_WRITES", "20")),
     }
 
 
@@ -37,10 +39,11 @@ def _initial_state() -> dict[str, Any]:
         "day": _today_utc(),
         "limits": _default_limits(),
         "usage": {
-            "tokens_in": 0,
-            "tokens_out": 0,
-            "web_search_queries": 0,
-            "github_actions": 0,
+            "llm_calls": 0,
+            "llm_tokens_in": 0,
+            "llm_tokens_out": 0,
+            "drive_writes": 0,
+            "github_writes": 0,
         },
     }
 
@@ -53,62 +56,60 @@ class BudgetLedger:
 
     async def load(self) -> None:
         async with self._lock:
+            payload: dict[str, Any] | None = None
             try:
                 payload = await self._read_from_drive()
             except DriveNotConfigured:
                 logger.warning("budget_ledger_drive_not_configured")
-                self._state = _initial_state()
-                return
             except Exception:
                 logger.exception("budget_ledger_load_failed")
-                self._state = _initial_state()
-                return
+
+            if payload is None:
+                payload = self._read_from_local()
 
             if payload is None:
                 self._state = _initial_state()
-                await self._write_to_drive(self._state)
+                await self._persist_state(self._state)
                 return
 
             self._state = self._normalize(payload)
 
     async def record_llm_usage(self, usage: dict[str, Any] | None) -> None:
-        if not usage:
-            return
         tokens_in, tokens_out = _extract_tokens(usage)
-        if tokens_in == 0 and tokens_out == 0:
-            return
         async with self._lock:
             self._reset_day_if_needed()
-            self._state["usage"]["tokens_in"] += tokens_in
-            self._state["usage"]["tokens_out"] += tokens_out
-            await self._write_to_drive(self._state)
+            self._state["usage"]["llm_calls"] += 1
+            self._state["usage"]["llm_tokens_in"] += tokens_in
+            self._state["usage"]["llm_tokens_out"] += tokens_out
+            await self._persist_state(self._state)
 
-    async def record_web_search_query(self, count: int = 1) -> None:
+    async def record_drive_write(self, count: int = 1) -> None:
         if count <= 0:
             return
         async with self._lock:
             self._reset_day_if_needed()
-            self._state["usage"]["web_search_queries"] += count
-            await self._write_to_drive(self._state)
+            self._state["usage"]["drive_writes"] += count
+            await self._persist_state(self._state)
 
-    async def record_github_action(self, count: int = 1) -> None:
+    async def record_github_write(self, count: int = 1) -> None:
         if count <= 0:
             return
         async with self._lock:
             self._reset_day_if_needed()
-            self._state["usage"]["github_actions"] += count
-            await self._write_to_drive(self._state)
+            self._state["usage"]["github_writes"] += count
+            await self._persist_state(self._state)
 
     async def reset_day(self) -> None:
         async with self._lock:
             self._state["day"] = _today_utc()
             self._state["usage"] = {
-                "tokens_in": 0,
-                "tokens_out": 0,
-                "web_search_queries": 0,
-                "github_actions": 0,
+                "llm_calls": 0,
+                "llm_tokens_in": 0,
+                "llm_tokens_out": 0,
+                "drive_writes": 0,
+                "github_writes": 0,
             }
-            await self._write_to_drive(self._state)
+            await self._persist_state(self._state)
 
     async def render_budget(self) -> str:
         async with self._lock:
@@ -118,12 +119,46 @@ class BudgetLedger:
         usage = state["usage"]
         limits = state["limits"]
         lines = [f"Budget day: {state['day']}"]
-        for key in ("tokens_in", "tokens_out", "web_search_queries", "github_actions"):
+        for key in ("llm_calls", "llm_tokens_in", "llm_tokens_out", "drive_writes", "github_writes"):
             used = int(usage.get(key, 0))
             limit = int(limits.get(key, 0))
             remain = max(limit - used, 0)
             lines.append(f"- {key}: used={used}, limit={limit}, remain={remain}")
         return "\n".join(lines)
+
+    async def _persist_state(self, payload: dict[str, Any]) -> None:
+        try:
+            await self._write_to_drive(payload)
+            return
+        except DriveNotConfigured:
+            logger.warning("budget_ledger_write_drive_not_configured")
+        except Exception:
+            logger.exception("budget_ledger_write_drive_failed")
+
+        self._write_to_local(payload)
+
+    def _local_state_path(self) -> str:
+        return os.getenv("MITRA_BUDGET_LEDGER_STATE_PATH", _LOCAL_STATE_PATH)
+
+    def _read_from_local(self) -> dict[str, Any] | None:
+        path = self._local_state_path()
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                return json.load(file)
+        except FileNotFoundError:
+            return None
+        except Exception:
+            logger.exception("budget_ledger_local_read_failed", extra={"path": path})
+            return None
+
+    def _write_to_local(self, payload: dict[str, Any]) -> None:
+        path = self._local_state_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as file:
+                json.dump(payload, file, ensure_ascii=False, indent=2)
+        except Exception:
+            logger.exception("budget_ledger_local_write_failed", extra={"path": path})
 
     def _reset_day_if_needed(self) -> None:
         if self._state.get("day") != _today_utc():
@@ -234,7 +269,9 @@ def _find_file_id(service: Any, name: str, parent_id: str, mime_type: str | None
     return str(files[0].get("id", ""))
 
 
-def _extract_tokens(usage: dict[str, Any]) -> tuple[int, int]:
+def _extract_tokens(usage: dict[str, Any] | None) -> tuple[int, int]:
+    if not isinstance(usage, dict):
+        return 0, 0
     tokens_in = usage.get("input_tokens", usage.get("prompt_tokens", 0))
     tokens_out = usage.get("output_tokens", usage.get("completion_tokens", 0))
     try:
@@ -244,4 +281,3 @@ def _extract_tokens(usage: dict[str, Any]) -> tuple[int, int]:
 
 
 budget_ledger = BudgetLedger()
-
