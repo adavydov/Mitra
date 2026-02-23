@@ -31,12 +31,22 @@ from mitra_app.drive import (
 from mitra_app.research import ResearchError, build_research_reply, run_research
 from mitra_app.telegram import ensure_webhook, send_message
 from mitra_app.search import SearchRateLimitExceeded, brave_web_search, format_search_results
+from mitra_app.llm.anthropic import AnthropicClient
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
 
 _THINK_PROMPT_MAX_CHARS = 1200
+_THINK_OUTPUT_MAX_CHARS = 900
 _SECRET_ENV_NAME_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|PRIVATE|API_KEY|ACCESS_KEY|CLIENT_SECRET)", re.IGNORECASE)
+_THINK_SYSTEM_PROMPT = (
+    "Ты помощник в режиме /think. Нужен только анализ текста пользователя без внешних действий. "
+    "Не используйте веб, GitHub, Drive, интеграции, инструменты или вызовы функций. "
+    "Верни ответ в формате:\n"
+    "Короткий ответ: ...\n"
+    "Допущения: ...\n"
+    "Следующие шаги: ..."
+)
 
 
 def _sensitive_env_names() -> set[str]:
@@ -83,12 +93,56 @@ def _build_think_reply(question: str) -> str:
     if not sanitized:
         return "Usage: /think <вопрос/задача>"
 
-    return "\n".join(
-        [
-            f"Что сделал: дал read-only разбор запроса «{sanitized}».",
-            "Допущения: внешние действия и интернет не используются; ответ только по тексту запроса.",
-            "Риск: без доп. контекста план может быть неполным.",
-        ]
+    llm_reply = _invoke_think_llm(sanitized)
+    if not llm_reply:
+        return "Не удалось получить ответ LLM для /think"
+
+    return _cap_output_chars(llm_reply, _THINK_OUTPUT_MAX_CHARS)
+
+
+def _invoke_think_llm(prompt: str, llm_client: AnthropicClient | None = None) -> str:
+    client = llm_client or AnthropicClient()
+    response = client.create_message(
+        messages=[{"role": "user", "content": prompt}],
+        system=_THINK_SYSTEM_PROMPT,
+    )
+    content = response.get("content")
+    if not isinstance(content, list):
+        return ""
+
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+
+    return "\n".join(parts).strip()
+
+
+def _cap_output_chars(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit].rstrip()}…"
+
+
+def _extract_think_prompt(text: str) -> str:
+    command, _, remainder = text.partition(" ")
+    if command.startswith("/think"):
+        return remainder.strip()
+    return ""
+
+
+def _audit_think_command(action_id: str, user_id: int | None, command: str, outcome: str) -> None:
+    _safe_audit_event(
+        {
+            "event": "telegram_think",
+            "action_id": action_id,
+            "user_id": user_id,
+            "command": command,
+            "outcome": outcome,
+            "log_level": "info" if outcome in {"success", "usage"} else "error",
+        }
     )
 
 
@@ -575,7 +629,17 @@ async def telegram_webhook(
             reply_text = "Allowlist not configured. Set ALLOWED_TELEGRAM_USER_IDS."
         elif text.startswith("/think"):
             think_prompt = _extract_think_prompt(text)
-            reply_text = _build_think_reply(think_prompt)
+            if not think_prompt:
+                reply_text = "Usage: /think <вопрос/задача>"
+                _audit_think_command(action_id=action_id, user_id=user_id, command="/think", outcome="usage")
+            else:
+                try:
+                    reply_text = _build_think_reply(think_prompt)
+                    _audit_think_command(action_id=action_id, user_id=user_id, command="/think", outcome="success")
+                except Exception:
+                    logger.exception("think_command_failed")
+                    reply_text = "Не удалось получить ответ LLM для /think"
+                    _audit_think_command(action_id=action_id, user_id=user_id, command="/think", outcome="error")
         elif text.startswith("/reports"):
             try:
                 files = await list_recent_files(limit=5)
@@ -724,7 +788,7 @@ async def telegram_webhook(
                         "action_type": "/pr",
                         "issue_number": issue_number,
                         "outcome": outcome,
-                        "log_level": "info" if outcome == "success" else "error",
+                        "log_level": "info" if outcome in {"success", "usage"} else "error",
                     }
                 )
         elif text.startswith("/drive_check"):
