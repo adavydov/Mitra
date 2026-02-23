@@ -1211,7 +1211,7 @@ def test_research_returns_search_results_and_summary(monkeypatch):
     assert "/report <text>" in calls[0][1]
 
 
-def test_pr_status_returns_link_and_checks(monkeypatch):
+def test_budget_command_replies_with_rendered_budget(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
 
@@ -1221,74 +1221,75 @@ def test_pr_status_returns_link_and_checks(monkeypatch):
         calls.append((chat_id, text))
         return True
 
-    class LinkedPR:
-        def __init__(self):
-            self.number = 77
-            self.html_url = "https://github.com/owner/repo/pull/77"
-
-    class PRStatus:
-        def __init__(self):
-            self.state = "open"
-            self.draft = False
-            self.merged = False
-            self.head_sha = "abc123"
-
-    class CheckSummary:
-        def __init__(self):
-            self.total = 3
-            self.successful = 2
-            self.failed = 1
-            self.pending = 0
-
-    async def fake_find_linked_pr(issue_number: int):
-        assert issue_number == 42
-        return LinkedPR()
-
-    async def fake_get_pr_status(number: int):
-        assert number == 77
-        return PRStatus()
-
-    async def fake_get_pr_checks_summary(head_sha: str):
-        assert head_sha == "abc123"
-        return CheckSummary()
+    async def fake_render_budget() -> str:
+        return "Budget day: 2099-01-01\n- llm_calls: used=1, limit=10, remain=9"
 
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
-    monkeypatch.setattr("mitra_app.main.github.find_linked_pr", fake_find_linked_pr)
-    monkeypatch.setattr("mitra_app.main.github.get_pr_status", fake_get_pr_status)
-    monkeypatch.setattr("mitra_app.main.github.get_pr_checks_summary", fake_get_pr_checks_summary)
+    monkeypatch.setattr("mitra_app.main.budget_ledger.render_budget", fake_render_budget)
 
     response = client.post(
         "/telegram/webhook",
         headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
-        json={"message": {"text": "/pr_status 42", "chat": {"id": 123}, "from": {"id": 123}}},
+        json={"message": {"text": "/budget", "chat": {"id": 123}, "from": {"id": 123}}},
     )
 
     assert response.status_code == 200
-    assert calls == [
-        (
-            123,
-            "PR: https://github.com/owner/repo/pull/77\nState: open\nChecks: total=3, success=2, failed=1, pending=0",
-        )
-    ]
+    assert calls == [(123, "Budget day: 2099-01-01\n- llm_calls: used=1, limit=10, remain=9")]
 
 
-def test_pr_status_invalid_usage(monkeypatch):
+def test_report_success_increments_budget_drive_writes(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
 
-    calls = []
+    counter = {"drive_writes": 0}
 
     async def fake_send_message(chat_id: int, text: str):
-        calls.append((chat_id, text))
         return True
 
+    async def fake_upload_markdown(title: str, markdown_body: str):
+        return DriveUploadResult(file_id="f-1", web_view_link="https://drive.test/f-1")
+
+    async def fake_record_drive_write(count: int = 1):
+        counter["drive_writes"] += count
+
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
+    monkeypatch.setattr("mitra_app.main.budget_ledger.record_drive_write", fake_record_drive_write)
 
     response = client.post(
         "/telegram/webhook",
         headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
-        json={"message": {"text": "/pr_status abc", "chat": {"id": 123}, "from": {"id": 123}}},
+        json={"message": {"text": "/report text", "chat": {"id": 123}, "from": {"id": 123}}},
     )
 
     assert response.status_code == 200
-    assert calls == [(123, "Usage: /pr_status <issue#|pr#>")]
+    assert counter["drive_writes"] == 1
+
+
+def test_pr_success_increments_budget_github_writes(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    counter = {"github_writes": 0}
+
+    async def fake_send_message(chat_id: int, text: str):
+        return True
+
+    async def fake_create_issue(title: str, body: str):
+        return 101, "https://github.test/issues/101"
+
+    async def fake_record_github_write(count: int = 1):
+        counter["github_writes"] += count
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_issue)
+    monkeypatch.setattr("mitra_app.main.budget_ledger.record_github_write", fake_record_github_write)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/pr test title\nbody", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert counter["github_writes"] == 1

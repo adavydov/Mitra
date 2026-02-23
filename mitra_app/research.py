@@ -6,7 +6,7 @@ from typing import Any
 
 import httpx
 
-from mitra_app.search import brave_web_search
+from mitra_app.budget_ledger import budget_ledger
 
 
 class ResearchError(RuntimeError):
@@ -67,12 +67,30 @@ async def summarize_with_sonnet(query: str, items: list[SearchItem]) -> str:
     max_tokens = int(os.getenv("RESEARCH_SONNET_MAX_TOKENS", "300"))
     prompt = _build_sonnet_prompt(query, items)
 
-    client = AnthropicClient(model=model, max_tokens_out=max_tokens)
-    payload = client.create_message(messages=[{"role": "user", "content": prompt}])
-    content = payload.get("content") or []
-    text_parts = [part.get("text", "") for part in content if part.get("type") == "text"]
-    summary = "\n".join(part.strip() for part in text_parts if part.strip()).strip()
-    return summary or _fallback_summary(query, items)
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    body = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": 0.2,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            response = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
+            response.raise_for_status()
+        payload = response.json()
+        await budget_ledger.record_llm_usage(payload.get("usage"))
+        content = payload.get("content") or []
+        text_parts = [part.get("text", "") for part in content if part.get("type") == "text"]
+        summary = "\n".join(part.strip() for part in text_parts if part.strip()).strip()
+        return summary or _fallback_summary(query, items)
+    except Exception:
+        return _fallback_summary(query, items)
 
 
 def _build_sonnet_prompt(query: str, items: list[SearchItem]) -> str:

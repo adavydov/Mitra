@@ -190,6 +190,7 @@ _COMMAND_POLICIES: dict[str, CommandPolicy] = {
     "/report": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
     "/pr_status": CommandPolicy(required_al="AL1", risk_level="R1", budget_category="search"),
     "/drive_check": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
+    "/budget": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
 }
 
 _policy_enforcer = CommandPolicyEnforcer(Path(__file__).resolve().parents[1])
@@ -914,6 +915,7 @@ async def telegram_webhook(
                     file_id = upload.file_id
                     link = upload.web_view_link or upload.file_id
                     reply_text = f"Saved: {link}"
+                    await budget_ledger.record_drive_write()
                     log_report_event(
                         action_id=action_id,
                         telegram_update_id=telegram_update_id,
@@ -998,6 +1000,7 @@ async def telegram_webhook(
 
                 try:
                     issue_number, issue_url = await _create_github_issue(title=title, body=issue_body)
+                    await budget_ledger.record_github_write()
                     reply_text = f"Created: {issue_url}"
                     outcome = "success"
                 except Exception:
