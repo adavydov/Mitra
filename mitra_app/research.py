@@ -6,6 +6,8 @@ from typing import Any
 
 import httpx
 
+from mitra_app.search import brave_web_search
+
 
 class ResearchError(RuntimeError):
     """Raised when research pipeline cannot complete."""
@@ -131,8 +133,20 @@ async def run_research(query: str) -> tuple[list[SearchItem], str]:
     if not cleaned:
         raise ResearchError("Usage: /research <query>")
 
-    items = await search_top5(cleaned)
+    if os.getenv("BRAVE_SEARCH_API_KEY", "").strip():
+        results = await brave_web_search(cleaned)
+        items = [
+            SearchItem(title=result.title, url=result.url, snippet=result.description)
+            for result in results
+        ]
+    else:
+        items = []
+
     summary = await summarize_with_sonnet(cleaned, items)
+
+    if not os.getenv("BRAVE_SEARCH_API_KEY", "").strip():
+        summary = "\n".join(["No web search (search not configured).", summary])
+
     return items, summary
 
 
