@@ -174,8 +174,6 @@ async def upload_markdown_document(title: str, markdown_body: str) -> DriveUploa
     return await upload_markdown(title=title, markdown_body=markdown_body)
 
 
-
-
 async def check_drive_folder_access() -> None:
     folder_id = os.getenv("DRIVE_ROOT_FOLDER_ID")
     if not folder_id:
@@ -184,13 +182,14 @@ async def check_drive_folder_access() -> None:
     credentials_info = {}
     if get_drive_auth_mode() == "service_account":
         credentials_info = _load_service_account_info()
-    service = _build_drive_service(credentials_info)
 
+    service = _build_drive_service(credentials_info)
     service.files().get(
         fileId=folder_id,
         fields="id",
         supportsAllDrives=True,
     ).execute()
+
 
 async def list_recent_files(limit: int = 5) -> list[DriveFile]:
     folder_id = os.getenv("DRIVE_ROOT_FOLDER_ID")
