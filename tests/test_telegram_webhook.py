@@ -808,6 +808,31 @@ def test_research_without_query_returns_usage(monkeypatch):
     assert calls == [(123, "Usage: /research <query>")]
 
 
+
+def test_research_unexpected_error_is_sanitized(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_run_research(query: str):
+        raise RuntimeError("boom\nTraceback: internal")
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.run_research", fake_run_research)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/research ai agents", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Research failed: boom Traceback: internal")]
 def test_research_returns_search_results_and_summary(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
