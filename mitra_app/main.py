@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-import json
+import re
 from collections import OrderedDict
 from datetime import datetime, timezone
 from threading import Lock
@@ -28,6 +28,20 @@ from mitra_app.telegram import ensure_webhook, send_message
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
+
+_THINK_PROMPT_MAX_LEN = 500
+_THINK_SUMMARY_MAX_LEN = 180
+_SECRET_ENV_NAME_PATTERNS = (
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_WEBHOOK_SECRET",
+    "GITHUB_TOKEN",
+    "DRIVE_SERVICE_ACCOUNT_JSON",
+    "DRIVE_SERVICE_ACCOUNT_JSON_B64",
+    "DRIVE_OAUTH_CLIENT_SECRET",
+    "DRIVE_OAUTH_REFRESH_TOKEN",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+)
 
 
 def _sanitize_drive_http_error(exc: HttpError) -> str:
@@ -307,84 +321,38 @@ def _safe_drive_check_error(exc: Exception) -> str:
     return "drive_check_failed"
 
 
-async def _build_pr_status_reply(ref: str) -> str:
-    cleaned = ref.strip().lstrip("#")
-    if not cleaned.isdigit():
-        return "Usage: /pr_status <issue#|pr#>"
+def _redact_secret_assignments(text: str) -> str:
+    redacted = text
+    for env_name in _SECRET_ENV_NAME_PATTERNS:
+        redacted = re.sub(
+            rf"(?i)({re.escape(env_name)}\s*[=:]\s*)([^\s,;]+)",
+            r"\1[REDACTED]",
+            redacted,
+        )
+    return redacted
 
-    repo = os.getenv("GITHUB_REPO", "").strip()
-    if not repo:
-        return "PR status unavailable: set GITHUB_REPO=owner/repo"
 
-    number = int(cleaned)
-    token = os.getenv("GITHUB_TOKEN", "").strip()
-    headers = {"Accept": "application/vnd.github+json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+def _extract_think_prompt(text: str) -> str:
+    prompt = text[len("/think") :].strip()
+    prompt = _redact_secret_assignments(prompt)
+    return prompt[:_THINK_PROMPT_MAX_LEN]
 
-    base_url = f"https://api.github.com/repos/{repo}"
-    timeout = httpx.Timeout(15.0)
 
-    try:
-        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-            pr_response = await client.get(f"{base_url}/pulls/{number}")
-            if pr_response.status_code == 404:
-                issue_response = await client.get(f"{base_url}/issues/{number}")
-                if issue_response.status_code != 200:
-                    return f"PR не найден для #{number}"
-                issue_payload = issue_response.json()
-                if not isinstance(issue_payload, dict) or "pull_request" not in issue_payload:
-                    return f"PR не найден для #{number}"
-                pr_response = await client.get(f"{base_url}/pulls/{number}")
+def _build_think_reply(prompt: str) -> str:
+    if not prompt:
+        return "Usage: /think <вопрос/задача>"
 
-            if pr_response.status_code != 200:
-                return f"PR status failed: {pr_response.status_code}"
+    summary = prompt.replace("\n", " ").strip()
+    if len(summary) > _THINK_SUMMARY_MAX_LEN:
+        summary = summary[: _THINK_SUMMARY_MAX_LEN - 1].rstrip() + "…"
 
-            pr_payload = pr_response.json()
-            if not isinstance(pr_payload, dict):
-                return "PR status failed: invalid GitHub response"
-
-            head_sha = ((pr_payload.get("head") or {}).get("sha") if isinstance(pr_payload.get("head"), dict) else None)
-            checks_summary = "нет данных"
-            if isinstance(head_sha, str) and head_sha:
-                checks_response = await client.get(f"{base_url}/commits/{head_sha}/check-runs")
-                if checks_response.status_code == 200:
-                    checks_payload = checks_response.json()
-                    check_runs = checks_payload.get("check_runs", []) if isinstance(checks_payload, dict) else []
-                    if check_runs:
-                        success = 0
-                        failed = 0
-                        pending = 0
-                        for run in check_runs:
-                            if not isinstance(run, dict):
-                                continue
-                            conclusion = run.get("conclusion")
-                            status = run.get("status")
-                            if conclusion == "success":
-                                success += 1
-                            elif conclusion in {"failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale"}:
-                                failed += 1
-                            elif status != "completed":
-                                pending += 1
-                        checks_summary = f"success={success}, failed={failed}, pending={pending}"
-                    else:
-                        checks_summary = "нет checks"
-
-            auto_merge_enabled = "включён" if pr_payload.get("auto_merge") else "нет"
-            html_url = pr_payload.get("html_url", "")
-            pr_number = pr_payload.get("number", number)
-
-            return "\n".join(
-                [
-                    f"PR: #{pr_number} (есть)",
-                    f"checks: {checks_summary}",
-                    f"auto-merge: {auto_merge_enabled}",
-                    f"ссылка: {html_url}",
-                ]
-            )
-    except httpx.HTTPError:
-        logger.exception("pr_status_request_failed", extra={"repo": repo, "number": number})
-        return "PR status unavailable"
+    return "\n".join(
+        [
+            f"Что сделал: сформировал ответ/план по запросу «{summary}».",
+            "Допущения: работаю только с текстом сообщения, без внешних действий.",
+            "Риск: без доп. контекста ответ может быть неполным.",
+        ]
+    )
 
 
 @app.get("/healthz")
@@ -458,6 +426,9 @@ async def telegram_webhook(
             reply_text = f"user_id={user_id}, chat_id={chat_id}"
         elif not allowlist_configured:
             reply_text = "Allowlist not configured. Set ALLOWED_TELEGRAM_USER_IDS."
+        elif text.startswith("/think"):
+            think_prompt = _extract_think_prompt(text)
+            reply_text = _build_think_reply(think_prompt)
         elif text.startswith("/reports"):
             try:
                 files = await list_recent_files(limit=5)
