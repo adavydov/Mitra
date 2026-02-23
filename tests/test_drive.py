@@ -5,7 +5,7 @@ import json
 import pytest
 from google.auth.exceptions import RefreshError
 
-from mitra_app.drive import DriveNotConfigured, OAuthRefreshInvalidGrant, upload_markdown
+from mitra_app.drive import DriveNotConfigured, OAuthRefreshInvalidGrant, trash_file, upload_markdown
 
 
 def _service_account_payload() -> dict[str, str]:
@@ -175,3 +175,33 @@ def test_upload_markdown_raises_oauth_expired_for_invalid_grant(monkeypatch):
 
     with pytest.raises(OAuthRefreshInvalidGrant, match="OAuth expired. Re-authorize required."):
         asyncio.run(upload_markdown("Report", "# hello"))
+
+
+
+def test_trash_file_marks_file_as_trashed(monkeypatch):
+    monkeypatch.delenv("DRIVE_OAUTH_REFRESH_TOKEN", raising=False)
+    monkeypatch.setenv("DRIVE_SERVICE_ACCOUNT_JSON", json.dumps(_service_account_payload()))
+
+    captured: dict[str, object] = {}
+
+    class _FakeFilesResource:
+        def update(self, **kwargs):
+            captured.update(kwargs)
+            return self
+
+        def execute(self):
+            return {"id": "file-123"}
+
+    class _FakeService:
+        def files(self):
+            return _FakeFilesResource()
+
+    monkeypatch.setattr(
+        "mitra_app.drive.service_account.Credentials.from_service_account_info",
+        lambda info, scopes: object(),
+    )
+    monkeypatch.setattr("mitra_app.drive.build", lambda *args, **kwargs: _FakeService())
+
+    asyncio.run(trash_file("file-123"))
+
+    assert captured == {"fileId": "file-123", "body": {"trashed": True}, "supportsAllDrives": True}

@@ -561,10 +561,10 @@ def test_drive_check_command_success_replies_with_auth_mode_and_audits(monkeypat
 
     async def fake_upload_markdown(title: str, markdown_body: str):
         assert title == "mitra-drive-check"
-        assert markdown_body == "test"
+        assert "mitra drive check" in markdown_body
         return DriveUploadResult(file_id="file-123", web_view_link="https://drive.test/view")
 
-    async def fake_delete_file(file_id: str):
+    async def fake_trash_file(file_id: str):
         assert file_id == "file-123"
         return None
 
@@ -573,7 +573,7 @@ def test_drive_check_command_success_replies_with_auth_mode_and_audits(monkeypat
 
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
     monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
-    monkeypatch.setattr("mitra_app.main.delete_file", fake_delete_file)
+    monkeypatch.setattr("mitra_app.main.trash_file", fake_trash_file)
     monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
 
     response = client.post(
@@ -583,7 +583,10 @@ def test_drive_check_command_success_replies_with_auth_mode_and_audits(monkeypat
     )
 
     assert response.status_code == 200
-    assert calls == [(123, "Drive OK (auth=oauth)")]
+    assert len(calls) == 1
+    assert calls[0][0] == 123
+    assert calls[0][1].startswith("Drive OK (auth=oauth) latency_ms=")
+    assert "file_id=file-123 (deleted)" in calls[0][1]
     drive_check_audit = next(event for event in audits if event.get("event") == "drive_check")
     assert drive_check_audit == {
         "event": "drive_check",
@@ -591,7 +594,7 @@ def test_drive_check_command_success_replies_with_auth_mode_and_audits(monkeypat
         "chat_id": 123,
         "auth_mode": "oauth",
         "outcome": "success",
-        "detail": "upload+delete ok",
+        "detail": "upload+trash ok",
     }
 
 
@@ -642,20 +645,70 @@ def test_drive_check_command_http_error_returns_sanitized_reason_and_audits(monk
 def test_drive_check_endpoint_returns_ok_with_auth_mode(monkeypatch):
     monkeypatch.setenv("DRIVE_OAUTH_REFRESH_TOKEN", "refresh-token")
 
+    async def fake_upload_markdown(title: str, markdown_body: str):
+        return DriveUploadResult(file_id="endpoint-file", web_view_link="https://drive.test/view")
+
+    async def fake_trash_file(file_id: str):
+        assert file_id == "endpoint-file"
+        return None
+
+    monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
+    monkeypatch.setattr("mitra_app.main.trash_file", fake_trash_file)
+
     response = client.get("/drive_check")
 
     assert response.status_code == 200
     payload = response.json()
     assert payload["auth_mode"] == "oauth"
+    assert payload["status"].startswith("Drive OK (auth=oauth) latency_ms=")
+    assert "file_id=endpoint-file (deleted)" in payload["status"]
 
 
 def test_drive_check_endpoint_returns_specific_http_error(monkeypatch):
     monkeypatch.delenv("DRIVE_OAUTH_REFRESH_TOKEN", raising=False)
 
+    class FakeResp:
+        status = 403
+        reason = "Forbidden"
+
+    async def failing_upload(*args, **kwargs):
+        raise HttpError(FakeResp(), b'{"error":{"errors":[{"reason":"insufficientPermissions"}]}}', uri="https://drive.test")
+
+    monkeypatch.setattr("mitra_app.main.upload_markdown", failing_upload)
+
     response = client.get("/drive_check")
 
     assert response.status_code == 200
-    assert response.json() == {"auth_mode": "service_account"}
+    assert response.json() == {
+        "auth_mode": "service_account",
+        "status": "Drive error: 403 insufficientPermissions",
+    }
+
+
+def test_drive_check_command_failure_still_returns_http_200(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_upload_markdown(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/drive_check", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Drive error: unknown drive_check_failed")]
 def test_startup_logs_drive_auth_mode(monkeypatch):
     monkeypatch.setenv("DRIVE_OAUTH_REFRESH_TOKEN", "refresh-token")
 
