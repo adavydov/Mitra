@@ -20,7 +20,7 @@ import mitra_app.audit as audit
 import mitra_app.github as github
 from mitra_app.audit import log_report_event
 from mitra_app.budget_ledger import budget_ledger
-from mitra_app.policy_enforcer import CommandPolicy, CommandPolicyEnforcer
+from mitra_app.policy_enforcer import CommandPolicy, CommandPolicyEnforcer, EnforcementDecision
 from mitra_app.drive import (
     DriveNotConfigured,
     OAuthRefreshInvalidGrant,
@@ -245,7 +245,14 @@ def _enforce_command_policy(
         return None
 
     current_al = _current_autonomy_level()
-    decision = _policy_enforcer.enforce(current_al=current_al, policy=policy)
+    try:
+        decision = _policy_enforcer.enforce(current_al=current_al, policy=policy)
+    except Exception:
+        logger.exception("policy_enforcement_failed", extra={"action_type": action_type})
+        decision = EnforcementDecision(
+            allowed=False,
+            reason=f"Denied: requires {policy.required_al}/{policy.risk_level}",
+        )
     if decision.allowed:
         return None
 

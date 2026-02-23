@@ -1262,33 +1262,38 @@ def test_research_returns_search_results_and_summary(monkeypatch):
     assert "/report <text>" in calls[0][1]
 
 
-def test_research_failure_writes_sanitized_reply_and_audit(monkeypatch, tmp_path):
+def test_policy_enforcement_exception_never_crashes_webhook(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
-    monkeypatch.setenv("MITRA_AUDIT_LOG", str(tmp_path / "events.ndjson"))
 
     calls = []
+    audits = []
 
     async def fake_send_message(chat_id: int, text: str):
         calls.append((chat_id, text))
         return True
 
-    async def fake_run_research(query: str):
-        raise RuntimeError("internal details should not leak")
+    def fake_enforce(*, current_al: str, policy):
+        raise RuntimeError("boom")
+
+    def fake_log_event(event: dict[str, object]):
+        audits.append(event)
 
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
-    monkeypatch.setattr("mitra_app.main.run_research", fake_run_research)
+    monkeypatch.setattr("mitra_app.main._policy_enforcer.enforce", fake_enforce)
+    monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
 
     response = client.post(
         "/telegram/webhook",
         headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
-        json={"message": {"text": "/research ai agents", "chat": {"id": 123}, "from": {"id": 123}}},
+        json={"message": {"text": "/report test", "chat": {"id": 123}, "from": {"id": 123}}},
     )
 
     assert response.status_code == 200
-    assert calls == [(123, "Research failed. Please try again later.")]
-
-    events = (tmp_path / "events.ndjson").read_text(encoding="utf-8").strip().splitlines()
-    payload = json.loads(events[-1])
-    assert payload["event"] == "telegram_research_failed"
-    assert payload["reason"] == "unexpected_error"
+    assert response.json() == {"status": "ok"}
+    assert calls == [(123, "Denied: requires AL2/R2")]
+    denial = [event for event in audits if event.get("event") == "telegram_policy_denied"][0]
+    assert denial["action_type"] == "/report"
+    assert denial["required_al"] == "AL2"
+    assert denial["risk_level"] == "R2"
+    assert denial["outcome"] == "denied"
