@@ -2,7 +2,6 @@ import base64
 import json
 
 import pytest
-
 from mitra_app.drive import DriveNotConfigured, upload_markdown
 
 
@@ -65,7 +64,8 @@ def test_upload_markdown_uses_raw_json_env(monkeypatch):
         "parents": ["root-folder"],
         "mimeType": "text/markdown",
     }
-    assert captured["media_body"] == b"# Content"
+    assert hasattr(captured["media_body"], "getbytes")
+    assert captured["media_body"].getbytes(0, len(b"# Content")) == b"# Content"
     assert captured["fields"] == "id,webViewLink"
 
 
