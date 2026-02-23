@@ -27,4 +27,5 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -r requirements.txt
+      - run: python -m py_compile mitra_app/*.py
       - run: pytest -q
