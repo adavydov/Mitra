@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 
 import httplib2
 from googleapiclient.errors import HttpError
@@ -794,75 +795,78 @@ def test_report_oauth_expired_replies_with_reauthorize_message(monkeypatch, tmp_
     assert payload["outcome"] == "oauth_expired"
 
 
-def test_pr_command_creates_issue_and_replies_with_url(monkeypatch):
+def test_think_command_returns_read_only_template(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
-    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
 
     calls = []
-    audits = []
 
     async def fake_send_message(chat_id: int, text: str):
         calls.append((chat_id, text))
         return True
 
-    async def fake_create_issue(title: str, body: str):
-        assert title == "Feature request"
-        assert body == "line1\nline2"
-        return 42, "https://github.com/org/repo/issues/42"
-
-    def fake_log_event(event: dict[str, object]):
-        audits.append(event)
-
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
-    monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_issue)
-    monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
 
     response = client.post(
         "/telegram/webhook",
         headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
-        json={"message": {"text": "/pr Feature request\nline1\nline2", "chat": {"id": 123}, "from": {"id": 123}}},
+        json={"message": {"text": "/think Как улучшить weekly-отчёт?", "chat": {"id": 123}}},
     )
 
     assert response.status_code == 200
-    assert calls == [(123, "Created: https://github.com/org/repo/issues/42")]
-    issue_audit = [entry for entry in audits if entry.get("event") == "telegram_pr_open_issue"][0]
-    assert issue_audit["issue_number"] == 42
-    assert issue_audit["outcome"] == "success"
+    assert len(calls) == 1
+    reply = calls[0][1]
+    assert "Что сделал:" in reply
+    assert "Допущения:" in reply
+    assert "Риск:" in reply
 
 
-def test_pr_command_rate_limit(monkeypatch):
+def test_think_command_sanitizes_secrets_and_limits_length(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
-    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    monkeypatch.setenv("OPENAI_API_KEY", "super-secret-key")
 
     calls = []
-    audits = []
 
     async def fake_send_message(chat_id: int, text: str):
         calls.append((chat_id, text))
         return True
 
-    async def fake_create_issue(title: str, body: str):
-        return 1, "https://github.com/org/repo/issues/1"
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
 
-    def fake_log_event(event: dict[str, object]):
-        audits.append(event)
+    long_tail = "x" * 5000
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={
+            "message": {
+                "text": f"/think OPENAI_API_KEY={os.getenv('OPENAI_API_KEY')} {long_tail}",
+                "chat": {"id": 123},
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    reply = calls[0][1]
+    assert "super-secret-key" not in reply
+    assert "[REDACTED]" in reply
+    assert len(reply) < 1700
+
+
+def test_think_without_prompt_returns_usage(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
 
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
-    monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_issue)
-    monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
-    from mitra_app.main import PerUserRateLimiter
 
-    monkeypatch.setattr("mitra_app.main._pr_rate_limiter", PerUserRateLimiter(limit=1, window_seconds=3600))
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/think", "chat": {"id": 123}}},
+    )
 
-    payload = {"message": {"text": "/pr T\nS", "chat": {"id": 123}, "from": {"id": 123}}}
-
-    first = client.post("/telegram/webhook", headers={"X-Telegram-Bot-Api-Secret-Token": "secret"}, json=payload)
-    second = client.post("/telegram/webhook", headers={"X-Telegram-Bot-Api-Secret-Token": "secret"}, json=payload)
-
-    assert first.status_code == 200
-    assert second.status_code == 200
-    assert calls == [
-        (123, "Created: https://github.com/org/repo/issues/1"),
-        (123, "Rate limit exceeded: max 5 /pr per hour"),
-    ]
-    assert any(entry.get("event") == "telegram_pr_open_issue" and entry.get("outcome") == "rate_limited" for entry in audits)
+    assert response.status_code == 200
+    assert calls == [(123, "Usage: /think <вопрос/задача>")]
