@@ -3,9 +3,4 @@ services:
     name: mitra-runtime
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m runtime.app
-    envVars:
-      - key: AUTONOMY_LEVEL
-        value: low
-      - key: RISK_APPETITE
-        value: low
+    startCommand: uvicorn mitra_app.main:app --host 0.0.0.0 --port $PORT
