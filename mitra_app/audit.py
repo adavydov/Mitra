@@ -5,13 +5,20 @@ import json
 import os
 
 
-def log_report_event(action_id: str, file_id: str, outcome: str, link: str | None = None) -> None:
+def log_report_event(
+    action_id: str,
+    user_id: int | None,
+    file_id: str,
+    outcome: str,
+    link: str | None = None,
+) -> None:
     path = os.getenv("MITRA_AUDIT_LOG", "audit/events.ndjson")
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     event = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "action_id": action_id,
+        "user_id": user_id,
         "file_id": file_id,
         "outcome": outcome,
     }
