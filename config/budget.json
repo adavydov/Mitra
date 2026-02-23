@@ -1,8 +1,9 @@
 {
+  "id": "CFG-BUDGET-01",
   "currency": "tokens",
   "window": "daily",
-  "hard_limit": 5000,
-  "soft_limit": 4000,
+  "soft_limit": 1000,
+  "hard_limit": 1500,
   "tool_costs": {
     "read": 1,
     "list": 1,
@@ -11,6 +12,5 @@
     "exec_local": 20,
     "exec_network": 100,
     "deploy": 250
-  },
-  "id": "CFG-BUDGET-01"
+  }
 }

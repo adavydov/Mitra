@@ -3,17 +3,26 @@
   "$id": "https://mitra.local/schemas/autonomy.schema.json",
   "type": "object",
   "required": [
-    "current_level",
+    "id",
+    "default_level",
     "levels"
   ],
   "properties": {
-    "current_level": {
+    "id": {
+      "type": "string"
+    },
+    "default_level": {
       "type": "string",
-      "pattern": "^AL[0-9]+$"
+      "enum": [
+        "AL0",
+        "AL1",
+        "AL2",
+        "AL3"
+      ],
+      "default": "AL1"
     },
     "levels": {
       "type": "object",
-      "minProperties": 1,
       "additionalProperties": {
         "type": "object",
         "required": [
@@ -29,10 +38,11 @@
           "max_risk": {
             "type": "string",
             "enum": [
-              "LOW",
-              "MEDIUM",
-              "HIGH",
-              "CRITICAL"
+              "R0",
+              "R1",
+              "R2",
+              "R3",
+              "R4"
             ]
           },
           "max_budget_per_action": {
@@ -43,15 +53,11 @@
             "type": "array",
             "items": {
               "type": "string"
-            },
-            "uniqueItems": true
+            }
           }
         },
         "additionalProperties": false
       }
-    },
-    "id": {
-      "type": "string"
     }
   },
   "additionalProperties": false

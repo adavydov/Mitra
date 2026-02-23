@@ -1,11 +1,28 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mitra.local/schemas/allowlist.schema.json",
   "type": "object",
-  "required": ["id", "hosts", "tools"],
+  "required": [
+    "id",
+    "hosts",
+    "tools"
+  ],
   "properties": {
-    "id": {"type": "string"},
-    "hosts": {"type": "array", "items": {"type": "string"}},
-    "tools": {"type": "array", "items": {"type": "string"}}
+    "id": {
+      "type": "string"
+    },
+    "hosts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
   },
   "additionalProperties": false
 }
