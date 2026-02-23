@@ -27,3 +27,27 @@ def test_log_event_redacts_known_env_vars(monkeypatch, tmp_path, capsys):
 
     stdout = capsys.readouterr().out.strip()
     assert stdout == written
+
+
+def test_log_event_redacts_drive_keys_and_pem(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DRIVE_SERVICE_ACCOUNT_JSON", '{"private_key":"pem-value"}')
+    monkeypatch.setenv("DRIVE_SERVICE_ACCOUNT_JSON_B64", "b64-value")
+
+    line = log_event(
+        {
+            "credentials": "b64-value",
+            "service_account": '{"private_key":"pem-value"}',
+            "pem_block": "-----BEGIN PRIVATE KEY-----\nabc",
+        }
+    )
+
+    payload = json.loads(line)
+    assert payload["credentials"] == "[REDACTED]"
+    assert payload["service_account"] == "[REDACTED]"
+    assert payload["pem_block"] == "[REDACTED]"
+
+    written = (tmp_path / "audit" / "audit.jsonl").read_text(encoding="utf-8").strip()
+    assert "b64-value" not in written
+    assert "pem-value" not in written
+    assert "-----BEGIN" not in written
