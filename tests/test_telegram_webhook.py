@@ -678,3 +678,66 @@ def test_report_oauth_expired_replies_with_reauthorize_message(monkeypatch, tmp_
     events = (tmp_path / "events.ndjson").read_text(encoding="utf-8").strip().splitlines()
     payload = json.loads(events[-1])
     assert payload["outcome"] == "oauth_expired"
+
+
+def test_policy_enforcement_denies_report_when_autonomy_too_low_and_audits(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    monkeypatch.setenv("MITRA_AUTONOMY_LEVEL", "AL1")
+
+    calls = []
+    audits = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    def fake_log_event(event: dict[str, object]):
+        audits.append(event)
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/report test", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Denied: requires AL2 (current AL1)")]
+
+    payload = [entry for entry in audits if entry.get("event") == "telegram_policy_denied"][0]
+    assert payload["action_type"] == "/report"
+    assert payload["required_al"] == "AL2"
+    assert payload["current_al"] == "AL1"
+    assert payload["risk_level"] == "R2"
+    assert payload["budget_category"] == "drive"
+    assert payload["outcome"] == "denied"
+
+
+def test_policy_enforcement_allows_report_when_autonomy_is_sufficient(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    monkeypatch.setenv("MITRA_AUTONOMY_LEVEL", "AL2")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_upload_markdown(title: str, markdown_body: str):
+        return DriveUploadResult(file_id="file-123", web_view_link="https://drive.test/view")
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/report test", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Saved: https://drive.test/view")]

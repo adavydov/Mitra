@@ -1,7 +1,9 @@
+import json
 import logging
 import os
 from collections import OrderedDict
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import Lock
 from uuid import uuid4
 from typing import Any
@@ -14,10 +16,13 @@ from mitra_app.audit import log_report_event
 from mitra_app.drive import (
     DriveNotConfigured,
     OAuthRefreshInvalidGrant,
+    check_drive_folder_access,
     get_drive_auth_mode,
     get_last_oauth_refresh_time,
+    list_recent_files,
     upload_markdown,
 )
+from mitra_app.policy_enforcer import CommandPolicy, CommandPolicyEnforcer
 from mitra_app.telegram import ensure_webhook, send_message
 
 app = FastAPI()
@@ -47,6 +52,89 @@ def _sanitize_drive_http_error(exc: HttpError) -> str:
         reason = str(getattr(getattr(exc, "resp", None), "reason", "unknown"))
 
     return f"Drive error: {status_code} {reason}"
+
+_COMMAND_POLICIES: dict[str, CommandPolicy] = {
+    "/status": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
+    "/oauth_status": CommandPolicy(required_al="AL1", risk_level="R1", budget_category="search"),
+    "/whoami": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
+    "/help": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
+    "/start": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
+    "/reports": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
+    "/report": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
+    "/drive_check": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
+}
+
+_policy_enforcer = CommandPolicyEnforcer(Path(__file__).resolve().parents[1])
+
+
+def _current_autonomy_level() -> str:
+    return os.getenv("MITRA_AUTONOMY_LEVEL", "AL2")
+
+
+def _audit_policy_denied(
+    *,
+    user_id: int | None,
+    chat_id: int | None,
+    action_id: str,
+    telegram_update_id: int | None,
+    action_type: str,
+    required_al: str,
+    current_al: str,
+    risk_level: str,
+    budget_category: str,
+    reason: str,
+) -> None:
+    _safe_audit_event(
+        {
+            "event": "telegram_policy_denied",
+            "action_id": action_id,
+            "telegram_update_id": telegram_update_id,
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "action_type": action_type,
+            "required_al": required_al,
+            "current_al": current_al,
+            "risk_level": risk_level,
+            "budget_category": budget_category,
+            "outcome": "denied",
+            "reason": reason,
+            "log_level": "info",
+        }
+    )
+
+
+def _enforce_command_policy(
+    *,
+    action_type: str,
+    action_id: str,
+    telegram_update_id: int | None,
+    user_id: int | None,
+    chat_id: int | None,
+) -> str | None:
+    policy = _COMMAND_POLICIES.get(action_type)
+    if policy is None:
+        return None
+
+    current_al = _current_autonomy_level()
+    decision = _policy_enforcer.enforce(current_al=current_al, policy=policy)
+    if decision.allowed:
+        return None
+
+    _audit_policy_denied(
+        user_id=user_id,
+        chat_id=chat_id,
+        action_id=action_id,
+        telegram_update_id=telegram_update_id,
+        action_type=action_type,
+        required_al=policy.required_al,
+        current_al=current_al,
+        risk_level=policy.risk_level,
+        budget_category=policy.budget_category,
+        reason=decision.reason or "Denied",
+    )
+
+    return decision.reason or "Denied"
+
 
 
 @app.on_event("startup")
@@ -234,6 +322,13 @@ async def drive_check() -> dict[str, str]:
     last_refresh_at = get_last_oauth_refresh_time()
     if auth_mode == "oauth" and last_refresh_at:
         payload["last_refresh_at"] = last_refresh_at
+
+    try:
+        await check_drive_folder_access()
+        payload["status"] = "OK"
+    except Exception as exc:
+        payload["status"] = _safe_drive_check_error(exc)
+
     return payload
 
 
@@ -275,6 +370,20 @@ async def telegram_webhook(
                 action_type=action_type,
             )
             return {"status": "ok"}
+
+        policy_bypass_commands = {"/status", "/oauth_status", "/whoami", "/help", "/start"}
+        if allowlist_configured or action_type in policy_bypass_commands:
+            deny_reason = _enforce_command_policy(
+                action_type=action_type,
+                action_id=action_id,
+                telegram_update_id=telegram_update_id,
+                user_id=user_id,
+                chat_id=chat_id,
+            )
+            if deny_reason is not None:
+                if chat_id is not None:
+                    await send_message(chat_id=chat_id, text=deny_reason)
+                return {"status": "ok"}
 
         if text.startswith("/status"):
             reply_text = "Mitra alive"
