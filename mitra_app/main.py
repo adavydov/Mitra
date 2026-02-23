@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import json
@@ -17,6 +18,31 @@ from mitra_app.telegram import ensure_webhook, send_message
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_drive_http_error(exc: HttpError) -> str:
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        status_code = getattr(getattr(exc, "resp", None), "status", "unknown")
+
+    reason: str | None = None
+    content = getattr(exc, "content", b"")
+    if isinstance(content, bytes):
+        try:
+            payload = json.loads(content.decode("utf-8"))
+            reason = (((payload.get("error") or {}).get("errors") or [{}])[0]).get("reason")
+        except (UnicodeDecodeError, json.JSONDecodeError, IndexError, AttributeError, TypeError):
+            reason = None
+
+    if not reason:
+        get_reason = getattr(exc, "_get_reason", None)
+        if callable(get_reason):
+            reason = str(get_reason())
+
+    if not reason:
+        reason = str(getattr(getattr(exc, "resp", None), "reason", "unknown"))
+
+    return f"Drive error: {status_code} {reason}"
 
 
 @app.on_event("startup")
