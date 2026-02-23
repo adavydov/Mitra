@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException
 
 from mitra_app.audit import log_report_event
-from mitra_app.drive import DriveNotConfiguredError, upload_markdown_document
+from mitra_app.drive import DriveNotConfigured, upload_markdown
 from mitra_app.telegram import send_message
 
 app = FastAPI()
@@ -56,9 +56,19 @@ def _build_report_title(text: str, now: datetime) -> str:
     return f"report-{stamp}-{_slugify(text)}"
 
 
-def _build_report_body(text: str, now: datetime) -> str:
+def _build_report_body(text: str, now: datetime, action_id: str) -> str:
     timestamp = now.isoformat()
-    return f"{text.strip()}\n\n---\ntimestamp: {timestamp}\n"
+    return "\n".join(
+        [
+            "---",
+            f"action_id: {action_id}",
+            f"timestamp: {timestamp}",
+            "---",
+            "",
+            text.strip(),
+            "",
+        ]
+    )
 
 
 @app.get("/healthz")
@@ -107,15 +117,15 @@ async def telegram_webhook(
         else:
             now = datetime.now(timezone.utc)
             title = _build_report_title(report_text, now)
-            body = _build_report_body(report_text, now)
+            body = _build_report_body(report_text, now, action_id=action_id)
 
             try:
-                upload = await upload_markdown_document(title=title, markdown_body=body)
+                upload = await upload_markdown(title=title, markdown_body=body)
                 file_id = upload.file_id
                 link = upload.web_view_link or upload.file_id
                 reply_text = f"Report uploaded: {link}"
-                log_report_event(action_id=action_id, file_id=file_id, outcome="success")
-            except DriveNotConfiguredError:
+                log_report_event(action_id=action_id, file_id=file_id, outcome="success", link=link)
+            except DriveNotConfigured:
                 reply_text = "Drive disabled"
                 log_report_event(action_id=action_id, file_id=file_id, outcome="drive_disabled")
             except Exception:

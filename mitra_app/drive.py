@@ -7,8 +7,11 @@ from dataclasses import dataclass
 import httpx
 
 
-class DriveNotConfiguredError(RuntimeError):
+class DriveNotConfigured(RuntimeError):
     """Raised when Drive integration is not configured."""
+
+
+DriveNotConfiguredError = DriveNotConfigured
 
 
 @dataclass
@@ -21,11 +24,11 @@ def _require_drive_config() -> tuple[str, str]:
     folder_id = os.getenv("DRIVE_ROOT_FOLDER_ID")
     access_token = os.getenv("GOOGLE_DRIVE_ACCESS_TOKEN")
     if not folder_id or not access_token:
-        raise DriveNotConfiguredError("Drive is not configured")
+        raise DriveNotConfigured("Drive is not configured")
     return folder_id, access_token
 
 
-async def upload_markdown_document(title: str, markdown_body: str) -> DriveUploadResult:
+async def upload_markdown(title: str, markdown_body: str) -> DriveUploadResult:
     folder_id, access_token = _require_drive_config()
 
     metadata = {
@@ -55,3 +58,8 @@ async def upload_markdown_document(title: str, markdown_body: str) -> DriveUploa
             web_view_link = read_response.json().get("webViewLink")
 
     return DriveUploadResult(file_id=file_id, web_view_link=web_view_link)
+
+
+async def upload_markdown_document(title: str, markdown_body: str) -> DriveUploadResult:
+    """Backward-compatible alias for older call sites."""
+    return await upload_markdown(title=title, markdown_body=markdown_body)
