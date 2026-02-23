@@ -3,7 +3,9 @@ import base64
 import json
 
 import pytest
-from mitra_app.drive import DriveNotConfigured, upload_markdown
+from google.auth.exceptions import RefreshError
+
+from mitra_app.drive import DriveNotConfigured, OAuthRefreshInvalidGrant, upload_markdown
 
 
 def _service_account_payload() -> dict[str, str]:
@@ -121,9 +123,15 @@ def test_upload_markdown_prefers_oauth_when_refresh_token_present(monkeypatch):
         def files(self):
             return _FakeFilesResource()
 
+    class _FakeOAuthCredentials:
+        def __init__(self, **kwargs):
+            captured["oauth_kwargs"] = kwargs
+
+        def refresh(self, request):
+            captured["refreshed"] = True
+
     def _fake_oauth_credentials(*args, **kwargs):
-        captured["oauth_kwargs"] = kwargs
-        return object()
+        return _FakeOAuthCredentials(**kwargs)
 
     def _unexpected_service_account(*args, **kwargs):
         raise AssertionError("service account credentials should be ignored when OAuth refresh token exists")
@@ -136,6 +144,7 @@ def test_upload_markdown_prefers_oauth_when_refresh_token_present(monkeypatch):
 
     assert result.file_id == "oauth-file"
     assert captured["oauth_kwargs"]["refresh_token"] == "refresh-token"
+    assert captured["refreshed"] is True
 
 
 def test_upload_markdown_oauth_requires_client_credentials(monkeypatch):
@@ -146,4 +155,23 @@ def test_upload_markdown_oauth_requires_client_credentials(monkeypatch):
     monkeypatch.setenv("DRIVE_SERVICE_ACCOUNT_JSON", json.dumps(_service_account_payload()))
 
     with pytest.raises(DriveNotConfigured, match="Missing OAuth credentials"):
+        asyncio.run(upload_markdown("Report", "# hello"))
+
+
+def test_upload_markdown_raises_oauth_expired_for_invalid_grant(monkeypatch):
+    monkeypatch.setenv("DRIVE_ROOT_FOLDER_ID", "root-folder")
+    monkeypatch.setenv("DRIVE_OAUTH_REFRESH_TOKEN", "refresh-token")
+    monkeypatch.setenv("DRIVE_OAUTH_CLIENT_ID", "client-id")
+    monkeypatch.setenv("DRIVE_OAUTH_CLIENT_SECRET", "client-secret")
+
+    class _FakeOAuthCredentials:
+        def __init__(self, **kwargs):
+            pass
+
+        def refresh(self, request):
+            raise RefreshError("invalid_grant")
+
+    monkeypatch.setattr("mitra_app.drive.OAuthCredentials", lambda *args, **kwargs: _FakeOAuthCredentials(**kwargs))
+
+    with pytest.raises(OAuthRefreshInvalidGrant, match="OAuth expired. Re-authorize required."):
         asyncio.run(upload_markdown("Report", "# hello"))

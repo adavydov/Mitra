@@ -3,10 +3,14 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import logging
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
+from google.auth.exceptions import RefreshError
+from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -20,10 +24,32 @@ class DriveNotConfigured(RuntimeError):
 
 
 DriveNotConfiguredError = DriveNotConfigured
+logger = logging.getLogger(__name__)
+_last_oauth_refresh_at: datetime | None = None
+
+
+class OAuthRefreshInvalidGrant(RuntimeError):
+    """Raised when OAuth refresh token is no longer valid."""
 
 
 def get_drive_auth_mode() -> str:
     return "oauth" if os.getenv("DRIVE_OAUTH_REFRESH_TOKEN") else "service_account"
+
+
+def get_last_oauth_refresh_time() -> str | None:
+    if _last_oauth_refresh_at is None:
+        return None
+    return _last_oauth_refresh_at.isoformat()
+
+
+def _record_oauth_refresh_time() -> None:
+    global _last_oauth_refresh_at
+    _last_oauth_refresh_at = datetime.now(timezone.utc)
+
+
+def _is_invalid_grant(exc: RefreshError) -> bool:
+    message = str(exc).lower()
+    return "invalid_grant" in message
 
 
 @dataclass
@@ -70,6 +96,17 @@ def _build_drive_service(credentials_info: dict[str, Any]):
             client_secret=client_secret,
             scopes=[_DRIVE_SCOPE],
         )
+
+        try:
+            credentials.refresh(Request())
+            _record_oauth_refresh_time()
+            logger.info("drive_oauth_refresh_success", extra={"last_refresh_at": get_last_oauth_refresh_time()})
+        except RefreshError as exc:
+            if _is_invalid_grant(exc):
+                logger.warning("drive_oauth_refresh_invalid_grant")
+                raise OAuthRefreshInvalidGrant("OAuth expired. Re-authorize required.") from exc
+            raise
+
         return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
     credentials = service_account.Credentials.from_service_account_info(
