@@ -27,7 +27,12 @@ async def telegram_webhook(
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
 
-    reply_text = "Mitra alive" if text.startswith("/status") else "Unknown command"
+    if text.startswith("/status"):
+        reply_text = "Mitra alive"
+    elif text.startswith("/help") or text.startswith("/start"):
+        reply_text = "Commands: /status"
+    else:
+        reply_text = "Unknown command"
 
     if chat_id is not None:
         await send_message(chat_id=chat_id, text=reply_text)
