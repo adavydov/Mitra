@@ -34,7 +34,7 @@ class CommandPolicyEnforcer:
         if self._al_index(current_al) < self._al_index(policy.required_al):
             return EnforcementDecision(
                 allowed=False,
-                reason=f"Denied: requires {policy.required_al} (current {current_al})",
+                reason=_required_gate_message(policy),
             )
 
         current_level_cfg = (self._autonomy.get("levels") or {}).get(current_al, {})
@@ -42,7 +42,7 @@ class CommandPolicyEnforcer:
         if self._risk_index(policy.risk_level) > self._risk_index(max_risk):
             return EnforcementDecision(
                 allowed=False,
-                reason=f"Denied: risk {policy.risk_level} exceeds max {max_risk} for {current_al}",
+                reason=_required_gate_message(policy),
             )
 
         category_limits = self._budget.get("category_limits", {})
@@ -50,15 +50,21 @@ class CommandPolicyEnforcer:
         if category_limit is not None and int(category_limit) <= 0:
             return EnforcementDecision(
                 allowed=False,
-                reason=f"Denied: budget for {policy.budget_category} is exhausted",
+                reason=_required_gate_message(policy),
             )
 
         return EnforcementDecision(allowed=True)
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any]:
-        with path.open("r", encoding="utf-8") as file:
-            return json.load(file)
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
+            return {}
+        if isinstance(payload, dict):
+            return payload
+        return {}
 
     @staticmethod
     def _al_index(level: str) -> int:
@@ -73,3 +79,7 @@ class CommandPolicyEnforcer:
             return _RISK_ORDER.index(level)
         except ValueError:
             return len(_RISK_ORDER)
+
+
+def _required_gate_message(policy: CommandPolicy) -> str:
+    return f"Denied: requires {policy.required_al}/{policy.risk_level}"
