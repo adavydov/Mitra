@@ -1,88 +1,53 @@
-import base64
-import json
+import asyncio
 
 import pytest
-
 from mitra_app.drive import DriveNotConfigured, upload_markdown
-
-
-class _FakeCreateRequest:
-    def __init__(self, response):
-        self.response = response
-
-    def execute(self):
-        return self.response
-
-
-class _FakeFilesResource:
-    def __init__(self, sink, response):
-        self.sink = sink
-        self.response = response
-
-    def create(self, **kwargs):
-        self.sink.update(kwargs)
-        return _FakeCreateRequest(self.response)
-
-
-class _FakeDriveService:
-    def __init__(self, sink, response):
-        self.sink = sink
-        self.response = response
-
-    def files(self):
-        return _FakeFilesResource(self.sink, self.response)
 
 
 def test_upload_markdown_raises_when_not_configured(monkeypatch):
     monkeypatch.delenv("DRIVE_ROOT_FOLDER_ID", raising=False)
-    monkeypatch.delenv("DRIVE_SERVICE_ACCOUNT_JSON", raising=False)
-    monkeypatch.delenv("DRIVE_SERVICE_ACCOUNT_JSON_B64", raising=False)
+    monkeypatch.delenv("GOOGLE_DRIVE_ACCESS_TOKEN", raising=False)
 
     with pytest.raises(DriveNotConfigured):
-        upload_markdown("Report", "# hello")
+        asyncio.run(upload_markdown("Report", "# hello"))
 
 
-def test_upload_markdown_uses_raw_json_env(monkeypatch):
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class _FakeAsyncClient:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+    async def post(self, url, headers, files):
+        assert "uploadType=multipart" in url
+        assert headers["Authorization"] == "Bearer token"
+        assert files["file"][2] == "text/markdown"
+        return _FakeResponse({"id": "file-123"})
+
+    async def get(self, url, headers):
+        assert url.endswith("?fields=webViewLink")
+        assert headers["Authorization"] == "Bearer token"
+        return _FakeResponse({"webViewLink": "https://drive/link"})
+
+
+def test_upload_markdown_returns_file_id_and_link(monkeypatch):
     monkeypatch.setenv("DRIVE_ROOT_FOLDER_ID", "root-folder")
-    monkeypatch.setenv(
-        "DRIVE_SERVICE_ACCOUNT_JSON",
-        json.dumps({"type": "service_account", "client_email": "bot@example.com"}),
-    )
+    monkeypatch.setenv("GOOGLE_DRIVE_ACCESS_TOKEN", "token")
+    monkeypatch.setattr("mitra_app.drive.httpx.AsyncClient", lambda timeout: _FakeAsyncClient())
 
-    captured = {}
+    result = asyncio.run(upload_markdown("Daily Report", "# Content"))
 
-    def fake_build_drive_service(credentials_info):
-        assert credentials_info["client_email"] == "bot@example.com"
-        return _FakeDriveService(captured, {"id": "file-123", "webViewLink": "https://drive/link"})
-
-    monkeypatch.setattr("mitra_app.drive._build_drive_service", fake_build_drive_service)
-
-    result = upload_markdown("Daily Report", "# Content")
-
-    assert result == {"file_id": "file-123", "webViewLink": "https://drive/link"}
-    assert captured["body"] == {
-        "name": "Daily Report",
-        "parents": ["root-folder"],
-        "mimeType": "text/markdown",
-    }
-    assert captured["media_body"] == b"# Content"
-    assert captured["fields"] == "id,webViewLink"
-
-
-def test_upload_markdown_uses_base64_env(monkeypatch):
-    monkeypatch.setenv("DRIVE_ROOT_FOLDER_ID", "root-folder")
-    payload = base64.b64encode(
-        json.dumps({"type": "service_account", "client_email": "base64@example.com"}).encode("utf-8")
-    ).decode("utf-8")
-    monkeypatch.setenv("DRIVE_SERVICE_ACCOUNT_JSON_B64", payload)
-    monkeypatch.delenv("DRIVE_SERVICE_ACCOUNT_JSON", raising=False)
-
-    def fake_build_drive_service(credentials_info):
-        assert credentials_info["client_email"] == "base64@example.com"
-        return _FakeDriveService({}, {"id": "file-456"})
-
-    monkeypatch.setattr("mitra_app.drive._build_drive_service", fake_build_drive_service)
-
-    result = upload_markdown("Another Report", "markdown")
-
-    assert result == {"file_id": "file-456", "webViewLink": None}
+    assert result.file_id == "file-123"
+    assert result.web_view_link == "https://drive/link"

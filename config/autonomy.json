@@ -1,15 +1,16 @@
 {
-  "current_level": "AL2",
+  "id": "CFG-AUT-01",
+  "default_level": "AL1",
   "levels": {
     "AL0": {
-      "description": "Quarantine/manual-only mode",
-      "max_risk": "LOW",
+      "description": "Manual/quarantine mode",
+      "max_risk": "R0",
       "max_budget_per_action": 0,
       "allowed_tools": []
     },
     "AL1": {
-      "description": "Read-only analysis",
-      "max_risk": "LOW",
+      "description": "Read-only autonomous analysis",
+      "max_risk": "R1",
       "max_budget_per_action": 10,
       "allowed_tools": [
         "read",
@@ -19,7 +20,7 @@
     },
     "AL2": {
       "description": "Standard assisted execution",
-      "max_risk": "MEDIUM",
+      "max_risk": "R2",
       "max_budget_per_action": 100,
       "allowed_tools": [
         "read",
@@ -31,7 +32,7 @@
     },
     "AL3": {
       "description": "Elevated execution",
-      "max_risk": "HIGH",
+      "max_risk": "R3",
       "max_budget_per_action": 500,
       "allowed_tools": [
         "read",
@@ -43,6 +44,5 @@
         "deploy"
       ]
     }
-  },
-  "id": "CFG-AUT-01"
+  }
 }
