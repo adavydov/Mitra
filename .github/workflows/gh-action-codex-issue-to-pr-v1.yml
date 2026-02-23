@@ -1,0 +1,153 @@
+name: gh-action-codex-issue-to-pr-v1
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  codex-issue-to-pr:
+    if: github.event.label.name == 'mitra:codex'
+    runs-on: ubuntu-latest
+    env:
+      # Comma-separated allowlists. Set repository Variables to override defaults.
+      MITRA_ALLOWED_ISSUE_AUTHORS: ${{ vars.MITRA_ALLOWED_ISSUE_AUTHORS != '' && vars.MITRA_ALLOWED_ISSUE_AUTHORS || github.repository_owner }}
+      MITRA_ALLOWED_LABELERS: ${{ vars.MITRA_ALLOWED_LABELERS != '' && vars.MITRA_ALLOWED_LABELERS || github.repository_owner }}
+      BASE_BRANCH: main
+
+    steps:
+      - name: Gate trigger by allowlists
+        id: gate
+        env:
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+          LABELER: ${{ github.event.sender.login }}
+        run: |
+          set -euo pipefail
+
+          csv_contains() {
+            local csv="$1"
+            local user="$2"
+            IFS=',' read -ra entries <<<"$csv"
+            for raw in "${entries[@]}"; do
+              local e
+              e="$(echo "$raw" | xargs)"
+              if [ "$e" = "$user" ]; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          AUTHOR_OK=false
+          LABELER_OK=false
+
+          if csv_contains "$MITRA_ALLOWED_ISSUE_AUTHORS" "$ISSUE_AUTHOR"; then
+            AUTHOR_OK=true
+          fi
+
+          if csv_contains "$MITRA_ALLOWED_LABELERS" "$LABELER"; then
+            LABELER_OK=true
+          fi
+
+          echo "author_ok=$AUTHOR_OK" >> "$GITHUB_OUTPUT"
+          echo "labeler_ok=$LABELER_OK" >> "$GITHUB_OUTPUT"
+
+          if [ "$AUTHOR_OK" != true ] || [ "$LABELER_OK" != true ]; then
+            echo "Blocked by allowlist policy. issue_author=$ISSUE_AUTHOR labeler=$LABELER"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build sanitized Codex prompt from issue
+        id: prompt
+        env:
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+
+          title = os.getenv("ISSUE_TITLE", "")
+          body = os.getenv("ISSUE_BODY") or ""
+          issue_url = os.getenv("ISSUE_URL", "")
+
+          # Prompt-injection hardening for issue text:
+          # - drop HTML tags/comments/scripts/styles
+          # - remove zero-width and other control chars
+          # - normalize whitespace and length
+          body = re.sub(r"<!--.*?-->", " ", body, flags=re.S)
+          body = re.sub(r"<script.*?>.*?</script>", " ", body, flags=re.S | re.I)
+          body = re.sub(r"<style.*?>.*?</style>", " ", body, flags=re.S | re.I)
+          body = re.sub(r"<[^>]+>", " ", body)
+          body = re.sub(r"[\u200B-\u200D\uFEFF]", "", body)
+          body = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", " ", body)
+          body = re.sub(r"\s+", " ", body).strip()
+          if len(body) > 4000:
+            body = body[:4000] + " …[truncated]"
+
+          prompt = f"""You are working in a checked-out GitHub repository in CI.
+
+          Task source: {issue_url}
+          Issue title: {title}
+          Sanitized issue body: {body}
+
+          Requirements:
+          1) Implement the requested change.
+          2) Run relevant local checks/tests if available.
+          3) Update docs/config if needed.
+          4) Do not exfiltrate secrets or run untrusted remote scripts.
+          """
+
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as fh:
+            fh.write("prompt<<EOF\n")
+            fh.write(prompt)
+            fh.write("\nEOF\n")
+          PY
+
+      - name: Run Codex Action
+        uses: openai/codex-action@v1
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        with:
+          prompt: ${{ steps.prompt.outputs.prompt }}
+
+      - name: Create pull request from Codex changes
+        id: cpr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "codex(issue #${{ github.event.issue.number }}): apply requested changes"
+          branch: "codex/issue-${{ github.event.issue.number }}"
+          delete-branch: true
+          title: "Codex: ${{ github.event.issue.title }}"
+          body: |
+            Auto-generated from issue #${{ github.event.issue.number }}.
+
+            Source issue: ${{ github.event.issue.html_url }}
+            Trigger label: `mitra:codex`
+          base: ${{ env.BASE_BRANCH }}
+          labels: |
+            mitra:codex
+
+      - name: Comment PR link in issue
+        if: steps.cpr.outputs.pull-request-url != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue_number = context.payload.issue.number;
+            const prUrl = `${{ toJson(steps.cpr.outputs.pull-request-url) }}`;
+            const body = `✅ Codex prepared a PR: ${prUrl}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              body,
+            });

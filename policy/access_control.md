@@ -15,6 +15,13 @@ Required evals: EVAL-SEC-TOOLCALL-01
 - IF AL/Risk ниже требуемых порогов THEN deny.
 - ELSE allow только для разрешённых инструментов.
 
+## GitHub token controls
+- Разрешён только `repo`-scoped токен (или fine-grained эквивалент с доступом к одному репозиторию).
+- Принцип минимальных прав: 
+  - read-only операции (`get_issue`, `list_prs`, `get_pr_status`) должны использовать только права чтения Issues/PR.
+  - write-доступ должен использоваться только для `create_issue`.
+- Токен не должен выводиться в логи, отчёты, трассировки и не должен храниться в коде/репозитории.
+
 ## Audit requirements
 Логировать request_id, decision, reason, policy IDs, execution_id.
 REF: L0-CONST

@@ -12,5 +12,11 @@
     "exec_local": 20,
     "exec_network": 100,
     "deploy": 250
+  },
+  "category_limits": {
+    "llm": 500,
+    "search": 300,
+    "github": 200,
+    "drive": 200
   }
 }
