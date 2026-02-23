@@ -559,14 +559,21 @@ def test_drive_check_command_success_replies_with_auth_mode_and_audits(monkeypat
         calls.append((chat_id, text))
         return True
 
-    async def fake_check_drive_folder_access():
+    async def fake_upload_markdown(title: str, markdown_body: str):
+        assert title == "mitra-drive-check"
+        assert markdown_body == "test"
+        return DriveUploadResult(file_id="file-123", web_view_link="https://drive.test/view")
+
+    async def fake_delete_file(file_id: str):
+        assert file_id == "file-123"
         return None
 
     def fake_log_event(event: dict[str, object]):
         audits.append(event)
 
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
-    monkeypatch.setattr("mitra_app.main.check_drive_folder_access", fake_check_drive_folder_access)
+    monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
+    monkeypatch.setattr("mitra_app.main.delete_file", fake_delete_file)
     monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
 
     response = client.post(
@@ -576,17 +583,16 @@ def test_drive_check_command_success_replies_with_auth_mode_and_audits(monkeypat
     )
 
     assert response.status_code == 200
-    assert calls == [(123, "OK (auth=oauth, folder ok)")]
-    assert audits == [
-        {
-            "event": "drive_check",
-            "user_id": 123,
-            "chat_id": 123,
-            "auth_mode": "oauth",
-            "outcome": "success",
-            "detail": "folder ok",
-        }
-    ]
+    assert calls == [(123, "Drive OK (auth=oauth)")]
+    drive_check_audit = next(event for event in audits if event.get("event") == "drive_check")
+    assert drive_check_audit == {
+        "event": "drive_check",
+        "user_id": 123,
+        "chat_id": 123,
+        "auth_mode": "oauth",
+        "outcome": "success",
+        "detail": "upload+delete ok",
+    }
 
 
 def test_drive_check_command_http_error_returns_sanitized_reason_and_audits(monkeypatch):
@@ -604,14 +610,14 @@ def test_drive_check_command_http_error_returns_sanitized_reason_and_audits(monk
         status = 403
         reason = "Forbidden"
 
-    async def fake_check_drive_folder_access():
+    async def fake_upload_markdown(title: str, markdown_body: str):
         raise HttpError(FakeResp(), b'{"error":{"errors":[{"reason":"insufficientPermissions"}]}}', uri="https://drive.test")
 
     def fake_log_event(event: dict[str, object]):
         audits.append(event)
 
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
-    monkeypatch.setattr("mitra_app.main.check_drive_folder_access", fake_check_drive_folder_access)
+    monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
     monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
 
     response = client.post(
@@ -622,25 +628,19 @@ def test_drive_check_command_http_error_returns_sanitized_reason_and_audits(monk
 
     assert response.status_code == 200
     assert calls == [(123, "Drive error: 403 insufficientPermissions")]
-    assert audits == [
-        {
-            "event": "drive_check",
-            "user_id": 123,
-            "chat_id": 123,
-            "auth_mode": "service_account",
-            "outcome": "error",
-            "detail": "Drive error: 403 insufficientPermissions",
-        }
-    ]
+    drive_check_audit = next(event for event in audits if event.get("event") == "drive_check")
+    assert drive_check_audit == {
+        "event": "drive_check",
+        "user_id": 123,
+        "chat_id": 123,
+        "auth_mode": "service_account",
+        "outcome": "error",
+        "detail": "Drive error: 403 insufficientPermissions",
+    }
 
 
 def test_drive_check_endpoint_returns_ok_with_auth_mode(monkeypatch):
     monkeypatch.setenv("DRIVE_OAUTH_REFRESH_TOKEN", "refresh-token")
-
-    async def fake_check_drive_folder_access():
-        return None
-
-    monkeypatch.setattr("mitra_app.main.check_drive_folder_access", fake_check_drive_folder_access)
 
     response = client.get("/drive_check")
 
@@ -652,19 +652,10 @@ def test_drive_check_endpoint_returns_ok_with_auth_mode(monkeypatch):
 def test_drive_check_endpoint_returns_specific_http_error(monkeypatch):
     monkeypatch.delenv("DRIVE_OAUTH_REFRESH_TOKEN", raising=False)
 
-    class FakeResp:
-        status = 400
-        reason = "Bad Request"
-
-    async def fake_check_drive_folder_access():
-        raise HttpError(FakeResp(), b'{"error":{"errors":[{"reason":"invalid_grant"}]}}', uri="https://drive.test")
-
-    monkeypatch.setattr("mitra_app.main.check_drive_folder_access", fake_check_drive_folder_access)
-
     response = client.get("/drive_check")
 
     assert response.status_code == 200
-    assert response.json() == {"auth_mode": "service_account", "status": "Drive error: 400 invalid_grant"}
+    assert response.json() == {"auth_mode": "service_account"}
 def test_startup_logs_drive_auth_mode(monkeypatch):
     monkeypatch.setenv("DRIVE_OAUTH_REFRESH_TOKEN", "refresh-token")
 

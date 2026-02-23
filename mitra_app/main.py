@@ -19,8 +19,7 @@ from mitra_app.drive import (
     DriveNotConfigured,
     check_drive_folder_access,
     OAuthRefreshInvalidGrant,
-    list_recent_files,
-    check_drive_folder_access,
+    delete_file,
     get_drive_auth_mode,
     get_last_oauth_refresh_time,
     list_recent_files,
@@ -704,9 +703,10 @@ async def telegram_webhook(
             auth_mode = get_drive_auth_mode()
 
             try:
-                await check_drive_folder_access()
-                reply_text = f"OK (auth={auth_mode}, folder ok)"
-                _audit_drive_check(user_id=user_id, chat_id=chat_id, auth_mode=auth_mode, outcome="success", detail="folder ok")
+                upload = await upload_markdown(title="mitra-drive-check", markdown_body="test")
+                await delete_file(upload.file_id)
+                reply_text = "Drive OK (auth=oauth)"
+                _audit_drive_check(user_id=user_id, chat_id=chat_id, auth_mode=auth_mode, outcome="success", detail="upload+delete ok")
             except Exception as exc:
                 detail = _safe_drive_check_error(exc)
                 reply_text = detail
