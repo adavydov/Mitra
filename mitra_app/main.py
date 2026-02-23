@@ -19,13 +19,13 @@ from mitra_app.drive import (
     DriveNotConfigured,
     check_drive_folder_access,
     OAuthRefreshInvalidGrant,
-    delete_file,
+    check_drive_folder_access,
     get_drive_auth_mode,
     get_last_oauth_refresh_time,
     list_recent_files,
     upload_markdown,
 )
-from mitra_app.budget_ledger import budget_ledger
+from mitra_app.research import ResearchError, build_research_reply, run_research
 from mitra_app.telegram import ensure_webhook, send_message
 from mitra_app.search import SearchRateLimitExceeded, brave_web_search, format_search_results
 
@@ -471,11 +471,13 @@ async def drive_check() -> dict[str, str]:
     last_refresh_at = get_last_oauth_refresh_time()
     if auth_mode == "oauth" and last_refresh_at:
         payload["last_refresh_at"] = last_refresh_at
+
     try:
         await check_drive_folder_access()
+        return payload
     except Exception as exc:
         payload["status"] = _safe_drive_check_error(exc)
-    return payload
+        return payload
 
 
 @app.post("/telegram/webhook")
@@ -577,6 +579,19 @@ async def telegram_webhook(
             except Exception as exc:
                 reply_text = _sanitize_report_error(exc)
                 logger.exception("report_list_failed")
+        elif text.startswith("/research"):
+            query = text[len("/research") :].strip()
+            if not query:
+                reply_text = "Usage: /research <query>"
+            else:
+                try:
+                    items, summary = await run_research(query)
+                    reply_text = build_research_reply(query, items, summary)
+                except ResearchError as exc:
+                    reply_text = str(exc)
+                except Exception:
+                    reply_text = "Research failed"
+                    logger.exception("research_command_failed")
         elif text.startswith("/report"):
             report_text = text[len("/report") :].strip()
             file_id = ""
@@ -639,6 +654,8 @@ async def telegram_webhook(
                         outcome="oauth_expired",
                         user_id=user_id,
                         chat_id=chat_id,
+                        action_type="/report",
+                        log_level="warning",
                     )
                 except Exception as exc:
                     reply_text = _sanitize_report_error(exc)
@@ -724,23 +741,9 @@ async def telegram_webhook(
             await budget_ledger.record_github_action()
             reply_text = "Unknown command"
         elif text.startswith("/help") or text.startswith("/start"):
-            reply_text = "Commands: /status, /oauth_status, /report <text>, /search <query>"
+            reply_text = "Commands: /status, /oauth_status, /research <query>, /report <text>"
         else:
             reply_text = "Unknown command"
-
-        if action_type not in {"/report", "/drive_check"}:
-            _safe_audit_event(
-                {
-                    "event": "telegram_command",
-                    "action_id": action_id,
-                    "telegram_update_id": telegram_update_id,
-                    "user_id": user_id,
-                    "chat_id": chat_id,
-                    "action_type": action_type,
-                    "outcome": "success",
-                    "log_level": "info",
-                }
-            )
 
         if chat_id is not None:
             await send_message(chat_id=chat_id, text=reply_text)

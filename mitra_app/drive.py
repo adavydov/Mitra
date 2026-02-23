@@ -220,7 +220,6 @@ async def list_recent_files(limit: int = 5) -> list[DriveFile]:
 
 
 async def check_drive_folder_access() -> None:
-    """Validates that configured Drive root folder is accessible."""
     folder_id = os.getenv("DRIVE_ROOT_FOLDER_ID")
     if not folder_id:
         raise DriveNotConfigured("Missing DRIVE_ROOT_FOLDER_ID")
@@ -230,8 +229,4 @@ async def check_drive_folder_access() -> None:
         credentials_info = _load_service_account_info()
     service = _build_drive_service(credentials_info)
 
-    service.files().get(
-        fileId=folder_id,
-        fields="id",
-        supportsAllDrives=True,
-    ).execute()
+    service.files().get(fileId=folder_id, fields="id", supportsAllDrives=True).execute()
