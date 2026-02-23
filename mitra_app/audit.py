@@ -18,13 +18,35 @@ def log_event(event: dict[str, object]) -> None:
         audit_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
-def log_report_event(action_id: str, file_id: str, outcome: str, link: str | None = None) -> None:
-    event = {
-        "action_id": action_id,
-        "user_id": user_id,
-        "file_id": file_id,
-        "outcome": outcome,
-    }
-    if link:
-        event["link"] = link
-    log_event(event)
+def log_report_event(
+    action_id: str,
+    file_id: str,
+    outcome: str,
+    user_id: int | None = None,
+    chat_id: int | None = None,
+    link: str | None = None,
+) -> None:
+    try:
+        event: dict[str, object] = {
+            "action_id": action_id,
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "file_id": file_id,
+            "outcome": outcome,
+        }
+        if link:
+            event["link"] = link
+        log_event(event)
+    except Exception as exc:
+        print(
+            {
+                "event": "log_report_event_failed",
+                "action_id": action_id,
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "file_id": file_id,
+                "outcome": outcome,
+                "link": link,
+                "error": str(exc),
+            }
+        )
