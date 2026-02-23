@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 import os
+import logging
 from dataclasses import dataclass
-from typing import Any
 
 import httpx
+
+from mitra_app.search import brave_web_search
+
+
+logger = logging.getLogger(__name__)
+
+_NO_SEARCH_DISCLAIMER = "No web search (search not configured)."
 
 
 class ResearchError(RuntimeError):
@@ -19,45 +26,10 @@ class SearchItem:
 
 
 async def search_top5(query: str) -> list[SearchItem]:
-    params = {"q": query, "format": "json", "no_html": 1, "skip_disambig": 1}
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.get("https://api.duckduckgo.com/", params=params)
-        response.raise_for_status()
-    payload = response.json()
-
-    candidates: list[SearchItem] = []
-    for topic in payload.get("RelatedTopics", []):
-        candidates.extend(_extract_topics(topic))
-        if len(candidates) >= 5:
-            break
-
-    if not candidates and payload.get("AbstractText"):
-        candidates.append(
-            SearchItem(
-                title=str(payload.get("Heading") or query),
-                url=str(payload.get("AbstractURL") or ""),
-                snippet=str(payload.get("AbstractText") or ""),
-            )
-        )
-
-    return candidates[:5]
+    results = await brave_web_search(query)
+    return [SearchItem(title=item.title, url=item.url, snippet=item.description) for item in results[:5]]
 
 
-def _extract_topics(topic: dict[str, Any]) -> list[SearchItem]:
-    if "Topics" in topic:
-        nested: list[SearchItem] = []
-        for item in topic.get("Topics", []):
-            nested.extend(_extract_topics(item))
-        return nested
-
-    text = str(topic.get("Text") or "").strip()
-    url = str(topic.get("FirstURL") or "").strip()
-    if not text:
-        return []
-
-    title = text.split(" - ", 1)[0].strip()
-    snippet = text.split(" - ", 1)[1].strip() if " - " in text else text
-    return [SearchItem(title=title or "(untitled)", url=url, snippet=snippet)]
 
 
 async def summarize_with_sonnet(query: str, items: list[SearchItem]) -> str:
@@ -131,9 +103,65 @@ async def run_research(query: str) -> tuple[list[SearchItem], str]:
     if not cleaned:
         raise ResearchError("Usage: /research <query>")
 
-    items = await search_top5(cleaned)
-    summary = await summarize_with_sonnet(cleaned, items)
-    return items, summary
+    search_api_key = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
+    if not search_api_key:
+        summary = await summarize_without_search(cleaned)
+        return [], f"{_NO_SEARCH_DISCLAIMER}\n{summary}"
+
+    try:
+        items = await search_top5(cleaned)
+        summary = await summarize_with_sonnet(cleaned, items)
+        return items, summary
+    except Exception as exc:
+        logger.exception("research_pipeline_failed")
+        raise ResearchError("Research failed. Please try again later.") from exc
+
+
+async def summarize_without_search(query: str) -> str:
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        return (
+            "LLM-only answer without fresh web sources. "
+            f"Working hypothesis for '{query}': уточните контекст, критерии и ограничения, "
+            "чтобы получить более точный вывод."
+        )
+
+    prompt = "\n".join(
+        [
+            f"Запрос: {query}",
+            "Сформируй короткий ответ на русском без использования веб-поиска.",
+            "Явно укажи, что ответ основан на общих знаниях модели и может быть устаревшим.",
+            "Формат: 3-6 буллетов + строка с ограничениями.",
+        ]
+    )
+
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    body = {
+        "model": os.getenv("RESEARCH_SONNET_MODEL", "claude-3-5-sonnet-latest"),
+        "max_tokens": int(os.getenv("RESEARCH_SONNET_MAX_TOKENS", "300")),
+        "temperature": 0.2,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            response = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
+            response.raise_for_status()
+        payload = response.json()
+        content = payload.get("content") or []
+        text_parts = [part.get("text", "") for part in content if part.get("type") == "text"]
+        summary = "\n".join(part.strip() for part in text_parts if part.strip()).strip()
+        return summary or f"Базовый ответ без веб-поиска по запросу '{query}'."
+    except Exception:
+        logger.exception("research_llm_only_failed")
+        return (
+            "LLM-only answer without fresh web sources. "
+            f"For '{query}' provide domain, geography, and timeframe to improve quality."
+        )
 
 
 def build_research_reply(query: str, items: list[SearchItem], summary: str) -> str:
