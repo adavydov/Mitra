@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from collections import OrderedDict
@@ -7,6 +8,7 @@ from uuid import uuid4
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException
+from googleapiclient.errors import HttpError
 
 import mitra_app.audit as audit
 from mitra_app.audit import log_report_event
@@ -15,6 +17,31 @@ from mitra_app.telegram import ensure_webhook, send_message
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_drive_http_error(exc: HttpError) -> str:
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        status_code = getattr(getattr(exc, "resp", None), "status", "unknown")
+
+    reason: str | None = None
+    content = getattr(exc, "content", b"")
+    if isinstance(content, bytes):
+        try:
+            payload = json.loads(content.decode("utf-8"))
+            reason = (((payload.get("error") or {}).get("errors") or [{}])[0]).get("reason")
+        except (UnicodeDecodeError, json.JSONDecodeError, IndexError, AttributeError, TypeError):
+            reason = None
+
+    if not reason:
+        get_reason = getattr(exc, "_get_reason", None)
+        if callable(get_reason):
+            reason = str(get_reason())
+
+    if not reason:
+        reason = str(getattr(getattr(exc, "resp", None), "reason", "unknown"))
+
+    return f"Drive error: {status_code} {reason}"
 
 
 @app.on_event("startup")
@@ -188,6 +215,7 @@ async def telegram_webhook(
                         link=link,
                     )
                 except DriveNotConfigured:
+                    logger.exception("report_upload_drive_not_configured")
                     reply_text = "Drive disabled"
                     log_report_event(
                         action_id=action_id,
@@ -196,8 +224,12 @@ async def telegram_webhook(
                         user_id=user_id,
                         chat_id=chat_id,
                     )
-                except Exception:
-                    reply_text = "Report failed"
+                except Exception as exc:
+                    logger.exception("report_upload_failed")
+                    if isinstance(exc, HttpError):
+                        reply_text = _sanitize_drive_http_error(exc)
+                    else:
+                        reply_text = "Report failed"
                     log_report_event(
                         action_id=action_id,
                         file_id=file_id,
