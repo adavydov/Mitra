@@ -1,11 +1,13 @@
+import json
 import logging
 import os
 from collections import OrderedDict
 from datetime import datetime, timezone
 from threading import Lock
-from uuid import uuid4
 from typing import Any
+from uuid import uuid4
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException
 from googleapiclient.errors import HttpError
 
@@ -13,9 +15,11 @@ import mitra_app.audit as audit
 from mitra_app.audit import log_report_event
 from mitra_app.drive import (
     DriveNotConfigured,
+    check_drive_folder_access,
     OAuthRefreshInvalidGrant,
     get_drive_auth_mode,
     get_last_oauth_refresh_time,
+    list_recent_files,
     upload_markdown,
 )
 from mitra_app.telegram import ensure_webhook, send_message
@@ -79,6 +83,85 @@ class RecentUpdateDeduplicator:
 
 
 _recent_update_deduplicator = RecentUpdateDeduplicator(max_size=1000)
+
+
+class PerUserRateLimiter:
+    def __init__(self, limit: int, window_seconds: int) -> None:
+        self._limit = limit
+        self._window_seconds = window_seconds
+        self._events_by_user: dict[int, list[float]] = {}
+        self._lock = Lock()
+
+    def allow(self, user_id: int | None) -> bool:
+        if user_id is None:
+            return False
+
+        now_ts = datetime.now(timezone.utc).timestamp()
+        min_ts = now_ts - self._window_seconds
+
+        with self._lock:
+            history = self._events_by_user.setdefault(user_id, [])
+            history[:] = [event_ts for event_ts in history if event_ts >= min_ts]
+            if len(history) >= self._limit:
+                return False
+            history.append(now_ts)
+            return True
+
+
+_pr_rate_limiter = PerUserRateLimiter(limit=5, window_seconds=3600)
+
+
+def _parse_pr_command(text: str) -> tuple[str, str] | None:
+    body = text[len("/pr") :].lstrip()
+    if not body:
+        return None
+
+    if "\n" in body:
+        title, spec = body.split("\n", 1)
+    else:
+        title, spec = body, ""
+
+    title = title.strip()
+    spec = spec.strip()
+
+    if not title:
+        return None
+
+    return title, spec
+
+
+async def _create_github_issue(title: str, body: str) -> tuple[int, str]:
+    token = os.getenv("GITHUB_TOKEN")
+    repository = os.getenv("GITHUB_REPOSITORY")
+    if not token or not repository:
+        raise RuntimeError("GitHub integration is not configured")
+
+    if "/" not in repository:
+        raise RuntimeError("GITHUB_REPOSITORY must be owner/repo")
+
+    api_url = f"https://api.github.com/repos/{repository}/issues"
+    payload = {
+        "title": title,
+        "body": body,
+        "labels": ["mitra:codex"],
+    }
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(api_url, json=payload, headers=headers)
+        response.raise_for_status()
+        response_payload: dict[str, Any] = response.json()
+
+    issue_number = int(response_payload.get("number", 0))
+    issue_url = str(response_payload.get("html_url", ""))
+    if issue_number <= 0 or not issue_url:
+        raise RuntimeError("GitHub issue create returned invalid response")
+
+    return issue_number, issue_url
 
 
 def _load_allowed_user_ids() -> set[int]:
@@ -377,6 +460,52 @@ async def telegram_webhook(
                         action_type="/report",
                         log_level="error",
                     )
+        elif text.startswith("/pr"):
+            parsed = _parse_pr_command(text)
+            if not parsed:
+                reply_text = "Usage: /pr <title>\\n<spec>"
+            elif not _pr_rate_limiter.allow(user_id if isinstance(user_id, int) else None):
+                reply_text = "Rate limit exceeded: max 5 /pr per hour"
+                _safe_audit_event(
+                    {
+                        "event": "telegram_pr_open_issue",
+                        "action_id": action_id,
+                        "telegram_update_id": telegram_update_id,
+                        "user_id": user_id,
+                        "chat_id": chat_id,
+                        "action_type": "/pr",
+                        "issue_number": None,
+                        "outcome": "rate_limited",
+                        "log_level": "info",
+                    }
+                )
+            else:
+                title, spec = parsed
+                issue_body = spec or "(no spec provided)"
+                issue_number: int | None = None
+
+                try:
+                    issue_number, issue_url = await _create_github_issue(title=title, body=issue_body)
+                    reply_text = f"Created: {issue_url}"
+                    outcome = "success"
+                except Exception:
+                    logger.exception("telegram_pr_create_issue_failed")
+                    reply_text = "Failed to create issue"
+                    outcome = "error"
+
+                _safe_audit_event(
+                    {
+                        "event": "telegram_pr_open_issue",
+                        "action_id": action_id,
+                        "telegram_update_id": telegram_update_id,
+                        "user_id": user_id,
+                        "chat_id": chat_id,
+                        "action_type": "/pr",
+                        "issue_number": issue_number,
+                        "outcome": outcome,
+                        "log_level": "info" if outcome == "success" else "error",
+                    }
+                )
         elif text.startswith("/drive_check"):
             auth_mode = get_drive_auth_mode()
 
