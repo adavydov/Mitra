@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 
 import httplib2
 from googleapiclient.errors import HttpError
@@ -94,6 +95,69 @@ def test_allowlist_not_configured_allows_whoami(monkeypatch):
 
     assert response.status_code == 200
     assert calls == [(123, "user_id=999, chat_id=123")]
+
+
+def test_think_command_returns_short_read_only_response(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def forbidden_upload_markdown(*args, **kwargs):
+        raise AssertionError("/think must not touch Drive")
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.upload_markdown", forbidden_upload_markdown)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/think Составь план запуска", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert len(calls) == 1
+    reply = calls[0][1]
+    assert "Что сделал:" in reply
+    assert "Допущения:" in reply
+    assert "Риск:" in reply
+
+
+def test_think_command_redacts_secret_assignments_and_limits_prompt(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+
+    long_tail = "x" * 1200
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={
+            "message": {
+                "text": f"/think Проверь TELEGRAM_BOT_TOKEN=12345 и хвост {long_tail}",
+                "chat": {"id": 123},
+                "from": {"id": 123},
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    reply = calls[0][1]
+    assert "12345" not in reply
+    assert "[REDACTED]" in reply
+    assert len(reply) < 450
 
 
 def test_allowlist_denied_user_returns_200_without_sending_message(monkeypatch):
@@ -640,6 +704,57 @@ def test_oauth_status_command_returns_mode_and_last_refresh(monkeypatch):
     assert calls == [(123, "auth_mode=oauth, last_refresh_at=2026-01-01T00:00:00+00:00")]
 
 
+def test_pr_status_command_uses_builder_and_returns_result(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_build_pr_status_reply(ref: str) -> str:
+        assert ref == "42"
+        return "PR: #42 (есть)\nchecks: success=3, failed=0, pending=0\nauto-merge: нет\nссылка: https://github.com/o/r/pull/42"
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main._build_pr_status_reply", fake_build_pr_status_reply)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/pr_status 42", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [
+        (123, "PR: #42 (есть)\nchecks: success=3, failed=0, pending=0\nauto-merge: нет\nссылка: https://github.com/o/r/pull/42")
+    ]
+
+
+def test_pr_status_command_without_argument_returns_usage(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/pr_status", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Usage: /pr_status <issue#|pr#>")]
+
+
 def test_report_oauth_expired_replies_with_reauthorize_message(monkeypatch, tmp_path):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("MITRA_AUDIT_LOG", str(tmp_path / "events.ndjson"))
@@ -669,3 +784,80 @@ def test_report_oauth_expired_replies_with_reauthorize_message(monkeypatch, tmp_
     events = (tmp_path / "events.ndjson").read_text(encoding="utf-8").strip().splitlines()
     payload = json.loads(events[-1])
     assert payload["outcome"] == "oauth_expired"
+
+
+def test_search_command_returns_formatted_top_5_and_writes_budget_ledger(monkeypatch, tmp_path):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    monkeypatch.setenv("MITRA_BUDGET_LEDGER", str(tmp_path / "budget_ledger.ndjson"))
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    class FakeResult:
+        def __init__(self, title: str, url: str, description: str):
+            self.title = title
+            self.url = url
+            self.description = description
+
+    async def fake_brave_web_search(query: str):
+        assert query == "mitra"
+        return [
+            FakeResult("Result A", "https://a.example", "Desc A"),
+            FakeResult("Result B", "https://b.example", "Desc B"),
+        ]
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.brave_web_search", fake_brave_web_search)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/search mitra", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [
+        (
+            123,
+            "Top 5 results:\n1. Result A\nhttps://a.example\nDesc A\n\n2. Result B\nhttps://b.example\nDesc B",
+        )
+    ]
+
+    ledger_lines = (tmp_path / "budget_ledger.ndjson").read_text(encoding="utf-8").strip().splitlines()
+    assert len(ledger_lines) == 1
+    payload = json.loads(ledger_lines[0])
+    assert payload["category"] == "search_queries"
+    assert payload["amount"] == 1
+    assert payload["metadata"]["query"] == "mitra"
+
+
+def test_search_command_rate_limit_returns_error(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_brave_web_search(query: str):
+        from mitra_app.search import SearchRateLimitExceeded
+
+        raise SearchRateLimitExceeded("Search rate limit exceeded: max 5 requests per minute")
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.brave_web_search", fake_brave_web_search)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/search mitra", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Search rate limit exceeded: max 5 requests per minute")]

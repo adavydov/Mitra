@@ -1,12 +1,15 @@
+import json
 import logging
 import os
 import json
 from collections import OrderedDict
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import Lock
-from uuid import uuid4
 from typing import Any
+from uuid import uuid4
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException
 from googleapiclient.errors import HttpError
 
@@ -14,6 +17,7 @@ import mitra_app.audit as audit
 from mitra_app.audit import log_report_event
 from mitra_app.drive import (
     DriveNotConfigured,
+    check_drive_folder_access,
     OAuthRefreshInvalidGrant,
     delete_file,
     get_drive_auth_mode,
@@ -21,10 +25,68 @@ from mitra_app.drive import (
     list_recent_files,
     upload_markdown,
 )
+from mitra_app.budget_ledger import budget_ledger
 from mitra_app.telegram import ensure_webhook, send_message
+from mitra_app.search import SearchRateLimitExceeded, brave_web_search, format_search_results
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
+
+_THINK_PROMPT_MAX_CHARS = 1200
+_SECRET_ENV_NAME_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|PRIVATE|API_KEY|ACCESS_KEY|CLIENT_SECRET)", re.IGNORECASE)
+
+
+def _sensitive_env_names() -> set[str]:
+    defaults = {
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_WEBHOOK_SECRET",
+        "DRIVE_OAUTH_CLIENT_SECRET",
+        "DRIVE_OAUTH_REFRESH_TOKEN",
+        "DRIVE_SERVICE_ACCOUNT_JSON",
+        "DRIVE_SERVICE_ACCOUNT_JSON_B64",
+        "GITHUB_TOKEN",
+        "OPENAI_API_KEY",
+    }
+    for key in os.environ:
+        if _SECRET_ENV_NAME_RE.search(key):
+            defaults.add(key)
+    return defaults
+
+
+def _sanitize_think_prompt(prompt: str) -> str:
+    sanitized = prompt.strip()
+
+    for env_name in _sensitive_env_names():
+        escaped_name = re.escape(env_name)
+        sanitized = re.sub(rf"(?i){escaped_name}\s*[:=]\s*[^\s,;]+", f"{env_name}=[REDACTED]", sanitized)
+        sanitized = re.sub(rf"(?i)\b{escaped_name}\b", f"{env_name}", sanitized)
+
+        secret_value = os.getenv(env_name)
+        if secret_value:
+            sanitized = sanitized.replace(secret_value, "[REDACTED]")
+
+    return sanitized
+
+
+def _trim_prompt(prompt: str, limit: int = _THINK_PROMPT_MAX_CHARS) -> str:
+    trimmed = prompt[:limit].strip()
+    if len(prompt) <= limit:
+        return trimmed
+    return f"{trimmed}…"
+
+
+def _build_think_reply(question: str) -> str:
+    sanitized = _trim_prompt(_sanitize_think_prompt(question))
+    if not sanitized:
+        return "Usage: /think <вопрос/задача>"
+
+    return "\n".join(
+        [
+            f"Что сделал: дал read-only разбор запроса «{sanitized}».",
+            "Допущения: внешние действия и интернет не используются; ответ только по тексту запроса.",
+            "Риск: без доп. контекста план может быть неполным.",
+        ]
+    )
 
 
 def _sanitize_drive_http_error(exc: HttpError) -> str:
@@ -51,9 +113,93 @@ def _sanitize_drive_http_error(exc: HttpError) -> str:
 
     return f"Drive error: {status_code} {reason}"
 
+_COMMAND_POLICIES: dict[str, CommandPolicy] = {
+    "/status": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
+    "/oauth_status": CommandPolicy(required_al="AL1", risk_level="R1", budget_category="search"),
+    "/whoami": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
+    "/help": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
+    "/start": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
+    "/reports": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
+    "/report": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
+    "/drive_check": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
+}
+
+_policy_enforcer = CommandPolicyEnforcer(Path(__file__).resolve().parents[1])
+
+
+def _current_autonomy_level() -> str:
+    return os.getenv("MITRA_AUTONOMY_LEVEL", "AL2")
+
+
+def _audit_policy_denied(
+    *,
+    user_id: int | None,
+    chat_id: int | None,
+    action_id: str,
+    telegram_update_id: int | None,
+    action_type: str,
+    required_al: str,
+    current_al: str,
+    risk_level: str,
+    budget_category: str,
+    reason: str,
+) -> None:
+    _safe_audit_event(
+        {
+            "event": "telegram_policy_denied",
+            "action_id": action_id,
+            "telegram_update_id": telegram_update_id,
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "action_type": action_type,
+            "required_al": required_al,
+            "current_al": current_al,
+            "risk_level": risk_level,
+            "budget_category": budget_category,
+            "outcome": "denied",
+            "reason": reason,
+            "log_level": "info",
+        }
+    )
+
+
+def _enforce_command_policy(
+    *,
+    action_type: str,
+    action_id: str,
+    telegram_update_id: int | None,
+    user_id: int | None,
+    chat_id: int | None,
+) -> str | None:
+    policy = _COMMAND_POLICIES.get(action_type)
+    if policy is None:
+        return None
+
+    current_al = _current_autonomy_level()
+    decision = _policy_enforcer.enforce(current_al=current_al, policy=policy)
+    if decision.allowed:
+        return None
+
+    _audit_policy_denied(
+        user_id=user_id,
+        chat_id=chat_id,
+        action_id=action_id,
+        telegram_update_id=telegram_update_id,
+        action_type=action_type,
+        required_al=policy.required_al,
+        current_al=current_al,
+        risk_level=policy.risk_level,
+        budget_category=policy.budget_category,
+        reason=decision.reason or "Denied",
+    )
+
+    return decision.reason or "Denied"
+
+
 
 @app.on_event("startup")
 async def startup_sync_webhook() -> None:
+    await budget_ledger.load()
     logger.info(
         "drive_auth_state",
         extra={"mode": get_drive_auth_mode(), "last_refresh_at": get_last_oauth_refresh_time()},
@@ -82,6 +228,85 @@ class RecentUpdateDeduplicator:
 
 
 _recent_update_deduplicator = RecentUpdateDeduplicator(max_size=1000)
+
+
+class PerUserRateLimiter:
+    def __init__(self, limit: int, window_seconds: int) -> None:
+        self._limit = limit
+        self._window_seconds = window_seconds
+        self._events_by_user: dict[int, list[float]] = {}
+        self._lock = Lock()
+
+    def allow(self, user_id: int | None) -> bool:
+        if user_id is None:
+            return False
+
+        now_ts = datetime.now(timezone.utc).timestamp()
+        min_ts = now_ts - self._window_seconds
+
+        with self._lock:
+            history = self._events_by_user.setdefault(user_id, [])
+            history[:] = [event_ts for event_ts in history if event_ts >= min_ts]
+            if len(history) >= self._limit:
+                return False
+            history.append(now_ts)
+            return True
+
+
+_pr_rate_limiter = PerUserRateLimiter(limit=5, window_seconds=3600)
+
+
+def _parse_pr_command(text: str) -> tuple[str, str] | None:
+    body = text[len("/pr") :].lstrip()
+    if not body:
+        return None
+
+    if "\n" in body:
+        title, spec = body.split("\n", 1)
+    else:
+        title, spec = body, ""
+
+    title = title.strip()
+    spec = spec.strip()
+
+    if not title:
+        return None
+
+    return title, spec
+
+
+async def _create_github_issue(title: str, body: str) -> tuple[int, str]:
+    token = os.getenv("GITHUB_TOKEN")
+    repository = os.getenv("GITHUB_REPOSITORY")
+    if not token or not repository:
+        raise RuntimeError("GitHub integration is not configured")
+
+    if "/" not in repository:
+        raise RuntimeError("GITHUB_REPOSITORY must be owner/repo")
+
+    api_url = f"https://api.github.com/repos/{repository}/issues"
+    payload = {
+        "title": title,
+        "body": body,
+        "labels": ["mitra:codex"],
+    }
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(api_url, json=payload, headers=headers)
+        response.raise_for_status()
+        response_payload: dict[str, Any] = response.json()
+
+    issue_number = int(response_payload.get("number", 0))
+    issue_url = str(response_payload.get("html_url", ""))
+    if issue_number <= 0 or not issue_url:
+        raise RuntimeError("GitHub issue create returned invalid response")
+
+    return issue_number, issue_url
 
 
 def _load_allowed_user_ids() -> set[int]:
@@ -225,6 +450,15 @@ def _safe_drive_check_error(exc: Exception) -> str:
     return "drive_check_failed"
 
 
+def _is_budget_admin(user_id: int | None) -> bool:
+    if user_id is None:
+        return False
+    owner_id = os.getenv("MITRA_ADMIN_TELEGRAM_USER_ID")
+    if owner_id is None:
+        return False
+    return str(user_id) == owner_id.strip()
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
@@ -237,6 +471,10 @@ async def drive_check() -> dict[str, str]:
     last_refresh_at = get_last_oauth_refresh_time()
     if auth_mode == "oauth" and last_refresh_at:
         payload["last_refresh_at"] = last_refresh_at
+    try:
+        await check_drive_folder_access()
+    except Exception as exc:
+        payload["status"] = _safe_drive_check_error(exc)
     return payload
 
 
@@ -279,6 +517,20 @@ async def telegram_webhook(
             )
             return {"status": "ok"}
 
+        policy_bypass_commands = {"/status", "/oauth_status", "/whoami", "/help", "/start"}
+        if allowlist_configured or action_type in policy_bypass_commands:
+            deny_reason = _enforce_command_policy(
+                action_type=action_type,
+                action_id=action_id,
+                telegram_update_id=telegram_update_id,
+                user_id=user_id,
+                chat_id=chat_id,
+            )
+            if deny_reason is not None:
+                if chat_id is not None:
+                    await send_message(chat_id=chat_id, text=deny_reason)
+                return {"status": "ok"}
+
         if text.startswith("/status"):
             reply_text = "Mitra alive"
         elif text.startswith("/oauth_status"):
@@ -288,8 +540,29 @@ async def telegram_webhook(
             reply_text = f"auth_mode={auth_mode}, last_refresh_at={last_refresh_at}"
         elif text.startswith("/whoami"):
             reply_text = f"user_id={user_id}, chat_id={chat_id}"
+        elif text.startswith("/search"):
+            query = text[len("/search") :].strip()
+            if not query:
+                reply_text = "Usage: /search <query>"
+            else:
+                try:
+                    search_results = await brave_web_search(query)
+                    reply_text = format_search_results(search_results)
+                    audit.log_budget_usage(
+                        category="search_queries",
+                        amount=1,
+                        metadata={"user_id": user_id, "chat_id": chat_id, "query": query},
+                    )
+                except SearchRateLimitExceeded as exc:
+                    reply_text = str(exc)
+                except Exception:
+                    reply_text = "Search failed"
+                    logger.exception("search_command_failed")
         elif not allowlist_configured:
             reply_text = "Allowlist not configured. Set ALLOWED_TELEGRAM_USER_IDS."
+        elif text.startswith("/think"):
+            think_prompt = _extract_think_prompt(text)
+            reply_text = _build_think_reply(think_prompt)
         elif text.startswith("/reports"):
             try:
                 files = await list_recent_files(limit=5)
@@ -380,6 +653,52 @@ async def telegram_webhook(
                         action_type="/report",
                         log_level="error",
                     )
+        elif text.startswith("/pr"):
+            parsed = _parse_pr_command(text)
+            if not parsed:
+                reply_text = "Usage: /pr <title>\\n<spec>"
+            elif not _pr_rate_limiter.allow(user_id if isinstance(user_id, int) else None):
+                reply_text = "Rate limit exceeded: max 5 /pr per hour"
+                _safe_audit_event(
+                    {
+                        "event": "telegram_pr_open_issue",
+                        "action_id": action_id,
+                        "telegram_update_id": telegram_update_id,
+                        "user_id": user_id,
+                        "chat_id": chat_id,
+                        "action_type": "/pr",
+                        "issue_number": None,
+                        "outcome": "rate_limited",
+                        "log_level": "info",
+                    }
+                )
+            else:
+                title, spec = parsed
+                issue_body = spec or "(no spec provided)"
+                issue_number: int | None = None
+
+                try:
+                    issue_number, issue_url = await _create_github_issue(title=title, body=issue_body)
+                    reply_text = f"Created: {issue_url}"
+                    outcome = "success"
+                except Exception:
+                    logger.exception("telegram_pr_create_issue_failed")
+                    reply_text = "Failed to create issue"
+                    outcome = "error"
+
+                _safe_audit_event(
+                    {
+                        "event": "telegram_pr_open_issue",
+                        "action_id": action_id,
+                        "telegram_update_id": telegram_update_id,
+                        "user_id": user_id,
+                        "chat_id": chat_id,
+                        "action_type": "/pr",
+                        "issue_number": issue_number,
+                        "outcome": outcome,
+                        "log_level": "info" if outcome == "success" else "error",
+                    }
+                )
         elif text.startswith("/drive_check"):
             auth_mode = get_drive_auth_mode()
 
@@ -393,23 +712,35 @@ async def telegram_webhook(
                 reply_text = detail
                 logger.exception("drive_check_command_failed")
                 _audit_drive_check(user_id=user_id, chat_id=chat_id, auth_mode=auth_mode, outcome="error", detail=detail)
+        elif text.startswith("/budget_reset_day"):
+            if _is_budget_admin(user_id):
+                await budget_ledger.reset_day()
+                reply_text = "Budget day reset"
+            else:
+                reply_text = "Forbidden"
+        elif text.startswith("/budget"):
+            reply_text = await budget_ledger.render_budget()
+        elif text.startswith("/pr"):
+            await budget_ledger.record_github_action()
+            reply_text = "Unknown command"
         elif text.startswith("/help") or text.startswith("/start"):
-            reply_text = "Commands: /status, /oauth_status, /report <text>"
+            reply_text = "Commands: /status, /oauth_status, /report <text>, /search <query>"
         else:
             reply_text = "Unknown command"
 
-        _safe_audit_event(
-            {
-                "event": "telegram_command",
-                "action_id": action_id,
-                "telegram_update_id": telegram_update_id,
-                "user_id": user_id,
-                "chat_id": chat_id,
-                "action_type": action_type,
-                "outcome": "success",
-                "log_level": "info",
-            }
-        )
+        if action_type not in {"/report", "/drive_check"}:
+            _safe_audit_event(
+                {
+                    "event": "telegram_command",
+                    "action_id": action_id,
+                    "telegram_update_id": telegram_update_id,
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "action_type": action_type,
+                    "outcome": "success",
+                    "log_level": "info",
+                }
+            )
 
         if chat_id is not None:
             await send_message(chat_id=chat_id, text=reply_text)
