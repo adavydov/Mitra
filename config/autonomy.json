@@ -1,29 +1,6 @@
 {
-  "current_level": "AL2",
-  "levels": {
-    "AL0": {
-      "description": "Quarantine/manual-only mode",
-      "max_risk": "LOW",
-      "max_budget_per_action": 0,
-      "allowed_tools": []
-    },
-    "AL1": {
-      "description": "Read-only analysis",
-      "max_risk": "LOW",
-      "max_budget_per_action": 10,
-      "allowed_tools": ["read", "list", "search"]
-    },
-    "AL2": {
-      "description": "Standard assisted execution",
-      "max_risk": "MEDIUM",
-      "max_budget_per_action": 100,
-      "allowed_tools": ["read", "list", "search", "write", "exec_local"]
-    },
-    "AL3": {
-      "description": "Elevated execution",
-      "max_risk": "HIGH",
-      "max_budget_per_action": 500,
-      "allowed_tools": ["read", "list", "search", "write", "exec_local", "exec_network", "deploy"]
-    }
-  }
+  "id": "CFG-AUT-01",
+  "default_level": "AL1",
+  "safe_mode": true,
+  "levels": ["AL0", "AL1", "AL2", "AL3", "AL4"]
 }

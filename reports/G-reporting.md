@@ -1,15 +1,9 @@
-# G — Reporting Standard
+ID: DOC-I-LEGACY
+Level: I
+Owner: User
+Status: deprecated
+Depends on: L0-CONST
+Config keys: (empty)
+Required evals: EVAL-REG-HEALTH-01
 
-- **ID:** G
-- **Level:** L3 (Transparency)
-- **Owner:** PMO / Governance Reporting
-- **Status:** Draft
-- **Depends on:** F (Audit Controls), C (Protocol Specification)
-- **Config keys:** `reports.kpi.catalog`, `reports.publication.schedule`
-- **Required evals:** `evals/report-quality.md`
-
-## Purpose
-Defines report taxonomy, KPI definitions, publication cadence, and audiences.
-
-## Single source of truth
-This document defines **what is reported and in which format**.
+Legacy file kept for compatibility. Use README in reports for current behavior.

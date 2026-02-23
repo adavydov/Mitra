@@ -1,16 +1,11 @@
-# A — Codex Charter
+# A) Конституция (указатель)
+ID: DOC-A-INDEX
+Level: L0
+Owner: User
+Status: active
+Depends on: L0-CONST
 
-- **ID:** A
-- **Level:** L1 (Strategic)
-- **Owner:** Governance Board
-- **Status:** Draft
-- **Depends on:** B (Policy Baseline)
-- **Config keys:** `governance.codex.version`, `governance.codex.owner`
-- **Required evals:** `evals/codex-compliance.md`
+Этот файл-указатель оставлен для совместимости и ссылается на канонический документ:
+- governance/constitution.md (Const ID L0-CONST)
 
-## Purpose
-Defines mission, boundaries, and decision rights for the Codex layer.
-
-## Single source of truth
-This document defines **what must be true** at a strategic level.
-Operational details are delegated to Policy/Protocol/Runbook/Config.
+REF: L0-CONST
