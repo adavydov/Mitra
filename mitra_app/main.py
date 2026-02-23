@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import json
 from collections import OrderedDict
 from datetime import datetime, timezone
 from threading import Lock
@@ -13,7 +12,7 @@ from googleapiclient.errors import HttpError
 
 import mitra_app.audit as audit
 from mitra_app.audit import log_report_event
-from mitra_app.drive import DriveNotConfigured, get_drive_auth_mode, upload_markdown
+from mitra_app.drive import DriveNotConfigured, check_drive_folder_access, get_drive_auth_mode, upload_markdown
 from mitra_app.telegram import ensure_webhook, send_message
 
 app = FastAPI()
@@ -171,6 +170,34 @@ def _sanitize_report_error(exc: Exception) -> str:
     return "Report failed"
 
 
+def _audit_drive_check(user_id: int | None, chat_id: int | None, auth_mode: str, outcome: str, detail: str) -> None:
+    event = {
+        "event": "drive_check",
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "auth_mode": auth_mode,
+        "outcome": outcome,
+        "detail": detail,
+    }
+
+    log_event = getattr(audit, "log_event", None)
+    if callable(log_event):
+        log_event(event)
+        return
+
+    logger.info("drive_check", extra=event)
+
+
+def _safe_drive_check_error(exc: Exception) -> str:
+    if isinstance(exc, DriveNotConfigured):
+        return "drive_not_configured"
+
+    if isinstance(exc, HttpError):
+        return _sanitize_drive_http_error(exc)
+
+    return "drive_check_failed"
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
@@ -178,7 +205,14 @@ async def healthz() -> dict[str, str]:
 
 @app.get("/drive_check")
 async def drive_check() -> dict[str, str]:
-    return {"auth_mode": get_drive_auth_mode()}
+    auth_mode = get_drive_auth_mode()
+
+    try:
+        await check_drive_folder_access()
+    except Exception as exc:
+        return {"auth_mode": auth_mode, "status": _safe_drive_check_error(exc)}
+
+    return {"auth_mode": auth_mode, "status": "ok"}
 
 
 @app.post("/telegram/webhook")
@@ -269,8 +303,20 @@ async def telegram_webhook(
                         user_id=user_id,
                         chat_id=chat_id,
                     )
+        elif text.startswith("/drive_check"):
+            auth_mode = get_drive_auth_mode()
+
+            try:
+                await check_drive_folder_access()
+                reply_text = f"OK (auth={auth_mode}, folder ok)"
+                _audit_drive_check(user_id=user_id, chat_id=chat_id, auth_mode=auth_mode, outcome="success", detail="folder ok")
+            except Exception as exc:
+                detail = _safe_drive_check_error(exc)
+                reply_text = detail
+                logger.exception("drive_check_command_failed")
+                _audit_drive_check(user_id=user_id, chat_id=chat_id, auth_mode=auth_mode, outcome="error", detail=detail)
         elif text.startswith("/help") or text.startswith("/start"):
-            reply_text = "Commands: /status, /report <text>"
+            reply_text = "Commands: /status, /report <text>, /drive_check"
         else:
             reply_text = "Unknown command"
 

@@ -3,7 +3,7 @@ import base64
 import json
 
 import pytest
-from mitra_app.drive import DriveNotConfigured, upload_markdown
+from mitra_app.drive import DriveNotConfigured, check_drive_folder_access, upload_markdown
 
 
 def _service_account_payload() -> dict[str, str]:
@@ -147,3 +147,67 @@ def test_upload_markdown_oauth_requires_client_credentials(monkeypatch):
 
     with pytest.raises(DriveNotConfigured, match="Missing OAuth credentials"):
         asyncio.run(upload_markdown("Report", "# hello"))
+
+
+def test_check_drive_folder_access_uses_minimal_metadata_call(monkeypatch):
+    monkeypatch.setenv("DRIVE_ROOT_FOLDER_ID", "root-folder")
+    monkeypatch.setenv("DRIVE_SERVICE_ACCOUNT_JSON", json.dumps(_service_account_payload()))
+
+    captured: dict[str, object] = {}
+
+    class _FakeFilesResource:
+        def get(self, fileId, fields):
+            captured["fileId"] = fileId
+            captured["fields"] = fields
+            return self
+
+        def execute(self):
+            return {"id": "root-folder"}
+
+    class _FakeService:
+        def files(self):
+            return _FakeFilesResource()
+
+    monkeypatch.setattr(
+        "mitra_app.drive.service_account.Credentials.from_service_account_info",
+        lambda info, scopes: object(),
+    )
+    monkeypatch.setattr("mitra_app.drive.build", lambda *args, **kwargs: _FakeService())
+
+    result = asyncio.run(check_drive_folder_access())
+
+    assert result.auth_mode == "service_account"
+    assert result.folder_id == "root-folder"
+    assert captured == {"fileId": "root-folder", "fields": "id"}
+
+
+def test_check_drive_folder_access_prefers_oauth(monkeypatch):
+    monkeypatch.setenv("DRIVE_ROOT_FOLDER_ID", "root-folder")
+    monkeypatch.setenv("DRIVE_OAUTH_REFRESH_TOKEN", "refresh-token")
+    monkeypatch.setenv("DRIVE_OAUTH_CLIENT_ID", "client-id")
+    monkeypatch.setenv("DRIVE_OAUTH_CLIENT_SECRET", "client-secret")
+
+    captured: dict[str, object] = {}
+
+    class _FakeFilesResource:
+        def get(self, fileId, fields):
+            return self
+
+        def execute(self):
+            return {"id": "root-folder"}
+
+    class _FakeService:
+        def files(self):
+            return _FakeFilesResource()
+
+    def _fake_oauth_credentials(*args, **kwargs):
+        captured["refresh_token"] = kwargs["refresh_token"]
+        return object()
+
+    monkeypatch.setattr("mitra_app.drive.OAuthCredentials", _fake_oauth_credentials)
+    monkeypatch.setattr("mitra_app.drive.build", lambda *args, **kwargs: _FakeService())
+
+    result = asyncio.run(check_drive_folder_access())
+
+    assert result.auth_mode == "oauth"
+    assert captured["refresh_token"] == "refresh-token"
