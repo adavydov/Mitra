@@ -1,5 +1,6 @@
 import logging
 import os
+import json
 from collections import OrderedDict
 from datetime import datetime, timezone
 from threading import Lock
@@ -14,10 +15,13 @@ from mitra_app.audit import log_report_event
 from mitra_app.drive import (
     DriveNotConfigured,
     OAuthRefreshInvalidGrant,
+    list_recent_files,
+    check_drive_folder_access,
     get_drive_auth_mode,
     get_last_oauth_refresh_time,
     upload_markdown,
 )
+from mitra_app.budget_ledger import budget_ledger
 from mitra_app.telegram import ensure_webhook, send_message
 
 app = FastAPI()
@@ -51,6 +55,7 @@ def _sanitize_drive_http_error(exc: HttpError) -> str:
 
 @app.on_event("startup")
 async def startup_sync_webhook() -> None:
+    await budget_ledger.load()
     logger.info(
         "drive_auth_state",
         extra={"mode": get_drive_auth_mode(), "last_refresh_at": get_last_oauth_refresh_time()},
@@ -222,6 +227,15 @@ def _safe_drive_check_error(exc: Exception) -> str:
     return "drive_check_failed"
 
 
+def _is_budget_admin(user_id: int | None) -> bool:
+    if user_id is None:
+        return False
+    owner_id = os.getenv("MITRA_ADMIN_TELEGRAM_USER_ID")
+    if owner_id is None:
+        return False
+    return str(user_id) == owner_id.strip()
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
@@ -234,6 +248,10 @@ async def drive_check() -> dict[str, str]:
     last_refresh_at = get_last_oauth_refresh_time()
     if auth_mode == "oauth" and last_refresh_at:
         payload["last_refresh_at"] = last_refresh_at
+    try:
+        await check_drive_folder_access()
+    except Exception as exc:
+        payload["status"] = _safe_drive_check_error(exc)
     return payload
 
 
@@ -389,23 +407,35 @@ async def telegram_webhook(
                 reply_text = detail
                 logger.exception("drive_check_command_failed")
                 _audit_drive_check(user_id=user_id, chat_id=chat_id, auth_mode=auth_mode, outcome="error", detail=detail)
+        elif text.startswith("/budget_reset_day"):
+            if _is_budget_admin(user_id):
+                await budget_ledger.reset_day()
+                reply_text = "Budget day reset"
+            else:
+                reply_text = "Forbidden"
+        elif text.startswith("/budget"):
+            reply_text = await budget_ledger.render_budget()
+        elif text.startswith("/pr"):
+            await budget_ledger.record_github_action()
+            reply_text = "Unknown command"
         elif text.startswith("/help") or text.startswith("/start"):
-            reply_text = "Commands: /status, /oauth_status, /report <text>"
+            reply_text = "Commands: /status, /oauth_status, /report <text>, /budget"
         else:
             reply_text = "Unknown command"
 
-        _safe_audit_event(
-            {
-                "event": "telegram_command",
-                "action_id": action_id,
-                "telegram_update_id": telegram_update_id,
-                "user_id": user_id,
-                "chat_id": chat_id,
-                "action_type": action_type,
-                "outcome": "success",
-                "log_level": "info",
-            }
-        )
+        if action_type not in {"/report", "/drive_check"}:
+            _safe_audit_event(
+                {
+                    "event": "telegram_command",
+                    "action_id": action_id,
+                    "telegram_update_id": telegram_update_id,
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "action_type": action_type,
+                    "outcome": "success",
+                    "log_level": "info",
+                }
+            )
 
         if chat_id is not None:
             await send_message(chat_id=chat_id, text=reply_text)
