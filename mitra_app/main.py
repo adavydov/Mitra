@@ -86,28 +86,19 @@ def _audit_dedup(update_id: int, user_id: int | None, chat_id: int | None) -> No
     )
 
 
-def _slugify(text: str, max_len: int = 24) -> str:
-    cleaned = "".join(ch.lower() if ch.isalnum() else "-" for ch in text.strip())
-    cleaned = "-".join(part for part in cleaned.split("-") if part)
-    return cleaned[:max_len] or "report"
+def _build_report_title(now: datetime) -> str:
+    return f"mitra-report {now.strftime('%Y-%m-%d %H:%M')}"
 
 
-def _build_report_title(text: str, now: datetime) -> str:
-    stamp = now.strftime("%Y%m%d-%H%M%S")
-    return f"report-{stamp}-{_slugify(text)}"
-
-
-def _build_report_body(text: str, now: datetime, action_id: str) -> str:
+def _build_report_body(text: str, now: datetime, user_id: int | None) -> str:
     timestamp = now.isoformat()
     return "\n".join(
         [
-            "---",
-            f"action_id: {action_id}",
-            f"timestamp: {timestamp}",
-            "---",
-            "",
             text.strip(),
             "",
+            "---",
+            f"timestamp: {timestamp}",
+            f"user_id: {user_id}",
         ]
     )
 
@@ -159,24 +150,25 @@ async def telegram_webhook(
 
         if not report_text:
             reply_text = "Usage: /report <text>"
-            log_report_event(action_id=action_id, file_id=file_id, outcome="invalid")
+            log_report_event(action_id=action_id, user_id=user_id, file_id=file_id, outcome="invalid")
         else:
             now = datetime.now(timezone.utc)
-            title = _build_report_title(report_text, now)
-            body = _build_report_body(report_text, now, action_id=action_id)
+            title = _build_report_title(now)
+            body = _build_report_body(report_text, now, user_id=user_id)
 
             try:
                 upload = await upload_markdown(title=title, markdown_body=body)
                 file_id = upload.file_id
                 link = upload.web_view_link or upload.file_id
-                reply_text = f"Report uploaded: {link}"
-                log_report_event(action_id=action_id, file_id=file_id, outcome="success", link=link)
+                reply_text = f"Saved: {link}"
+                log_report_event(action_id=action_id, user_id=user_id, file_id=file_id, outcome="success", link=link)
             except DriveNotConfigured:
                 reply_text = "Drive disabled"
-                log_report_event(action_id=action_id, file_id=file_id, outcome="drive_disabled")
-            except Exception:
-                reply_text = "Report failed"
-                log_report_event(action_id=action_id, file_id=file_id, outcome="error")
+                log_report_event(action_id=action_id, user_id=user_id, file_id=file_id, outcome="drive_disabled")
+            except Exception as exc:
+                summary = str(exc).strip() or "unknown error"
+                reply_text = f"Report failed: {summary[:120]}"
+                log_report_event(action_id=action_id, user_id=user_id, file_id=file_id, outcome="error")
     elif text.startswith("/help") or text.startswith("/start"):
         reply_text = "Commands: /status, /report <text>"
     else:
