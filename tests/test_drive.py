@@ -99,3 +99,51 @@ def test_upload_markdown_falls_back_to_raw_json_env(monkeypatch):
 
     assert result.file_id == "file-raw"
     assert result.web_view_link is None
+
+
+def test_upload_markdown_prefers_oauth_when_refresh_token_present(monkeypatch):
+    monkeypatch.setenv("DRIVE_ROOT_FOLDER_ID", "root-folder")
+    monkeypatch.setenv("DRIVE_OAUTH_REFRESH_TOKEN", "refresh-token")
+    monkeypatch.setenv("DRIVE_OAUTH_CLIENT_ID", "client-id")
+    monkeypatch.setenv("DRIVE_OAUTH_CLIENT_SECRET", "client-secret")
+    monkeypatch.setenv("DRIVE_SERVICE_ACCOUNT_JSON", "not-json")
+
+    captured: dict[str, object] = {}
+
+    class _FakeFilesResource:
+        def create(self, body, media_body, fields):
+            return self
+
+        def execute(self):
+            return {"id": "oauth-file"}
+
+    class _FakeService:
+        def files(self):
+            return _FakeFilesResource()
+
+    def _fake_oauth_credentials(*args, **kwargs):
+        captured["oauth_kwargs"] = kwargs
+        return object()
+
+    def _unexpected_service_account(*args, **kwargs):
+        raise AssertionError("service account credentials should be ignored when OAuth refresh token exists")
+
+    monkeypatch.setattr("mitra_app.drive.OAuthCredentials", _fake_oauth_credentials)
+    monkeypatch.setattr("mitra_app.drive.service_account.Credentials.from_service_account_info", _unexpected_service_account)
+    monkeypatch.setattr("mitra_app.drive.build", lambda *args, **kwargs: _FakeService())
+
+    result = asyncio.run(upload_markdown("Daily Report", "# Content"))
+
+    assert result.file_id == "oauth-file"
+    assert captured["oauth_kwargs"]["refresh_token"] == "refresh-token"
+
+
+def test_upload_markdown_oauth_requires_client_credentials(monkeypatch):
+    monkeypatch.setenv("DRIVE_ROOT_FOLDER_ID", "root-folder")
+    monkeypatch.setenv("DRIVE_OAUTH_REFRESH_TOKEN", "refresh-token")
+    monkeypatch.delenv("DRIVE_OAUTH_CLIENT_ID", raising=False)
+    monkeypatch.delenv("DRIVE_OAUTH_CLIENT_SECRET", raising=False)
+    monkeypatch.setenv("DRIVE_SERVICE_ACCOUNT_JSON", json.dumps(_service_account_payload()))
+
+    with pytest.raises(DriveNotConfigured, match="Missing OAuth credentials"):
+        asyncio.run(upload_markdown("Report", "# hello"))
