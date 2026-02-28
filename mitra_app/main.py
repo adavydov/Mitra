@@ -691,7 +691,6 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
         system=_TASK_SYSTEM_PROMPT,
     )
     content = response.get("content")
-    parse_diagnostics = _build_task_parse_diagnostics(content)
     text_blocks: list[str] = []
     if isinstance(content, list):
         for block in content:
