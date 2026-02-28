@@ -2,14 +2,16 @@ name: Mitra label -> Codex
 
 on:
   issues:
-    types: [labeled]
+    types: [opened, reopened, labeled]
 
 permissions:
   issues: write
 
 jobs:
   mitra-label-to-codex:
-    if: github.event.label.name == 'mitra:codex'
+    if: >
+      (github.event.action == 'labeled' && github.event.label.name == 'mitra:codex') ||
+      ((github.event.action == 'opened' || github.event.action == 'reopened') && contains(github.event.issue.labels.*.name, 'mitra:codex'))
     runs-on: ubuntu-latest
     steps:
       - name: Post Codex task comment
@@ -17,14 +19,32 @@ jobs:
         with:
           script: |
             const issue = context.payload.issue;
+            const signature = '<!-- mitra:codex:auto-comment -->';
             const labeler = context.payload.sender?.login || 'unknown';
+            const trigger = context.payload.action === 'labeled'
+              ? `Triggered by label: \`${context.payload.label?.name || 'unknown'}\` by @${labeler}`
+              : `Triggered by issue ${context.payload.action} with existing \`mitra:codex\` label.`;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              per_page: 100,
+            });
+
+            if (comments.some((comment) => comment.body?.includes(signature))) {
+              core.info(`Codex comment already exists for issue #${issue.number}; skipping.`);
+              return;
+            }
+
             const body = [
+              signature,
               '@codex',
               '',
               `Please pick up issue #${issue.number}: ${issue.title}`,
               '',
               `Source: ${issue.html_url}`,
-              `Triggered by label: \`${context.payload.label?.name || 'unknown'}\` by @${labeler}`,
+              trigger,
             ].join('\n');
 
             await github.rest.issues.createComment({

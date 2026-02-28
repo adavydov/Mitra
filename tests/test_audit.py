@@ -1,6 +1,6 @@
 import json
 
-from mitra_app.audit import log_event, log_report_event
+from mitra_app.audit import _redact_value, log_event, log_report_event
 
 
 def test_log_event_redacts_known_env_vars(monkeypatch, tmp_path, capsys):
@@ -66,3 +66,23 @@ def test_log_report_event_does_not_raise_when_file_write_fails(monkeypatch):
         file_id="",
         outcome="error",
     )
+
+
+def test_redact_value_masks_long_credential_like_strings():
+    token = "ghp_" + "A" * 36
+    value = _redact_value({"note": f"token={token}"})
+
+    assert isinstance(value, dict)
+    assert value["note"] == "token=[REDACTED]"
+
+
+def test_log_event_redacts_jwt_like_values(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    jwt_like = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signatureVALUE123456789"
+
+    line = log_event({"metadata": f"oauth token: {jwt_like}"})
+
+    payload = json.loads(line)
+    assert "[REDACTED]" in payload["metadata"]
+    assert jwt_like not in payload["metadata"]
+

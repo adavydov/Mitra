@@ -44,6 +44,18 @@ _THINK_PROMPT_MAX_CHARS = 1200
 _THINK_OUTPUT_MAX_CHARS = 900
 _GOAL_PREVIEW_MAX_CHARS = 160
 _SECRET_ENV_NAME_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|PRIVATE|API_KEY|ACCESS_KEY|CLIENT_SECRET)", re.IGNORECASE)
+_PROBABLE_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?i)client[ _-]?secret\s*[:=]\s*[^\s,;]{6,}"),
+    re.compile(r"(?i)oauth[ _-]?token\s*[:=]\s*[^\s,;]{8,}"),
+    re.compile(r"(?i)(?:api|access|private)[ _-]?key\s*[:=]\s*[^\s,;]{8,}"),
+    re.compile(r"\beyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9._-]{10,}\.[a-zA-Z0-9._-]{10,}\b"),
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|(?=[A-Za-z0-9+/_-]{32,}\b)(?=.*[A-Za-z])(?=.*\\d)[A-Za-z0-9+/_-]{32,})\b"),
+)
+_SECRET_STORE_GUIDANCE = (
+    "Похоже, в сообщении есть секрет (token/key/client secret). "
+    "Я не обрабатываю секреты в Telegram. Передайте значение через approved secret store "
+    "и пришлите только имя секрета/переменной (например, GITHUB_TOKEN)."
+)
 _THINK_SYSTEM_PROMPT = (
     "Ты помощник в режиме /think. Нужен только анализ текста пользователя без внешних действий. "
     "Не используйте веб, GitHub, Drive, интеграции, инструменты или вызовы функций. "
@@ -86,14 +98,16 @@ _TASK_EXAMPLE_HINT = (
 
 _TASK_CONTEXT_COMPLETENESS_THRESHOLD = 3
 _TASK_CONTEXT_FIELD_ORDER = (
-    "provider",
+    "issue_provider",
+    "integration_provider",
     "credentials_source",
     "risk_constraints",
     "success_criteria",
     "deadlines",
 )
 _TASK_CONTEXT_QUESTIONS = {
-    "provider": "Уточни provider: где будем создавать задачу (например GitHub/Jira/Linear)?",
+    "issue_provider": "Уточни issue provider: где создаём задачу (GitHub/Jira/Linear)?",
+    "integration_provider": "Какой integration provider используется в задаче (например Yandex/Google/Outlook)?",
     "credentials_source": "Где брать credentials (источник секретов/доступов)?",
     "risk_constraints": "Какие есть risk constraints (например max risk level, ограничения по данным/продакшену)?",
     "success_criteria": "Сформулируй success criteria (как поймём, что задача выполнена).",
@@ -122,6 +136,14 @@ _FAILURE_REASON_TO_GAP: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(lint|format|type check|mypy|ruff|black)\b", re.IGNORECASE), "quality_gate"),
 ]
 
+
+
+def _contains_probable_secret(text: str) -> bool:
+    sanitized = text.strip()
+    if not sanitized:
+        return False
+
+    return any(pattern.search(sanitized) for pattern in _PROBABLE_SECRET_PATTERNS)
 
 
 def _sensitive_env_names() -> set[str]:
@@ -427,9 +449,10 @@ _pr_rate_limiter = PerUserRateLimiter(limit=5, window_seconds=3600)
 
 @dataclass
 class MissingContext:
-    provider: str | None = None
+    issue_provider: str | None = None
+    integration_provider: str | None = None
     credentials_source: str | None = None
-    risk_constraints: str | None = None
+    risk_constraints: dict[str, Any] | None = None
     success_criteria: str | None = None
     deadlines: str | None = None
 
@@ -437,6 +460,10 @@ class MissingContext:
         missing: list[str] = []
         for field_name in _TASK_CONTEXT_FIELD_ORDER:
             value = getattr(self, field_name)
+            if field_name == "risk_constraints":
+                if not isinstance(value, dict) or not isinstance(value.get("has_constraints"), bool):
+                    missing.append(field_name)
+                continue
             if not isinstance(value, str) or not value.strip():
                 missing.append(field_name)
         return missing
@@ -456,22 +483,92 @@ class TaskDialogState:
 _task_dialog_state_by_chat: dict[int, TaskDialogState] = {}
 
 
+def _normalize_provider_name(raw: str) -> str:
+    value = raw.strip().lower()
+    if value in {"github", "гитхаб"}:
+        return "GitHub"
+    if value in {"jira", "джира"}:
+        return "Jira"
+    if value in {"linear"}:
+        return "Linear"
+    return ""
+
+
+def _normalize_integration_provider(raw: str) -> str:
+    value = raw.strip().lower()
+    if value in {"yandex", "яндекс"}:
+        return "Yandex"
+    if value in {"google", "гугл"}:
+        return "Google"
+    if value in {"outlook", "аутлук"}:
+        return "Outlook"
+    return ""
+
+
+def _normalize_risk_constraints(raw: str) -> dict[str, Any] | None:
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+
+    lowered = cleaned.lower()
+    if re.search(r"\bнет\s+ограничени[йяеъ]*\b", lowered):
+        return {"has_constraints": False, "details": []}
+
+    return {"has_constraints": True, "details": [cleaned]}
+
+
+def _validate_context_answer(field_name: str, answer: str) -> tuple[bool, Any, str | None]:
+    cleaned = answer.strip()
+    if not cleaned:
+        return False, None, "Ответ пустой."
+
+    if field_name == "issue_provider":
+        normalized = _normalize_provider_name(cleaned)
+        if not normalized:
+            return False, None, "Нужен issue provider из списка GitHub/Jira/Linear."
+        return True, normalized, None
+
+    if field_name == "integration_provider":
+        normalized = _normalize_integration_provider(cleaned)
+        if not normalized:
+            return False, None, "Не понял integration provider. Укажи Yandex/Google/Outlook (или другой явно)."
+        return True, normalized, None
+
+    if field_name == "credentials_source":
+        credentials_tokens = ("vault", "1password", "secret", "env", "переменн", "oauth", "k8s", "secrets manager")
+        if not any(token in cleaned.lower() for token in credentials_tokens):
+            return False, None, "Нужно чуть подробнее: где именно брать credentials."
+        return True, cleaned, None
+
+    if field_name == "risk_constraints":
+        normalized = _normalize_risk_constraints(cleaned)
+        if normalized is None:
+            return False, None, "Не понял risk constraints."
+        return True, normalized, None
+
+    return True, cleaned, None
+
+
 def _extract_missing_context(request_text: str) -> MissingContext:
     text = request_text.strip()
     lowered = text.lower()
     context = MissingContext()
 
-    provider_match = re.search(r"\b(github|gitlab|jira|linear|asana)\b", lowered)
-    if provider_match:
-        context.provider = provider_match.group(1)
+    issue_provider_match = re.search(r"\b(github|jira|linear)\b", lowered)
+    if issue_provider_match:
+        context.issue_provider = _normalize_provider_name(issue_provider_match.group(1))
+
+    integration_provider_match = re.search(r"\b(yandex|яндекс|google|гугл|outlook|аутлук)\b", lowered)
+    if integration_provider_match:
+        context.integration_provider = _normalize_integration_provider(integration_provider_match.group(1))
 
     if any(token in lowered for token in ("vault", "1password", "secret", "env", "переменн")):
         context.credentials_source = text
 
     if re.search(r"\br[0-4]\b", lowered) or "risk" in lowered or "огранич" in lowered:
-        context.risk_constraints = text
+        context.risk_constraints = _normalize_risk_constraints(text)
 
-    if any(token in lowered for token in ("критер", "acceptance", "готово", "должен", "должна")):
+    if any(token in lowered for token in ("критер", "acceptance", "готово")):
         context.success_criteria = text
 
     if re.search(r"\b\d{4}-\d{2}-\d{2}\b", lowered) or "дедлайн" in lowered or "до " in lowered:
@@ -487,11 +584,15 @@ def _merge_context_answer(state: TaskDialogState, answer_text: str) -> None:
 
     target_field = state.last_question_field
     if target_field in _TASK_CONTEXT_FIELD_ORDER:
-        setattr(state.context, target_field, answer)
+        is_valid, normalized, _ = _validate_context_answer(target_field, answer)
+        if is_valid:
+            setattr(state.context, target_field, normalized)
     else:
         for field_name in state.context.missing_fields():
-            setattr(state.context, field_name, answer)
-            break
+            is_valid, normalized, _ = _validate_context_answer(field_name, answer)
+            if is_valid:
+                setattr(state.context, field_name, normalized)
+                break
 
     state.turns.append({"role": "user", "content": answer})
 
@@ -508,17 +609,34 @@ def _build_context_question(context: MissingContext) -> tuple[str, str] | None:
 
 
 def _context_above_threshold(context: MissingContext) -> bool:
-    return context.filled_fields_count() >= _TASK_CONTEXT_COMPLETENESS_THRESHOLD
+    has_required_baseline = all(
+        field_name not in context.missing_fields()
+        for field_name in ("issue_provider", "risk_constraints")
+    )
+    return context.filled_fields_count() >= _TASK_CONTEXT_COMPLETENESS_THRESHOLD and has_required_baseline
 
 
 def _enrich_task_request_with_context(request_text: str, context: MissingContext) -> str:
     lines = [request_text.strip(), "", "Контекст уточнений:"]
     for field_name in _TASK_CONTEXT_FIELD_ORDER:
         value = getattr(context, field_name)
-        if isinstance(value, str) and value.strip():
-            label = field_name.replace("_", " ")
+        label = field_name.replace("_", " ")
+        if field_name == "risk_constraints" and isinstance(value, dict):
+            lines.append(f"- {label}: {json.dumps(value, ensure_ascii=False)}")
+        elif isinstance(value, str) and value.strip():
             lines.append(f"- {label}: {value.strip()}")
     return "\n".join(lines).strip()
+
+
+def _serialize_task_dialog_state(state: TaskDialogState | None) -> dict[str, Any] | None:
+    if state is None:
+        return None
+    return {
+        "missing_fields": state.context.missing_fields(),
+        "filled_fields_count": state.context.filled_fields_count(),
+        "last_question_field": state.last_question_field,
+        "turns_count": len(state.turns),
+    }
 
 
 def _parse_goal_command(text: str) -> tuple[str, str | None] | None:
@@ -833,6 +951,7 @@ def _build_fallback_task_spec(request_text: str) -> dict[str, Any]:
         "risk_level": "R2",
         "allowed_file_scope": ["mitra_app/*", "tests/*"],
         "degraded": True,
+        "parse_outcome": "fallback",
     }
 
 
@@ -919,12 +1038,62 @@ def _extract_intents_from_request(request_text: str) -> set[str]:
         "webhook": "telegram",
         "drive": "drive",
         "calendar": "calendar",
+        "календар": "calendar",
+        "встреч": "calendar",
+        "доступност": "calendar",
         "report": "reporting",
     }
     for marker, intent in intent_hints.items():
         if marker in lowered:
             intents.add(intent)
     return intents
+
+
+def _paths_exist(relative_paths: list[str]) -> bool:
+    project_root = Path(__file__).resolve().parents[1]
+    for rel in relative_paths:
+        candidate = (project_root / rel).resolve()
+        if candidate.exists():
+            return True
+    return False
+
+
+def _resolve_capability_artifacts(capability: dict[str, Any]) -> dict[str, bool]:
+    capability_id = str(capability.get("id", "")).strip().lower()
+    artifacts = capability.get("artifacts")
+    if not isinstance(artifacts, dict):
+        artifacts = {}
+
+    code_paths = [str(item).strip() for item in artifacts.get("code", []) if str(item).strip()]
+    if not code_paths and capability_id == "calendar":
+        code_paths = [
+            "mitra_app/handlers/calendar.py",
+            "mitra_app/modules/calendar.py",
+            "service/calendar.py",
+        ]
+
+    tests_paths = [str(item).strip() for item in capability.get("tests", []) if str(item).strip()]
+    runbook_paths = [str(item).strip() for item in artifacts.get("runbook", []) if str(item).strip()]
+    if not runbook_paths and capability_id:
+        runbook_paths = [f"runbooks/{capability_id}.md"]
+
+    policy_paths = [str(item).strip() for item in capability.get("policies", []) if str(item).strip()]
+
+    required_env = capability.get("required_env")
+    if isinstance(required_env, list):
+        required_env_values = [str(item).strip() for item in required_env if str(item).strip()]
+    else:
+        required_env_values = []
+
+    return {
+        "has_code": _paths_exist(code_paths),
+        "has_tests": _paths_exist(tests_paths),
+        "has_runbook": _paths_exist(runbook_paths),
+        "has_policy": _paths_exist(policy_paths),
+        "has_config": bool(capability.get("tools") or required_env_values),
+        "has_secrets": bool(required_env_values),
+        "requires_secrets": bool(required_env_values),
+    }
 
 
 def detect_capability_gaps(request_text: str) -> dict[str, Any]:
@@ -938,37 +1107,73 @@ def detect_capability_gaps(request_text: str) -> dict[str, Any]:
             matched.append(capability)
 
     if not matched:
+        gaps = list(_CAPABILITY_GAP_TYPES)
         return {
             "intents": sorted(intents),
             "matched_capabilities": [],
-            "gaps": list(_CAPABILITY_GAP_TYPES),
+            "gaps": gaps,
+            "coverage_status": "missing",
+            "gap_closure_notes": [
+                f"{gap}: capability отсутствует в каталоге — требуется явная реализация/описание." for gap in gaps
+            ],
         }
 
-    has_policy = any(cap.get("policies") for cap in matched)
-    has_tests = any(cap.get("tests") for cap in matched)
-    has_secrets = any(cap.get("required_env") for cap in matched)
-    has_code = any(cap.get("tools") for cap in matched)
-    has_config = any(cap.get("tools") or cap.get("required_env") for cap in matched)
-    has_runbook = any((Path(__file__).resolve().parents[1] / "runbooks" / f"{cap.get('id', '')}.md").exists() for cap in matched)
+    artifact_state = [_resolve_capability_artifacts(capability) for capability in matched]
+
+    has_policy = any(state["has_policy"] for state in artifact_state)
+    has_tests = any(state["has_tests"] for state in artifact_state)
+    has_secrets = any(state["has_secrets"] for state in artifact_state)
+    has_code = any(state["has_code"] for state in artifact_state)
+    has_config = any(state["has_config"] for state in artifact_state)
+    has_runbook = any(state["has_runbook"] for state in artifact_state)
+
+    required_gaps: set[str] = set()
+    for capability in matched:
+        for criterion in capability.get("minimum_implementation", []):
+            if isinstance(criterion, str) and criterion.strip():
+                required_gaps.add(criterion.strip().lower())
+
+    availability = {
+        "code": has_code,
+        "policy": has_policy,
+        "config": has_config,
+        "tests": has_tests,
+        "secrets": has_secrets,
+        "runbook": has_runbook,
+    }
 
     gaps: list[str] = []
-    if not has_code:
-        gaps.append("code")
-    if not has_policy:
-        gaps.append("policy")
-    if not has_config:
-        gaps.append("config")
-    if not has_tests:
-        gaps.append("tests")
-    if not has_secrets:
-        gaps.append("secrets")
-    if not has_runbook:
-        gaps.append("runbook")
+    if required_gaps:
+        for gap_type in _CAPABILITY_GAP_TYPES:
+            if gap_type in required_gaps and not availability.get(gap_type, False):
+                gaps.append(gap_type)
+    else:
+        if not has_code:
+            gaps.append("code")
+        if not has_policy:
+            gaps.append("policy")
+        if not has_config:
+            gaps.append("config")
+        if not has_tests:
+            gaps.append("tests")
+        requires_secrets = any(state["requires_secrets"] for state in artifact_state)
+        if requires_secrets and not has_secrets:
+            gaps.append("secrets")
+        if not has_runbook:
+            gaps.append("runbook")
 
     return {
         "intents": sorted(intents),
         "matched_capabilities": [str(cap.get("id", "unknown")) for cap in matched],
         "gaps": gaps,
+        "coverage_status": "covered" if not gaps else "partial",
+        "gap_closure_notes": [
+            (
+                f"{gap}: capability частично реализована ({', '.join(str(cap.get('id', 'unknown')) for cap in matched)}) — "
+                "нужно закрыть недостающий блок."
+            )
+            for gap in gaps
+        ],
     }
 
 
@@ -1047,6 +1252,7 @@ def build_task_spec_resilient(request_text: str, llm_client: AnthropicClient | N
             logger.warning("task_spec_fallback_used")
             return _build_fallback_task_spec(request_text)
 
+        parse_outcome = "retry"
         logger.info(
             "task_spec_retry_success",
             extra={
@@ -1078,6 +1284,7 @@ def build_task_spec_resilient(request_text: str, llm_client: AnthropicClient | N
         "risk_level": risk_level,
         "allowed_file_scope": _normalize_string_list(parsed.get("allowed_file_scope")) or ["mitra_app/*", "tests/*"],
         "degraded": False,
+        "parse_outcome": parse_outcome,
     }
 
 
@@ -1124,11 +1331,14 @@ def _render_task_issue(spec: dict[str, Any], mitra_meta: dict[str, Any] | None =
     body_lines.append(f"- timestamp: {meta.get('timestamp')}")
 
     capability_gaps = _normalize_string_list(spec.get("capability_gaps"))
+    capability_gap_notes = _normalize_string_list(spec.get("capability_gap_notes"))
     if capability_gaps:
         body_lines.append("")
         body_lines.append("## Capability gaps to close")
-        for gap in capability_gaps:
+        for idx, gap in enumerate(capability_gaps):
             body_lines.append(f"### GAP: {gap}")
+            if idx < len(capability_gap_notes):
+                body_lines.append(f"- {capability_gap_notes[idx]}")
             body_lines.append(f"- Закрыть системный разрыв `{gap}`: код, проверки, документация/политики по необходимости.")
 
     return title, "\n".join(body_lines).strip()
@@ -1924,18 +2134,53 @@ async def telegram_webhook(
                     await send_message(chat_id=chat_id, text=deny_reason)
                 return {"status": "ok"}
 
+        if isinstance(text, str) and _contains_probable_secret(text):
+            _safe_audit_event(
+                {
+                    "event": "telegram_secret_detected",
+                    "action_id": action_id,
+                    "telegram_update_id": telegram_update_id,
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "action_type": action_type,
+                    "outcome": "blocked",
+                    "log_level": "warning",
+                }
+            )
+            if chat_id is not None:
+                await send_message(chat_id=chat_id, text=_SECRET_STORE_GUIDANCE)
+            return {"status": "ok"}
+
         pending_task_state = _task_dialog_state_by_chat.get(chat_id) if isinstance(chat_id, int) else None
         if pending_task_state is not None and isinstance(text, str) and text.strip() and not text.strip().startswith("/"):
-            _merge_context_answer(pending_task_state, text)
+            validation_error: str | None = None
+            if pending_task_state.last_question_field in _TASK_CONTEXT_FIELD_ORDER:
+                is_valid, normalized, error_message = _validate_context_answer(
+                    pending_task_state.last_question_field,
+                    text,
+                )
+                if is_valid:
+                    setattr(pending_task_state.context, pending_task_state.last_question_field, normalized)
+                    pending_task_state.turns.append({"role": "user", "content": text.strip()})
+                else:
+                    validation_error = error_message or "Ответ не прошёл валидацию."
+            else:
+                _merge_context_answer(pending_task_state, text)
+
             next_question = _build_context_question(pending_task_state.context)
-            if next_question is not None and not _context_above_threshold(pending_task_state.context):
+            if validation_error and pending_task_state.last_question_field:
+                question = _TASK_CONTEXT_QUESTIONS.get(pending_task_state.last_question_field, "")
+                reply_text = f"{validation_error} {question}".strip()
+            elif next_question is not None and not _context_above_threshold(pending_task_state.context):
                 field_name, question = next_question
                 pending_task_state.last_question_field = field_name
                 reply_text = question
             else:
                 issue_number: int | None = None
+                issue_url: str | None = None
                 degraded = False
                 capability_detection = {"intents": [], "matched_capabilities": [], "gaps": []}
+                spec: dict[str, Any] = {}
                 try:
                     enriched_request = _enrich_task_request_with_context(
                         pending_task_state.request_text,
@@ -1943,7 +2188,7 @@ async def telegram_webhook(
                     )
                     spec = _build_task_spec(enriched_request)
                     degraded = bool(spec.get("degraded"))
-                    capability_detection = detect_capability_gaps(enriched_request)
+                    capability_detection = detect_capability_gaps(pending_task_state.request_text)
                     spec["capability_gaps"] = capability_detection.get("gaps", [])
                     issue_title, issue_body = _render_task_issue(
                         spec,
@@ -1968,6 +2213,7 @@ async def telegram_webhook(
                     detected_gaps = capability_detection.get("gaps") or []
                     if detected_gaps:
                         lines.append("Обнаружены gaps: " + ", ".join(detected_gaps))
+                        lines.append(_build_gap_summary(capability_detection))
                     if degraded:
                         lines.append("Spec auto-filled from request (LLM JSON parse failed)")
                     lines.append(_TASK_EXAMPLE_HINT)
@@ -1987,10 +2233,15 @@ async def telegram_webhook(
                         "chat_id": chat_id,
                         "action_type": "/task",
                         "issue_number": issue_number,
+                        "issue_url": issue_url if outcome in {"success", "degraded"} else None,
                         "degraded": degraded,
-                        "detected_intents": capability_detection.get("intents", []),
+                        "request_intents": capability_detection.get("intents", []),
                         "matched_capabilities": capability_detection.get("matched_capabilities", []),
-                        "capability_gaps": capability_detection.get("gaps", []),
+                        "detected_gaps": capability_detection.get("gaps", []),
+                        "parse_outcome": spec.get("parse_outcome", "fallback" if degraded else "primary") if outcome in {"success", "degraded"} else "fallback",
+                        "risk_level": spec.get("risk_level") if outcome in {"success", "degraded"} else None,
+                        "allowed_file_scope": spec.get("allowed_file_scope") if outcome in {"success", "degraded"} else None,
+                        "dialog_state": _serialize_task_dialog_state(pending_task_state),
                         "outcome": outcome,
                         "log_level": "info" if outcome in {"success", "degraded"} else "error",
                     }
@@ -2317,7 +2568,7 @@ async def telegram_webhook(
             else:
                 context = _extract_missing_context(request_text)
                 next_question = _build_context_question(context)
-                if next_question is not None:
+                if next_question is not None and not _context_above_threshold(context):
                     field_name, question = next_question
                     if isinstance(chat_id, int):
                         _task_dialog_state_by_chat[chat_id] = TaskDialogState(
@@ -2329,8 +2580,10 @@ async def telegram_webhook(
                     reply_text = question
                 else:
                     issue_number: int | None = None
+                    issue_url: str | None = None
                     degraded = False
                     capability_detection = {"intents": [], "matched_capabilities": [], "gaps": []}
+                    spec: dict[str, Any] = {}
                     try:
                         spec = _build_task_spec(request_text)
                         degraded = bool(spec.get("degraded"))
@@ -2359,6 +2612,7 @@ async def telegram_webhook(
                         detected_gaps = capability_detection.get("gaps") or []
                         if detected_gaps:
                             lines.append("Обнаружены gaps: " + ", ".join(detected_gaps))
+                            lines.append(_build_gap_summary(capability_detection))
                         if degraded:
                             lines.append("Spec auto-filled from request (LLM JSON parse failed)")
                         lines.append(_TASK_EXAMPLE_HINT)
@@ -2378,10 +2632,15 @@ async def telegram_webhook(
                             "chat_id": chat_id,
                             "action_type": "/task",
                             "issue_number": issue_number,
+                            "issue_url": issue_url if outcome in {"success", "degraded"} else None,
                             "degraded": degraded,
-                            "detected_intents": capability_detection.get("intents", []),
+                            "request_intents": capability_detection.get("intents", []),
                             "matched_capabilities": capability_detection.get("matched_capabilities", []),
-                            "capability_gaps": capability_detection.get("gaps", []),
+                            "detected_gaps": capability_detection.get("gaps", []),
+                            "parse_outcome": spec.get("parse_outcome", "fallback" if degraded else "primary") if outcome in {"success", "degraded"} else "fallback",
+                            "risk_level": spec.get("risk_level") if outcome in {"success", "degraded"} else None,
+                            "allowed_file_scope": spec.get("allowed_file_scope") if outcome in {"success", "degraded"} else None,
+                            "dialog_state": _serialize_task_dialog_state(None),
                             "outcome": outcome,
                             "log_level": "info" if outcome in {"success", "degraded"} else "error",
                         }
@@ -2513,6 +2772,21 @@ async def telegram_webhook(
             reply_text = HELP_TEXT
         else:
             reply_text = "Unknown command"
+            _safe_audit_event(
+                {
+                    "event": "telegram_unknown_command",
+                    "action_id": action_id,
+                    "telegram_update_id": telegram_update_id,
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "action_type": "unknown",
+                    "text": text[:200],
+                    "reason_code": "unknown_command",
+                    "dialog_state": _serialize_task_dialog_state(pending_task_state),
+                    "outcome": "ignored",
+                    "log_level": "info",
+                }
+            )
 
         if chat_id is not None:
             await send_message(chat_id=chat_id, text=reply_text)
