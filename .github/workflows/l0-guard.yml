@@ -10,38 +10,40 @@ jobs:
     permissions:
       pull-requests: read
     steps:
-      - uses: tj-actions/changed-files@v34
-        id: changed
+      - name: Check for protected L0 files via GitHub API
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const protectedFiles = new Set([
+              'governance/constitution.md',
+              'governance/identity.md',
+              'governance/normative_hierarchy.md',
+            ]);
 
-      - name: Check for protected files
-        run: |
-          PROTECTED="governance/constitution.md governance/identity.md governance/normative_hierarchy.md"
-          WORKFLOW_PATH=".github/workflows/"
-          CHANGED="${{ steps.changed.outputs.all_changed_files }}"
-          ACTOR="${{ github.actor }}"
-          LABELS="${{ github.event.pull_request.labels.*.name }}"
-          FAIL=false
+            const labels = (context.payload.pull_request?.labels ?? []).map((label) => label.name);
+            const hasOverride = labels.includes('l0-approved');
 
-          for p in $PROTECTED; do
-            if echo "$CHANGED" | grep -E "$p"; then
-              FAIL=true
-            fi
-          done
+            const changedFiles = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              per_page: 100,
+            });
 
-          if echo "$CHANGED" | grep -Fq "$WORKFLOW_PATH"; then
-            if [ "$ACTOR" = "adavydov" ] || [[ "$LABELS" =~ "allow-workflows" ]]; then
-              echo "Workflow changes allowed for sovereign actor/label override."
-            else
-              echo "Workflow files are protected. Only adavydov or PRs with 'allow-workflows' label may change them."
-              exit 1
-            fi
-          fi
+            const touchedL0 = changedFiles
+              .map((file) => file.filename)
+              .filter((filename) => protectedFiles.has(filename));
 
-          if [ "$FAIL" = true ]; then
-            if [[ "$LABELS" =~ "l0-approved" ]]; then
-              echo "L0 override label found. Allowing."
-            else
-              echo "Protected files changed. Add label 'l0-approved' to merge."
-              exit 1
-            fi
-          fi
+            if (touchedL0.length === 0) {
+              core.info('No L0 files changed.');
+              return;
+            }
+
+            core.warning(`Touched L0 files: ${touchedL0.join(', ')}`);
+
+            if (hasOverride) {
+              core.info("L0 override label 'l0-approved' found. Allowing.");
+              return;
+            }
+
+            core.setFailed("Protected L0 files changed. Add label 'l0-approved' to merge.");
