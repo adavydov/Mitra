@@ -311,6 +311,33 @@ def test_think_command_returns_short_read_only_response(monkeypatch):
     assert "Следующие шаги:" in reply
 
 
+def test_think_command_strips_thinking_tags_from_llm_reply(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    class FakeThinkLlm:
+        def create_message(self, *, messages, system):
+            return {"content": [{"type": "text", "text": "<thinking>hidden</thinking>\nPONG"}]}
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.AnthropicClient", FakeThinkLlm)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/think ping", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "PONG")]
+
+
 def test_think_command_redacts_secret_assignments_and_limits_prompt(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
