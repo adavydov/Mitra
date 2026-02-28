@@ -20,6 +20,7 @@ from mitra_app.main import (
     _REFLECT_SYSTEM_PROMPT,
     _extract_json_object,
     _build_task_spec,
+    detect_capability_gaps,
     _build_pr_status_reply,
     _render_task_issue,
     _extract_think_prompt,
@@ -1358,6 +1359,7 @@ def test_task_command_without_llm_json_uses_fallback_spec(monkeypatch):
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
 
     calls = []
+    audits = []
 
     async def fake_send_message(chat_id: int, text: str):
         calls.append((chat_id, text))
@@ -1377,9 +1379,13 @@ def test_task_command_without_llm_json_uses_fallback_spec(monkeypatch):
         assert "Добавь новую команду" in body
         return 91, "https://github.com/o/r/issues/91"
 
+    def fake_log_event(event: dict[str, object]):
+        audits.append(event)
+
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
     monkeypatch.setattr("mitra_app.main.AnthropicClient", FakeAnthropicClient)
     monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_github_issue)
+    monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
 
     response = client.post(
         "/telegram/webhook",
@@ -1397,6 +1403,10 @@ def test_task_command_without_llm_json_uses_fallback_spec(monkeypatch):
     assert len(calls) == 1
     assert "Issue создан: https://github.com/o/r/issues/91" in calls[0][1]
     assert "Spec auto-filled from request (LLM JSON parse failed)" in calls[0][1]
+
+    task_audit = next(event for event in audits if event.get("event") == "telegram_task_open_issue")
+    assert task_audit["action_type"] == "/task"
+    assert task_audit["degraded"] is True
 
 
 def test_task_command_without_body_returns_usage(monkeypatch):
@@ -1549,6 +1559,69 @@ def test_build_task_spec_returns_fallback_when_multiple_non_json_text_blocks_ret
     assert spec["degraded"] is True
     assert spec["summary"] == "Нужен fallback"
     assert any(rec.message == "task_spec_fallback_used" for rec in caplog.records)
+
+
+def test_detect_capability_gaps_for_new_capability_request_returns_all_required_blocks():
+    detection = detect_capability_gaps("Нужна новая способность для партнёрской интеграции с CRM")
+
+    assert detection["matched_capabilities"] == []
+    assert detection["gaps"] == ["code", "policy", "config", "tests", "secrets", "runbook"]
+
+
+def test_task_command_includes_gap_sections_in_issue_body(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_create_github_issue(title: str, body: str):
+        assert title == "Добавить новую способность CRM"
+        assert "## Capability gaps to close" in body
+        assert "### GAP: code" in body
+        assert "### GAP: policy" in body
+        assert "### GAP: config" in body
+        assert "### GAP: tests" in body
+        assert "### GAP: secrets" in body
+        assert "### GAP: runbook" in body
+        return 109, "https://github.com/o/r/issues/109"
+
+    def fake_build_task_spec(request_text: str):
+        assert "новую способность" in request_text
+        return {
+            "title": "Добавить новую способность CRM",
+            "summary": "Нужно создать способность для CRM-синхронизации.",
+            "components": [],
+            "required_env_secrets": [],
+            "new_commands": [],
+            "acceptance_criteria": ["Способность документирована и интегрирована"],
+            "tests_to_add": [],
+            "risk_level": "R2",
+        }
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main._build_task_spec", fake_build_task_spec)
+    monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_github_issue)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={
+            "message": {
+                "text": "/task Добавить новую способность CRM с синхронизацией",
+                "chat": {"id": 123},
+                "from": {"id": 123},
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert "Issue создан: https://github.com/o/r/issues/109" in calls[0][1]
+    assert "Обнаружены gaps: code, policy, config, tests, secrets, runbook" in calls[0][1]
 
 
 def test_extract_json_object_handles_dirty_text_with_fenced_block_and_json():
