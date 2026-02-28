@@ -1344,7 +1344,7 @@ def test_task_command_creates_codex_issue_and_reports_expected_command(monkeypat
     response = client.post(
         "/telegram/webhook",
         headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
-        json={"message": {"text": "/task Добавь /hello", "chat": {"id": 123}, "from": {"id": 123}}},
+        json={"message": {"text": "/task Добавь /hello в GitHub, секреты в Vault, риск R1, команда должна отвечать hello, дедлайн 2026-01-10", "chat": {"id": 123}, "from": {"id": 123}}},
     )
 
     assert response.status_code == 200
@@ -1373,7 +1373,7 @@ def test_task_command_without_llm_json_uses_fallback_spec(monkeypatch):
             return {"content": [{"type": "text", "text": "Не JSON ответ"}]}
 
     async def fake_create_github_issue(title: str, body: str):
-        assert title == "Добавь новую команду, которая отвечает текущим временем и коротким статусом сист"
+        assert "Добавь новую команду" in title
         assert "## Summary" in body
         assert "## Risk level\n- R2" in body
         assert "Добавь новую команду" in body
@@ -1392,7 +1392,7 @@ def test_task_command_without_llm_json_uses_fallback_spec(monkeypatch):
         headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
         json={
             "message": {
-                "text": "/task Добавь новую команду, которая отвечает текущим временем и коротким статусом системы",
+                "text": "/task Добавь новую команду в GitHub, секреты в env, риск R2, команда должна отвечать текущим временем и коротким статусом системы, дедлайн 2026-02-01",
                 "chat": {"id": 123},
                 "from": {"id": 123},
             }
@@ -1431,81 +1431,71 @@ def test_task_command_without_body_returns_usage(monkeypatch):
     assert calls == [(123, "Usage: /task <request>")]
 
 
-def test_task_command_new_capability_does_not_create_issue_when_mandatory_sections_empty(monkeypatch):
+def test_task_command_multiturn_collects_context_before_issue_creation(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
 
     calls = []
-    create_called = False
+    build_calls = []
+    issue_calls = []
 
     async def fake_send_message(chat_id: int, text: str):
         calls.append((chat_id, text))
         return True
 
     def fake_build_task_spec(request_text: str):
-        assert request_text
+        build_calls.append(request_text)
+        assert "- provider: GitHub" in request_text
+        assert "- credentials source: Секреты в Vault" in request_text
         return {
-            "title": "Новая capability",
-            "summary": "Добавить новую capability",
+            "title": "Добавить /hello",
+            "summary": "Добавить простую команду.",
             "components": ["mitra_app/main.py"],
-            "required_env_secrets": [],
+            "required_env_secrets": ["OPENAI_API_KEY"],
             "new_commands": ["/hello"],
-            "acceptance_criteria": ["Команда существует"],
-            "tests_to_add": ["pytest tests/test_telegram_webhook.py"],
-            "risk_level": "R2",
-            "task_type": "new capability",
-            "missing_capabilities": [],
-            "required_code_changes": ["mitra_app/main.py"],
-            "policy_config_updates": ["policy/merge_rules.md"],
-            "acceptance_checks": [],
-            "rollback_safety": [],
+            "acceptance_criteria": ["Команда /hello отвечает hello from mitra"],
+            "tests_to_add": ["pytest для /telegram/webhook"],
+            "risk_level": "R1",
         }
 
     async def fake_create_github_issue(title: str, body: str):
-        nonlocal create_called
-        create_called = True
-        return 1, "https://github.com/o/r/issues/1"
+        issue_calls.append((title, body))
+        return 101, "https://github.com/o/r/issues/101"
 
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
     monkeypatch.setattr("mitra_app.main._build_task_spec", fake_build_task_spec)
     monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_github_issue)
 
-    response = client.post(
+    first = client.post(
         "/telegram/webhook",
         headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
-        json={"message": {"text": "/task Добавь capability", "chat": {"id": 123}, "from": {"id": 123}}},
+        json={
+            "message": {
+                "text": "/task Добавь /hello, команда должна отвечать hello",
+                "chat": {"id": 123},
+                "from": {"id": 123},
+            }
+        },
+    )
+    second = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "GitHub", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+    third = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "Секреты в Vault", "chat": {"id": 123}, "from": {"id": 123}}},
     )
 
-    assert response.status_code == 200
-    assert create_called is False
-    assert len(calls) == 1
-    assert "Task issue not created" in calls[0][1]
-    assert "Missing capabilities" in calls[0][1]
-
-
-def test_render_task_issue_includes_new_capability_sections_and_ci_block():
-    title, body = _render_task_issue(
-        {
-            "title": "Add new capability",
-            "summary": "Introduce hello",
-            "task_type": "new capability",
-            "missing_capabilities": ["Missing /hello command"],
-            "required_code_changes": ["mitra_app/main.py"],
-            "policy_config_updates": ["config/autonomy.json"],
-            "acceptance_checks": ["pytest tests/test_telegram_webhook.py -k task"],
-            "rollback_safety": ["Revert the /hello handler"],
-        }
-    )
-
-    assert title == "Add new capability"
-    assert "## Missing capabilities" in body
-    assert "## Required code changes (paths/modules)" in body
-    assert "## Policy/config updates" in body
-    assert "## Acceptance checks" in body
-    assert "## Rollback/safety" in body
-    assert "## CI completeness block" in body
-    assert '"task_type": "new capability"' in body
-    assert '"mandatory_sections_complete": true' in body
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert third.status_code == 200
+    assert calls[0] == (123, "Уточни provider: где будем создавать задачу (например GitHub/Jira/Linear)?")
+    assert calls[1] == (123, "Где брать credentials (источник секретов/доступов)?")
+    assert "Issue создан: https://github.com/o/r/issues/101" in calls[2][1]
+    assert len(build_calls) == 1
+    assert len(issue_calls) == 1
 
 
 def test_build_task_spec_returns_fallback_when_json_parse_fails(caplog):

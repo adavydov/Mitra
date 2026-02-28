@@ -4,7 +4,8 @@ import logging
 import os
 import re
 from collections import OrderedDict
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 import time
@@ -89,9 +90,21 @@ _TASK_EXAMPLE_HINT = (
     "и покрыта тестом."
 )
 
-_CAPABILITY_CATALOG_PATH = Path(__file__).resolve().parents[1] / "capabilities" / "catalog.json"
-_CAPABILITY_GAP_TYPES = ("code", "policy", "config", "tests", "secrets", "runbook")
-_INTENT_TOKEN_RE = re.compile(r"[a-zA-Zа-яА-Я0-9_\-/]{3,}")
+_TASK_CONTEXT_COMPLETENESS_THRESHOLD = 3
+_TASK_CONTEXT_FIELD_ORDER = (
+    "provider",
+    "credentials_source",
+    "risk_constraints",
+    "success_criteria",
+    "deadlines",
+)
+_TASK_CONTEXT_QUESTIONS = {
+    "provider": "Уточни provider: где будем создавать задачу (например GitHub/Jira/Linear)?",
+    "credentials_source": "Где брать credentials (источник секретов/доступов)?",
+    "risk_constraints": "Какие есть risk constraints (например max risk level, ограничения по данным/продакшену)?",
+    "success_criteria": "Сформулируй success criteria (как поймём, что задача выполнена).",
+    "deadlines": "Есть ли deadline/срок для задачи?",
+}
 
 
 _REFLECT_SYSTEM_PROMPT = (
@@ -413,6 +426,102 @@ class PerUserRateLimiter:
 
 
 _pr_rate_limiter = PerUserRateLimiter(limit=5, window_seconds=3600)
+
+
+@dataclass
+class MissingContext:
+    provider: str | None = None
+    credentials_source: str | None = None
+    risk_constraints: str | None = None
+    success_criteria: str | None = None
+    deadlines: str | None = None
+
+    def missing_fields(self) -> list[str]:
+        missing: list[str] = []
+        for field_name in _TASK_CONTEXT_FIELD_ORDER:
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                missing.append(field_name)
+        return missing
+
+    def filled_fields_count(self) -> int:
+        return len(_TASK_CONTEXT_FIELD_ORDER) - len(self.missing_fields())
+
+
+@dataclass
+class TaskDialogState:
+    request_text: str
+    context: MissingContext = field(default_factory=MissingContext)
+    last_question_field: str | None = None
+    turns: list[dict[str, str]] = field(default_factory=list)
+
+
+_task_dialog_state_by_chat: dict[int, TaskDialogState] = {}
+
+
+def _extract_missing_context(request_text: str) -> MissingContext:
+    text = request_text.strip()
+    lowered = text.lower()
+    context = MissingContext()
+
+    provider_match = re.search(r"\b(github|gitlab|jira|linear|asana)\b", lowered)
+    if provider_match:
+        context.provider = provider_match.group(1)
+
+    if any(token in lowered for token in ("vault", "1password", "secret", "env", "переменн")):
+        context.credentials_source = text
+
+    if re.search(r"\br[0-4]\b", lowered) or "risk" in lowered or "огранич" in lowered:
+        context.risk_constraints = text
+
+    if any(token in lowered for token in ("критер", "acceptance", "готово", "должен", "должна")):
+        context.success_criteria = text
+
+    if re.search(r"\b\d{4}-\d{2}-\d{2}\b", lowered) or "дедлайн" in lowered or "до " in lowered:
+        context.deadlines = text
+
+    return context
+
+
+def _merge_context_answer(state: TaskDialogState, answer_text: str) -> None:
+    answer = answer_text.strip()
+    if not answer:
+        return
+
+    target_field = state.last_question_field
+    if target_field in _TASK_CONTEXT_FIELD_ORDER:
+        setattr(state.context, target_field, answer)
+    else:
+        for field_name in state.context.missing_fields():
+            setattr(state.context, field_name, answer)
+            break
+
+    state.turns.append({"role": "user", "content": answer})
+
+
+def _build_context_question(context: MissingContext) -> tuple[str, str] | None:
+    missing = context.missing_fields()
+    if not missing:
+        return None
+    field_name = missing[0]
+    question = _TASK_CONTEXT_QUESTIONS.get(field_name)
+    if not question:
+        return None
+    return field_name, question
+
+
+def _context_above_threshold(context: MissingContext) -> bool:
+    return context.filled_fields_count() >= _TASK_CONTEXT_COMPLETENESS_THRESHOLD
+
+
+def _enrich_task_request_with_context(request_text: str, context: MissingContext) -> str:
+    lines = [request_text.strip(), "", "Контекст уточнений:"]
+    for field_name in _TASK_CONTEXT_FIELD_ORDER:
+        value = getattr(context, field_name)
+        if isinstance(value, str) and value.strip():
+            label = field_name.replace("_", " ")
+            lines.append(f"- {label}: {value.strip()}")
+    return "\n".join(lines).strip()
 
 
 def _parse_goal_command(text: str) -> tuple[str, str | None] | None:
@@ -875,7 +984,6 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
                     text_blocks.append(text.strip())
 
     parse_diagnostics = _build_task_parse_diagnostics(content)
-
     parsed = _extract_json_object("\n".join(text_blocks))
     if not parsed:
         logger.warning("task_spec_parse_primary_failed", extra=parse_diagnostics)
@@ -1801,7 +1909,62 @@ async def telegram_webhook(
                     await send_message(chat_id=chat_id, text=deny_reason)
                 return {"status": "ok"}
 
-        if text.startswith("/status"):
+        pending_task_state = _task_dialog_state_by_chat.get(chat_id) if isinstance(chat_id, int) else None
+        if pending_task_state is not None and isinstance(text, str) and text.strip() and not text.strip().startswith("/"):
+            _merge_context_answer(pending_task_state, text)
+            next_question = _build_context_question(pending_task_state.context)
+            if next_question is not None and not _context_above_threshold(pending_task_state.context):
+                field_name, question = next_question
+                pending_task_state.last_question_field = field_name
+                reply_text = question
+            else:
+                issue_number: int | None = None
+                degraded = False
+                try:
+                    enriched_request = _enrich_task_request_with_context(
+                        pending_task_state.request_text,
+                        pending_task_state.context,
+                    )
+                    spec = _build_task_spec(enriched_request)
+                    degraded = bool(spec.get("degraded"))
+                    issue_title, issue_body = _render_task_issue(spec)
+                    issue_number, issue_url = await _create_github_issue(title=issue_title, body=issue_body)
+                    await budget_ledger.record_github_write()
+
+                    required_secrets = spec.get("required_env_secrets") or []
+                    expected_commands = spec.get("new_commands") or []
+                    lines = [f"Issue создан: {issue_url}"]
+                    if required_secrets:
+                        lines.append("Требуются ключи/доступы: " + ", ".join(required_secrets))
+                    if expected_commands:
+                        lines.append("Ожидаемая новая команда: " + ", ".join(expected_commands))
+                    if degraded:
+                        lines.append("Spec auto-filled from request (LLM JSON parse failed)")
+                    lines.append(_TASK_EXAMPLE_HINT)
+                    reply_text = "\n".join(lines)
+                    outcome = "degraded" if degraded else "success"
+                except Exception:
+                    logger.exception("telegram_task_create_issue_failed")
+                    reply_text = "Failed to create task issue"
+                    outcome = "error"
+
+                _safe_audit_event(
+                    {
+                        "event": "telegram_task_open_issue",
+                        "action_id": action_id,
+                        "telegram_update_id": telegram_update_id,
+                        "user_id": user_id,
+                        "chat_id": chat_id,
+                        "action_type": "/task",
+                        "issue_number": issue_number,
+                        "degraded": degraded,
+                        "outcome": outcome,
+                        "log_level": "info" if outcome in {"success", "degraded"} else "error",
+                    }
+                )
+                if isinstance(chat_id, int):
+                    _task_dialog_state_by_chat.pop(chat_id, None)
+        elif text.startswith("/status"):
             reply_text = "Mitra alive"
         elif text.startswith("/smoke_deep"):
             reply_text, smoke_audit = await _run_smoke_deep_checks()
@@ -2119,64 +2282,59 @@ async def telegram_webhook(
             elif not _pr_rate_limiter.allow(user_id if isinstance(user_id, int) else None):
                 reply_text = "Rate limit exceeded: max 5 /task per hour"
             else:
-                issue_number: int | None = None
-                degraded = False
-                try:
-                    gap_detection = detect_capability_gaps(request_text)
-                    spec = _build_task_spec(request_text)
-                    degraded = bool(spec.get("degraded"))
-                    task_type = _normalize_task_type(spec.get("task_type"))
-                    missing_sections = _new_capability_missing_sections(spec) if task_type == "new capability" else []
-                    if missing_sections:
-                        reply_text = (
-                            "Task issue not created: mandatory sections for task type 'new capability' are empty: "
-                            + ", ".join(missing_sections)
+                context = _extract_missing_context(request_text)
+                next_question = _build_context_question(context)
+                if next_question is not None:
+                    field_name, question = next_question
+                    if isinstance(chat_id, int):
+                        _task_dialog_state_by_chat[chat_id] = TaskDialogState(
+                            request_text=request_text,
+                            context=context,
+                            last_question_field=field_name,
+                            turns=[{"role": "user", "content": request_text}],
                         )
-                        outcome = "validation_failed"
-                        raise ValueError("new_capability_mandatory_sections_missing")
+                    reply_text = question
+                else:
+                    issue_number: int | None = None
+                    degraded = False
+                    try:
+                        spec = _build_task_spec(request_text)
+                        degraded = bool(spec.get("degraded"))
+                        issue_title, issue_body = _render_task_issue(spec)
+                        issue_number, issue_url = await _create_github_issue(title=issue_title, body=issue_body)
+                        await budget_ledger.record_github_write()
 
-                    issue_title, issue_body = _render_task_issue(spec)
-                    issue_number, issue_url = await _create_github_issue(title=issue_title, body=issue_body)
-                    await budget_ledger.record_github_write()
+                        required_secrets = spec.get("required_env_secrets") or []
+                        expected_commands = spec.get("new_commands") or []
+                        lines = [f"Issue создан: {issue_url}"]
+                        if required_secrets:
+                            lines.append("Требуются ключи/доступы: " + ", ".join(required_secrets))
+                        if expected_commands:
+                            lines.append("Ожидаемая новая команда: " + ", ".join(expected_commands))
+                        if degraded:
+                            lines.append("Spec auto-filled from request (LLM JSON parse failed)")
+                        lines.append(_TASK_EXAMPLE_HINT)
+                        reply_text = "\n".join(lines)
+                        outcome = "degraded" if degraded else "success"
+                    except Exception:
+                        logger.exception("telegram_task_create_issue_failed")
+                        reply_text = "Failed to create task issue"
+                        outcome = "error"
 
-                    required_secrets = spec.get("required_env_secrets") or []
-                    expected_commands = spec.get("new_commands") or []
-                    lines = [f"Issue создан: {issue_url}"]
-                    if required_secrets:
-                        lines.append("Требуются ключи/доступы: " + ", ".join(required_secrets))
-                    if expected_commands:
-                        lines.append("Ожидаемая новая команда: " + ", ".join(expected_commands))
-                    if degraded:
-                        lines.append("Spec auto-filled from request (LLM JSON parse failed)")
-                    if gap_detection.get("gaps"):
-                        lines.append("Обнаружены gaps: " + ", ".join(gap_detection["gaps"]))
-                    lines.append(_TASK_EXAMPLE_HINT)
-                    reply_text = "\n".join(lines)
-                    outcome = "degraded" if degraded else "success"
-                except ValueError as exc:
-                    if str(exc) == "new_capability_mandatory_sections_missing":
-                        logger.warning("telegram_task_validation_failed", extra={"task_type": "new capability"})
-                    else:
-                        logger.exception("telegram_task_validation_failed")
-                except Exception:
-                    logger.exception("telegram_task_create_issue_failed")
-                    reply_text = "Failed to create task issue"
-                    outcome = "error"
-
-                _safe_audit_event(
-                    {
-                        "event": "telegram_task_open_issue",
-                        "action_id": action_id,
-                        "telegram_update_id": telegram_update_id,
-                        "user_id": user_id,
-                        "chat_id": chat_id,
-                        "action_type": "/task",
-                        "issue_number": issue_number,
-                        "degraded": degraded,
-                        "outcome": outcome,
-                        "log_level": "info" if outcome in {"success", "degraded"} else "error",
-                    }
-                )
+                    _safe_audit_event(
+                        {
+                            "event": "telegram_task_open_issue",
+                            "action_id": action_id,
+                            "telegram_update_id": telegram_update_id,
+                            "user_id": user_id,
+                            "chat_id": chat_id,
+                            "action_type": "/task",
+                            "issue_number": issue_number,
+                            "degraded": degraded,
+                            "outcome": outcome,
+                            "log_level": "info" if outcome in {"success", "degraded"} else "error",
+                        }
+                    )
         elif text.startswith("/pr"):
             parsed = _parse_pr_command(text)
             if not parsed:
