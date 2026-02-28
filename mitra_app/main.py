@@ -5,7 +5,7 @@ import os
 import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 import time
@@ -86,14 +86,16 @@ _TASK_EXAMPLE_HINT = (
 
 _TASK_CONTEXT_COMPLETENESS_THRESHOLD = 3
 _TASK_CONTEXT_FIELD_ORDER = (
-    "provider",
+    "issue_provider",
+    "integration_provider",
     "credentials_source",
     "risk_constraints",
     "success_criteria",
     "deadlines",
 )
 _TASK_CONTEXT_QUESTIONS = {
-    "provider": "Уточни provider: где будем создавать задачу (например GitHub/Jira/Linear)?",
+    "issue_provider": "Уточни issue provider: где создаём задачу (GitHub/Jira/Linear)?",
+    "integration_provider": "Какой integration provider используется в задаче (например Yandex/Google/Outlook)?",
     "credentials_source": "Где брать credentials (источник секретов/доступов)?",
     "risk_constraints": "Какие есть risk constraints (например max risk level, ограничения по данным/продакшену)?",
     "success_criteria": "Сформулируй success criteria (как поймём, что задача выполнена).",
@@ -427,9 +429,10 @@ _pr_rate_limiter = PerUserRateLimiter(limit=5, window_seconds=3600)
 
 @dataclass
 class MissingContext:
-    provider: str | None = None
+    issue_provider: str | None = None
+    integration_provider: str | None = None
     credentials_source: str | None = None
-    risk_constraints: str | None = None
+    risk_constraints: dict[str, Any] | None = None
     success_criteria: str | None = None
     deadlines: str | None = None
 
@@ -437,6 +440,10 @@ class MissingContext:
         missing: list[str] = []
         for field_name in _TASK_CONTEXT_FIELD_ORDER:
             value = getattr(self, field_name)
+            if field_name == "risk_constraints":
+                if not isinstance(value, dict) or not isinstance(value.get("has_constraints"), bool):
+                    missing.append(field_name)
+                continue
             if not isinstance(value, str) or not value.strip():
                 missing.append(field_name)
         return missing
@@ -456,22 +463,92 @@ class TaskDialogState:
 _task_dialog_state_by_chat: dict[int, TaskDialogState] = {}
 
 
+def _normalize_provider_name(raw: str) -> str:
+    value = raw.strip().lower()
+    if value in {"github", "гитхаб"}:
+        return "GitHub"
+    if value in {"jira", "джира"}:
+        return "Jira"
+    if value in {"linear"}:
+        return "Linear"
+    return ""
+
+
+def _normalize_integration_provider(raw: str) -> str:
+    value = raw.strip().lower()
+    if value in {"yandex", "яндекс"}:
+        return "Yandex"
+    if value in {"google", "гугл"}:
+        return "Google"
+    if value in {"outlook", "аутлук"}:
+        return "Outlook"
+    return ""
+
+
+def _normalize_risk_constraints(raw: str) -> dict[str, Any] | None:
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+
+    lowered = cleaned.lower()
+    if re.search(r"\bнет\s+ограничени[йяеъ]*\b", lowered):
+        return {"has_constraints": False, "details": []}
+
+    return {"has_constraints": True, "details": [cleaned]}
+
+
+def _validate_context_answer(field_name: str, answer: str) -> tuple[bool, Any, str | None]:
+    cleaned = answer.strip()
+    if not cleaned:
+        return False, None, "Ответ пустой."
+
+    if field_name == "issue_provider":
+        normalized = _normalize_provider_name(cleaned)
+        if not normalized:
+            return False, None, "Нужен issue provider из списка GitHub/Jira/Linear."
+        return True, normalized, None
+
+    if field_name == "integration_provider":
+        normalized = _normalize_integration_provider(cleaned)
+        if not normalized:
+            return False, None, "Не понял integration provider. Укажи Yandex/Google/Outlook (или другой явно)."
+        return True, normalized, None
+
+    if field_name == "credentials_source":
+        credentials_tokens = ("vault", "1password", "secret", "env", "переменн", "oauth", "k8s", "secrets manager")
+        if not any(token in cleaned.lower() for token in credentials_tokens):
+            return False, None, "Нужно чуть подробнее: где именно брать credentials."
+        return True, cleaned, None
+
+    if field_name == "risk_constraints":
+        normalized = _normalize_risk_constraints(cleaned)
+        if normalized is None:
+            return False, None, "Не понял risk constraints."
+        return True, normalized, None
+
+    return True, cleaned, None
+
+
 def _extract_missing_context(request_text: str) -> MissingContext:
     text = request_text.strip()
     lowered = text.lower()
     context = MissingContext()
 
-    provider_match = re.search(r"\b(github|gitlab|jira|linear|asana)\b", lowered)
-    if provider_match:
-        context.provider = provider_match.group(1)
+    issue_provider_match = re.search(r"\b(github|jira|linear)\b", lowered)
+    if issue_provider_match:
+        context.issue_provider = _normalize_provider_name(issue_provider_match.group(1))
+
+    integration_provider_match = re.search(r"\b(yandex|яндекс|google|гугл|outlook|аутлук)\b", lowered)
+    if integration_provider_match:
+        context.integration_provider = _normalize_integration_provider(integration_provider_match.group(1))
 
     if any(token in lowered for token in ("vault", "1password", "secret", "env", "переменн")):
         context.credentials_source = text
 
     if re.search(r"\br[0-4]\b", lowered) or "risk" in lowered or "огранич" in lowered:
-        context.risk_constraints = text
+        context.risk_constraints = _normalize_risk_constraints(text)
 
-    if any(token in lowered for token in ("критер", "acceptance", "готово", "должен", "должна")):
+    if any(token in lowered for token in ("критер", "acceptance", "готово")):
         context.success_criteria = text
 
     if re.search(r"\b\d{4}-\d{2}-\d{2}\b", lowered) or "дедлайн" in lowered or "до " in lowered:
@@ -487,11 +564,15 @@ def _merge_context_answer(state: TaskDialogState, answer_text: str) -> None:
 
     target_field = state.last_question_field
     if target_field in _TASK_CONTEXT_FIELD_ORDER:
-        setattr(state.context, target_field, answer)
+        is_valid, normalized, _ = _validate_context_answer(target_field, answer)
+        if is_valid:
+            setattr(state.context, target_field, normalized)
     else:
         for field_name in state.context.missing_fields():
-            setattr(state.context, field_name, answer)
-            break
+            is_valid, normalized, _ = _validate_context_answer(field_name, answer)
+            if is_valid:
+                setattr(state.context, field_name, normalized)
+                break
 
     state.turns.append({"role": "user", "content": answer})
 
@@ -508,15 +589,21 @@ def _build_context_question(context: MissingContext) -> tuple[str, str] | None:
 
 
 def _context_above_threshold(context: MissingContext) -> bool:
-    return context.filled_fields_count() >= _TASK_CONTEXT_COMPLETENESS_THRESHOLD
+    has_required_baseline = all(
+        field_name not in context.missing_fields()
+        for field_name in ("issue_provider", "risk_constraints")
+    )
+    return context.filled_fields_count() >= _TASK_CONTEXT_COMPLETENESS_THRESHOLD and has_required_baseline
 
 
 def _enrich_task_request_with_context(request_text: str, context: MissingContext) -> str:
     lines = [request_text.strip(), "", "Контекст уточнений:"]
     for field_name in _TASK_CONTEXT_FIELD_ORDER:
         value = getattr(context, field_name)
-        if isinstance(value, str) and value.strip():
-            label = field_name.replace("_", " ")
+        label = field_name.replace("_", " ")
+        if field_name == "risk_constraints" and isinstance(value, dict):
+            lines.append(f"- {label}: {json.dumps(value, ensure_ascii=False)}")
+        elif isinstance(value, str) and value.strip():
             lines.append(f"- {label}: {value.strip()}")
     return "\n".join(lines).strip()
 
@@ -1013,6 +1100,7 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
                 },
             )
             logger.warning("task_spec_degraded_json_parse_failed")
+            logger.warning("task_spec_fallback_used")
             return _build_fallback_task_spec(request_text)
 
         logger.info(
@@ -1882,9 +1970,25 @@ async def telegram_webhook(
 
         pending_task_state = _task_dialog_state_by_chat.get(chat_id) if isinstance(chat_id, int) else None
         if pending_task_state is not None and isinstance(text, str) and text.strip() and not text.strip().startswith("/"):
-            _merge_context_answer(pending_task_state, text)
+            validation_error: str | None = None
+            if pending_task_state.last_question_field in _TASK_CONTEXT_FIELD_ORDER:
+                is_valid, normalized, error_message = _validate_context_answer(
+                    pending_task_state.last_question_field,
+                    text,
+                )
+                if is_valid:
+                    setattr(pending_task_state.context, pending_task_state.last_question_field, normalized)
+                    pending_task_state.turns.append({"role": "user", "content": text.strip()})
+                else:
+                    validation_error = error_message or "Ответ не прошёл валидацию."
+            else:
+                _merge_context_answer(pending_task_state, text)
+
             next_question = _build_context_question(pending_task_state.context)
-            if next_question is not None and not _context_above_threshold(pending_task_state.context):
+            if validation_error and pending_task_state.last_question_field:
+                question = _TASK_CONTEXT_QUESTIONS.get(pending_task_state.last_question_field, "")
+                reply_text = f"{validation_error} {question}".strip()
+            elif next_question is not None and not _context_above_threshold(pending_task_state.context):
                 field_name, question = next_question
                 pending_task_state.last_question_field = field_name
                 reply_text = question
@@ -2264,7 +2368,7 @@ async def telegram_webhook(
             else:
                 context = _extract_missing_context(request_text)
                 next_question = _build_context_question(context)
-                if next_question is not None:
+                if next_question is not None and not _context_above_threshold(context):
                     field_name, question = next_question
                     if isinstance(chat_id, int):
                         _task_dialog_state_by_chat[chat_id] = TaskDialogState(
