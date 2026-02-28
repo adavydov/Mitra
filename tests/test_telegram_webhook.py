@@ -1665,6 +1665,131 @@ def test_github_actions_callback_posts_to_admin_chat(monkeypatch):
     assert response.status_code == 200
     assert calls == [(777, "PR открыт: #144 (issue #55)\nhttps://github.com/o/r/pull/144")]
 
+
+def test_github_actions_callback_failed_ci_logs_gap_and_updates_backlog(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GITHUB_ACTIONS_CALLBACK_TOKEN", "cb-secret")
+    monkeypatch.setenv("TELEGRAM_ADMIN_CHAT_ID", "777")
+    monkeypatch.setenv("MITRA_AUDIT_LOG", str(tmp_path / "events.ndjson"))
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_poll(pr_number: int):
+        from mitra_app.github import GitHubChecksSummary, GitHubPullRequestStatus
+
+        return (
+            "failed",
+            "pytest failure",
+            GitHubPullRequestStatus(
+                number=pr_number,
+                state="open",
+                draft=False,
+                merged=False,
+                mergeable=True,
+                head_sha="abc",
+                html_url=f"https://github.com/o/r/pull/{pr_number}",
+            ),
+            GitHubChecksSummary(total=2, successful=1, failed=1, pending=0),
+        )
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main._poll_pr_ci_snapshot", fake_poll)
+
+    response = client.post(
+        "/github/actions_callback",
+        headers={"X-Mitra-Actions-Token": "cb-secret"},
+        json={"event": "ci_failed", "pr_number": 145},
+    )
+
+    assert response.status_code == 200
+    assert calls and "Gap: tests_missing" in calls[0][1]
+
+    backlog = (tmp_path / "reports" / "capability_gaps.md").read_text(encoding="utf-8")
+    assert "#145" in backlog
+    assert "tests_missing" in backlog
+
+    audit_lines = (tmp_path / "events.ndjson").read_text(encoding="utf-8").strip().splitlines()
+    payload = json.loads(audit_lines[-1])
+    assert payload["event"] == "github_pr_ci_status"
+    assert payload["failure_reason"] == "pytest failure"
+    assert payload["gap_type"] == "tests_missing"
+
+
+def test_github_actions_callback_repeated_failure_suggests_task_template(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GITHUB_ACTIONS_CALLBACK_TOKEN", "cb-secret")
+    monkeypatch.setenv("TELEGRAM_ADMIN_CHAT_ID", "777")
+    monkeypatch.setenv("MITRA_AUDIT_LOG", str(tmp_path / "events.ndjson"))
+
+    (tmp_path / "events.ndjson").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "timestamp": "2026-02-25T10:00:00+00:00",
+                        "event": "github_pr_ci_status",
+                        "outcome": "failed",
+                        "gap_type": "env_missing",
+                        "pr_number": 99,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-02-25T11:00:00+00:00",
+                        "event": "github_pr_ci_status",
+                        "outcome": "failed",
+                        "gap_type": "env_missing",
+                        "pr_number": 99,
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_poll(pr_number: int):
+        from mitra_app.github import GitHubChecksSummary, GitHubPullRequestStatus
+
+        return (
+            "failed",
+            "missing secret",
+            GitHubPullRequestStatus(
+                number=pr_number,
+                state="open",
+                draft=False,
+                merged=False,
+                mergeable=True,
+                head_sha="abc",
+                html_url=f"https://github.com/o/r/pull/{pr_number}",
+            ),
+            GitHubChecksSummary(total=1, successful=0, failed=1, pending=0),
+        )
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main._poll_pr_ci_snapshot", fake_poll)
+
+    response = client.post(
+        "/github/actions_callback",
+        headers={"X-Mitra-Actions-Token": "cb-secret"},
+        json={"event": "ci_failed", "pr_number": 99},
+    )
+
+    assert response.status_code == 200
+    assert calls
+    assert "Повторяющийся провал" in calls[0][1]
+    assert "/task Root-cause fix" in calls[0][1]
+
 def test_report_oauth_expired_replies_with_reauthorize_message(monkeypatch, tmp_path):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("MITRA_AUDIT_LOG", str(tmp_path / "events.ndjson"))
