@@ -157,7 +157,7 @@ def test_start_command_lists_search(monkeypatch):
         (
             123,
             "Commands: /status, /oauth_status, /search <query>, /research <query>, /think <prompt>, "
-            "/report <text>, /pr <title>\\n<spec>, /pr_status <issue#|pr#>, /drive_check, /budget, /smoke, /smoke_deep",
+            "/report <text>, /pr <title>\\n<spec>, /task <request>, /pr_status <issue#|pr#>, /drive_check, /budget, /smoke, /smoke_deep",
         )
     ]
 
@@ -1182,6 +1182,99 @@ def test_pr_command_audits_error_when_github_create_fails(monkeypatch):
     assert pr_audit["issue_number"] is None
     assert pr_audit["outcome"] == "error"
 
+
+def test_task_command_creates_codex_issue_and_reports_expected_command(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_create_github_issue(title: str, body: str):
+        assert title == "Добавить /hello"
+        assert "## Acceptance criteria" in body
+        return 88, "https://github.com/o/r/issues/88"
+
+    def fake_build_task_spec(request_text: str):
+        assert "/hello" in request_text
+        return {
+            "title": "Добавить /hello",
+            "summary": "Добавить простую команду.",
+            "components": ["mitra_app/main.py"],
+            "required_env_secrets": ["OPENAI_API_KEY"],
+            "new_commands": ["/hello"],
+            "acceptance_criteria": ["Команда /hello отвечает hello from mitra"],
+            "tests_to_add": ["pytest для /telegram/webhook"],
+            "risk_level": "R1",
+        }
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main._build_task_spec", fake_build_task_spec)
+    monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_github_issue)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/task Добавь /hello", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert "Issue создан: https://github.com/o/r/issues/88" in calls[0][1]
+    assert "Требуются ключи/доступы: OPENAI_API_KEY" in calls[0][1]
+    assert "Ожидаемая новая команда: /hello" in calls[0][1]
+
+
+def test_task_command_without_body_returns_usage(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/task", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Usage: /task <request>")]
+
+
+def test_github_actions_callback_posts_to_admin_chat(monkeypatch):
+    monkeypatch.setenv("GITHUB_ACTIONS_CALLBACK_TOKEN", "cb-secret")
+    monkeypatch.setenv("TELEGRAM_ADMIN_CHAT_ID", "777")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+
+    response = client.post(
+        "/github/actions_callback",
+        headers={"X-Mitra-Actions-Token": "cb-secret"},
+        json={
+            "event": "pr_opened",
+            "issue_number": 55,
+            "pr_number": 144,
+            "pr_url": "https://github.com/o/r/pull/144",
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls == [(777, "PR открыт: #144 (issue #55)\nhttps://github.com/o/r/pull/144")]
 
 def test_report_oauth_expired_replies_with_reauthorize_message(monkeypatch, tmp_path):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
