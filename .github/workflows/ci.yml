@@ -44,7 +44,7 @@ jobs:
   smoke:
     name: ci/smoke
     runs-on: ubuntu-latest
-    needs: [scope-check, lint]
+    needs: [lint]
     env:
       TELEGRAM_BOT_TOKEN: dummy
       TELEGRAM_WEBHOOK_SECRET: dummy

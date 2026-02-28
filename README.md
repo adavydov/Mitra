@@ -16,11 +16,15 @@
 
 ## How CI works
 - GitHub Actions workflow: `.github/workflows/ci.yml`.
-- Triggers: every pull request and every push to `main`.
-- Stable branch-protection checks:
-  - `ci/lint` — validates IDs.
-  - `ci/smoke` — быстрые smoke-проверки импорта и `/healthz` (`py_compile`, import, `tests/test_import_smoke.py`).
-  - `ci/tests-full` — полный `pytest -q`; запускается на `push` в `main`, вручную через `workflow_dispatch` или в PR с label `full-tests`.
+- Triggers:
+  - `pull_request` (`opened`, `synchronize`, `reopened`) — запускаются `ci/scope-check`, `ci/lint`, `ci/smoke`.
+  - `push` в `main` — запускаются `ci/lint`, `ci/smoke`.
+  - `workflow_dispatch` — ручной запуск.
+- Stable checks and roles:
+  - `ci/scope-check` — **policy-gate только для PR** (governance/security проверка изменений и declared scope).
+  - `ci/lint` — техническая проверка (базовая валидация/компиляция).
+  - `ci/smoke` — **технический smoke-job**, зависит только от `ci/lint` (быстрые проверки импорта: `py_compile`, import, `tests/test_import_smoke.py`).
+  - `ci/tests-full` — полный `pytest -q`; запускается вручную через `workflow_dispatch` или в PR с label `full-tests`.
 
 ## Workflow PR governance guard
 - Если PR изменяет `.github/workflows/**`, обязателен override label: `sovereign-override` (или legacy `l0-approved`).
