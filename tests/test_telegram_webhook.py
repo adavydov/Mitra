@@ -1441,10 +1441,21 @@ def test_task_command_multiturn_collects_context_before_issue_creation(monkeypat
     calls = []
     build_calls = []
     issue_calls = []
+    detect_calls = []
 
     async def fake_send_message(chat_id: int, text: str):
         calls.append((chat_id, text))
         return True
+
+    def fake_detect_capability_gaps(request_text: str):
+        detect_calls.append(request_text)
+        return {
+            "intents": ["hello"],
+            "matched_capabilities": [],
+            "gaps": ["code"],
+            "coverage_status": "missing",
+            "gap_closure_notes": ["code: capability отсутствует в каталоге — требуется явная реализация/описание."],
+        }
 
     def fake_build_task_spec(request_text: str):
         build_calls.append(request_text)
@@ -1468,6 +1479,7 @@ def test_task_command_multiturn_collects_context_before_issue_creation(monkeypat
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
     monkeypatch.setattr("mitra_app.main._build_task_spec", fake_build_task_spec)
     monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_github_issue)
+    monkeypatch.setattr("mitra_app.main.detect_capability_gaps", fake_detect_capability_gaps)
 
     first = client.post(
         "/telegram/webhook",
@@ -1499,6 +1511,8 @@ def test_task_command_multiturn_collects_context_before_issue_creation(monkeypat
     assert "Issue создан: https://github.com/o/r/issues/101" in calls[2][1]
     assert len(build_calls) == 1
     assert len(issue_calls) == 1
+    assert detect_calls == ["Добавь /hello, команда должна отвечать hello"]
+    assert "Gap summary: missing capability, закрыть блоки: code" in calls[2][1]
 
 
 def test_build_task_spec_returns_fallback_when_json_parse_fails(caplog):
@@ -1554,6 +1568,8 @@ def test_detect_capability_gaps_for_new_capability_request_returns_all_required_
 
     assert detection["matched_capabilities"] == []
     assert detection["gaps"] == ["code", "policy", "config", "tests", "secrets", "runbook"]
+    assert detection["coverage_status"] == "missing"
+    assert all("capability отсутствует" in note for note in detection["gap_closure_notes"])
 
 
 def test_task_command_includes_gap_sections_in_issue_body(monkeypatch):
@@ -1575,6 +1591,7 @@ def test_task_command_includes_gap_sections_in_issue_body(monkeypatch):
         assert "### GAP: tests" in body
         assert "### GAP: secrets" in body
         assert "### GAP: runbook" in body
+        assert "capability отсутствует в каталоге" in body
         return 109, "https://github.com/o/r/issues/109"
 
     def fake_build_task_spec(request_text: str):
@@ -1610,6 +1627,7 @@ def test_task_command_includes_gap_sections_in_issue_body(monkeypatch):
     assert len(calls) == 1
     assert "Issue создан: https://github.com/o/r/issues/109" in calls[0][1]
     assert "Обнаружены gaps: code, policy, config, tests, secrets, runbook" in calls[0][1]
+    assert "Gap summary: missing capability, закрыть блоки: code, policy, config, tests, secrets, runbook" in calls[0][1]
 
 
 def test_task_command_calendar_logs_detected_gaps_and_capabilities(monkeypatch):
@@ -1629,6 +1647,7 @@ def test_task_command_calendar_logs_detected_gaps_and_capabilities(monkeypatch):
         assert "### GAP: tests" in body
         assert "### GAP: secrets" in body
         assert "### GAP: runbook" in body
+        assert "capability частично реализована (calendar)" in body
         return 120, "https://github.com/o/r/issues/120"
 
     def fake_build_task_spec(request_text: str):
@@ -1668,6 +1687,7 @@ def test_task_command_calendar_logs_detected_gaps_and_capabilities(monkeypatch):
     assert response.status_code == 200
     assert len(calls) == 1
     assert "Обнаружены gaps: tests, secrets, runbook" in calls[0][1]
+    assert "Gap summary: partial capability, закрыть блоки: tests, secrets, runbook" in calls[0][1]
 
     task_audit = next(event for event in audits if event.get("event") == "telegram_task_open_issue")
     assert task_audit["matched_capabilities"] == ["calendar"]
