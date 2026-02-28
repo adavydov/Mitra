@@ -1,4 +1,4 @@
-name: gh-action-codex-issue-to-pr-v1
+name: Codex issue -> PR
 
 on:
   issues:
@@ -9,22 +9,27 @@ permissions:
   pull-requests: write
   issues: write
 
+concurrency:
+  group: codex-issue-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
 jobs:
   codex-issue-to-pr:
     if: github.event.label.name == 'mitra:codex'
     runs-on: ubuntu-latest
     env:
       # Comma-separated allowlists. Set repository Variables to override defaults.
-      MITRA_ALLOWED_ISSUE_AUTHORS: ${{ vars.MITRA_ALLOWED_ISSUE_AUTHORS != '' && vars.MITRA_ALLOWED_ISSUE_AUTHORS || github.repository_owner }}
-      MITRA_ALLOWED_LABELERS: ${{ vars.MITRA_ALLOWED_LABELERS != '' && vars.MITRA_ALLOWED_LABELERS || github.repository_owner }}
+      MITRA_ALLOWED_ISSUE_AUTHORS: ${{ vars.MITRA_ALLOWED_ISSUE_AUTHORS != '' && vars.MITRA_ALLOWED_ISSUE_AUTHORS || 'adavydov' }}
+      MITRA_ALLOWED_LABELERS: ${{ vars.MITRA_ALLOWED_LABELERS != '' && vars.MITRA_ALLOWED_LABELERS || 'adavydov' }}
       BASE_BRANCH: main
 
     steps:
-      - name: Gate trigger by allowlists
+      - name: Validate trigger allowlists and required secret
         id: gate
         env:
           ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
           LABELER: ${{ github.event.sender.login }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           set -euo pipefail
 
@@ -41,6 +46,11 @@ jobs:
             done
             return 1
           }
+
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "OPENAI_API_KEY is not configured. Add repository secret OPENAI_API_KEY to run openai/codex-action@v1."
+            exit 1
+          fi
 
           AUTHOR_OK=false
           LABELER_OK=false
@@ -79,10 +89,6 @@ jobs:
           body = os.getenv("ISSUE_BODY") or ""
           issue_url = os.getenv("ISSUE_URL", "")
 
-          # Prompt-injection hardening for issue text:
-          # - drop HTML tags/comments/scripts/styles
-          # - remove zero-width and other control chars
-          # - normalize whitespace and length
           body = re.sub(r"<!--.*?-->", " ", body, flags=re.S)
           body = re.sub(r"<script.*?>.*?</script>", " ", body, flags=re.S | re.I)
           body = re.sub(r"<style.*?>.*?</style>", " ", body, flags=re.S | re.I)
