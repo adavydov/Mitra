@@ -53,14 +53,22 @@ _THINK_SYSTEM_PROMPT = (
 
 HELP_TEXT = (
     "Commands: /status, /oauth_status, /search <query>, /research <query>, /think <prompt>, "
-    "/report <text>, /pr <title>\\n<spec>, /pr_status <issue#|pr#>, /evo_issue <n> [risk:R0-R3], /drive_check, /budget, "
+    "/report <text>, /pr <title>\\n<spec>, /task <request>, /pr_status <issue#|pr#>, /drive_check, /budget, "
     "/smoke, /smoke_deep"
 )
 
-_REFLECT_SYSTEM_PROMPT = (
-    "Ты MITRA EVO brain в режиме AL0: только гипотезы, без выполнения действий. "
-    "Верни EVO-0 отчёт на русском языке в markdown с разделами: "
-    "Краткая выжимка, Гипотезы (3-7 пунктов), Риски (R0-R3), Что тестировать, Не трогать."
+_TASK_SYSTEM_PROMPT = (
+    "Ты переводишь пользовательскую задачу в codex-ready спецификацию issue для GitHub. "
+    "Верни только JSON-объект с ключами: title, summary, components, required_env_secrets, "
+    "new_commands, acceptance_criteria, tests_to_add, risk_level. "
+    "components/new_commands/required_env_secrets/acceptance_criteria/tests_to_add должны быть массивами строк. "
+    "risk_level должен быть одним из R0,R1,R2,R3,R4. "
+    "required_env_secrets указывай только именами переменных без значений."
+)
+
+_TASK_EXAMPLE_HINT = (
+    "Тестовый кейс для полного цикла: /task Добавь команду /hello которая отвечает \"hello from mitra\" "
+    "и покрыта тестом."
 )
 
 
@@ -200,7 +208,7 @@ _COMMAND_POLICIES: dict[str, CommandPolicy] = {
     "/reports": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
     "/report": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
     "/pr_status": CommandPolicy(required_al="AL1", risk_level="R1", budget_category="search"),
-    "/evo_issue": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="search"),
+    "/task": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="github"),
     "/drive_check": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
     "/budget": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
     "/reflect": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
@@ -593,6 +601,163 @@ def _build_evo_issue_body(*, hypothesis: str, report_source: str, risk_level: st
 
 
 
+
+
+
+def _parse_task_command(text: str) -> str | None:
+    body = text[len("/task") :].strip()
+    return body or None
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    stripped = text.strip()
+    candidates = [stripped]
+    if "```" in stripped:
+        block_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, flags=re.DOTALL | re.IGNORECASE)
+        if block_match:
+            candidates.insert(0, block_match.group(1).strip())
+
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidates.append(stripped[start : end + 1])
+
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+
+    return None
+
+
+def _normalize_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    for item in value:
+        item_str = str(item).strip()
+        if item_str:
+            items.append(item_str)
+    return items
+
+
+def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = None) -> dict[str, Any]:
+    client = llm_client or AnthropicClient(max_tokens_out=900)
+    response = client.create_message(
+        messages=[{"role": "user", "content": request_text}],
+        system=_TASK_SYSTEM_PROMPT,
+    )
+    content = response.get("content")
+    text_blocks: list[str] = []
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    text_blocks.append(text.strip())
+
+    parsed = _extract_json_object("\n".join(text_blocks))
+    if not parsed:
+        raise ValueError("LLM did not return JSON spec")
+
+    risk_level = str(parsed.get("risk_level", "R2")).strip().upper()
+    if risk_level not in {"R0", "R1", "R2", "R3", "R4"}:
+        risk_level = "R2"
+
+    title = str(parsed.get("title", "")).strip()
+    summary = str(parsed.get("summary", "")).strip()
+    if not summary:
+        summary = request_text
+    if not title:
+        title = summary[:80] or "Task from Telegram"
+
+    return {
+        "title": title,
+        "summary": summary,
+        "components": _normalize_string_list(parsed.get("components")),
+        "required_env_secrets": _normalize_string_list(parsed.get("required_env_secrets")),
+        "new_commands": _normalize_string_list(parsed.get("new_commands")),
+        "acceptance_criteria": _normalize_string_list(parsed.get("acceptance_criteria")),
+        "tests_to_add": _normalize_string_list(parsed.get("tests_to_add")),
+        "risk_level": risk_level,
+    }
+
+
+def _render_task_issue(spec: dict[str, Any]) -> tuple[str, str]:
+    title = str(spec.get("title", "Task from Telegram")).strip()
+    summary = str(spec.get("summary", "")).strip()
+
+    def render_list(name: str, values: list[str]) -> list[str]:
+        lines = [f"## {name}"]
+        if not values:
+            lines.append("- (none)")
+        else:
+            lines.extend(f"- {value}" for value in values)
+        return lines
+
+    body_lines: list[str] = ["## Summary", summary or "(no summary)", ""]
+    body_lines.extend(render_list("Components/modules to add/change", spec.get("components", [])))
+    body_lines.append("")
+    body_lines.extend(render_list("Required env/secrets (names only)", spec.get("required_env_secrets", [])))
+    body_lines.append("")
+    body_lines.extend(render_list("New commands to add", spec.get("new_commands", [])))
+    body_lines.append("")
+    body_lines.extend(render_list("Acceptance criteria", spec.get("acceptance_criteria", [])))
+    body_lines.append("")
+    body_lines.extend(render_list("Tests to add", spec.get("tests_to_add", [])))
+    body_lines.append("")
+    body_lines.append(f"## Risk level\n- {spec.get('risk_level', 'R2')}")
+
+    return title, "\n".join(body_lines).strip()
+
+
+def _admin_chat_state_path() -> Path:
+    return Path(os.getenv("MITRA_ADMIN_CHAT_STATE_PATH", "state/admin_chat_id.txt"))
+
+
+def _save_admin_chat_id(chat_id: int) -> None:
+    path = _admin_chat_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(chat_id), encoding="utf-8")
+
+
+def _load_admin_chat_id() -> int | None:
+    env_value = os.getenv("TELEGRAM_ADMIN_CHAT_ID", "").strip()
+    if env_value:
+        try:
+            return int(env_value)
+        except ValueError:
+            logger.warning("invalid_telegram_admin_chat_id", extra={"value": env_value})
+
+    path = _admin_chat_state_path()
+    try:
+        persisted = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        logger.exception("failed_to_read_admin_chat_id")
+        return None
+
+    if not persisted:
+        return None
+
+    try:
+        return int(persisted)
+    except ValueError:
+        logger.warning("invalid_persisted_admin_chat_id", extra={"value": persisted})
+        return None
+
+
+def _remember_admin_chat_if_allowed(user_id: int | None, chat_id: int | None, allowed_user_ids: set[int]) -> None:
+    if chat_id is None or user_id is None or user_id not in allowed_user_ids:
+        return
+    try:
+        _save_admin_chat_id(chat_id=int(chat_id))
+    except (OSError, ValueError):
+        logger.exception("failed_to_persist_admin_chat_id", extra={"chat_id": chat_id})
 
 def _parse_pr_status_command(text: str) -> str | None:
     body = text[len("/pr_status") :].strip()
@@ -1104,6 +1269,37 @@ async def drive_check() -> dict[str, str]:
     return payload
 
 
+@app.post("/github/actions_callback")
+async def github_actions_callback(
+    payload: dict[str, Any],
+    x_mitra_actions_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    expected = os.getenv("GITHUB_ACTIONS_CALLBACK_TOKEN")
+    if not expected or x_mitra_actions_token != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    admin_chat_id = _load_admin_chat_id()
+    if admin_chat_id is None:
+        logger.warning("github_actions_callback_missing_admin_chat")
+        return {"status": "ok", "delivered": False}
+
+    event_name = str(payload.get("event") or "").strip().lower()
+    issue_number = payload.get("issue_number")
+    pr_number = payload.get("pr_number")
+    pr_url = payload.get("pr_url")
+    commit_sha = payload.get("commit_sha")
+
+    if event_name == "pr_opened":
+        text = f"PR открыт: #{pr_number} (issue #{issue_number})\n{pr_url}".strip()
+    elif event_name == "pr_merged":
+        text = f"PR смержен: #{pr_number}\ncommit: {commit_sha or '-'}"
+    else:
+        text = f"GitHub update: {json.dumps(payload, ensure_ascii=False)}"
+
+    await send_message(chat_id=admin_chat_id, text=text)
+    return {"status": "ok", "delivered": True}
+
+
 @app.post("/telegram/webhook")
 async def telegram_webhook(
     update: dict[str, Any],
@@ -1144,6 +1340,12 @@ async def telegram_webhook(
                 action_type=action_type,
             )
             return {"status": "ok"}
+
+        _remember_admin_chat_if_allowed(
+            user_id=user_id if isinstance(user_id, int) else None,
+            chat_id=chat_id if isinstance(chat_id, int) else None,
+            allowed_user_ids=allowed_user_ids,
+        )
 
         policy_bypass_commands = {"/status", "/oauth_status", "/whoami", "/help", "/start", "/smoke"}
         if allowlist_configured or action_type in policy_bypass_commands:
@@ -1470,10 +1672,52 @@ async def telegram_webhook(
                 reply_text = "Usage: /pr_status <issue#|pr#>"
             else:
                 reply_text = await _build_pr_status_reply(ref)
+        elif text.startswith("/task"):
+            request_text = _parse_task_command(text)
+            if not request_text:
+                reply_text = "Usage: /task <request>"
+            elif not _pr_rate_limiter.allow(user_id if isinstance(user_id, int) else None):
+                reply_text = "Rate limit exceeded: max 5 /task per hour"
+            else:
+                issue_number: int | None = None
+                try:
+                    spec = _build_task_spec(request_text)
+                    issue_title, issue_body = _render_task_issue(spec)
+                    issue_number, issue_url = await _create_github_issue(title=issue_title, body=issue_body)
+                    await budget_ledger.record_github_write()
+
+                    required_secrets = spec.get("required_env_secrets") or []
+                    expected_commands = spec.get("new_commands") or []
+                    lines = [f"Issue создан: {issue_url}"]
+                    if required_secrets:
+                        lines.append("Требуются ключи/доступы: " + ", ".join(required_secrets))
+                    if expected_commands:
+                        lines.append("Ожидаемая новая команда: " + ", ".join(expected_commands))
+                    lines.append(_TASK_EXAMPLE_HINT)
+                    reply_text = "\n".join(lines)
+                    outcome = "success"
+                except Exception:
+                    logger.exception("telegram_task_create_issue_failed")
+                    reply_text = "Failed to create task issue"
+                    outcome = "error"
+
+                _safe_audit_event(
+                    {
+                        "event": "telegram_task_open_issue",
+                        "action_id": action_id,
+                        "telegram_update_id": telegram_update_id,
+                        "user_id": user_id,
+                        "chat_id": chat_id,
+                        "action_type": "/task",
+                        "issue_number": issue_number,
+                        "outcome": outcome,
+                        "log_level": "info" if outcome == "success" else "error",
+                    }
+                )
         elif text.startswith("/pr"):
             parsed = _parse_pr_command(text)
             if not parsed:
-                reply_text = "Usage: /pr <title>\\n<spec>"
+                reply_text = "Usage: /pr <title>\n<spec>"
             elif not _pr_rate_limiter.allow(user_id if isinstance(user_id, int) else None):
                 reply_text = "Rate limit exceeded: max 5 /pr per hour"
                 _safe_audit_event(
