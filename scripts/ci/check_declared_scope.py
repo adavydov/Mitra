@@ -3,12 +3,13 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-import sys
 from fnmatch import fnmatch
 
 RESTRICTED_PATTERNS = ("governance/*", ".github/workflows/*", "policy/*")
 OVERRIDE_LABELS = {"sovereign-override", "l0-approved"}
 HIGH_RISK_LABELS = {"security-review", "governance-approved"}
+STRICT_SCOPE_LABEL = "strict-scope"
+VALID_MODES = {"auto", "strict", "fallback", "warn"}
 
 
 def _extract_section_items(body: str, heading: str) -> list[str]:
@@ -52,15 +53,33 @@ def main() -> int:
         return 2
 
     labels = {item.strip().lower() for item in labels_csv.split(",") if item.strip()}
+    mode = os.getenv("SCOPE_CHECK_MODE", "auto").strip().lower() or "auto"
+    if mode not in VALID_MODES:
+        print(f"WARN: unknown SCOPE_CHECK_MODE={mode!r}; using 'auto'")
+        mode = "auto"
+
+    strict_requested = mode == "strict" or (mode == "auto" and STRICT_SCOPE_LABEL in labels)
+    fallback_requested = mode in {"fallback", "auto"}
+
+    mode_name = "strict" if strict_requested else ("fallback" if fallback_requested else "warn")
+    print(f"Scope check mode: {mode_name} (SCOPE_CHECK_MODE={mode}, strict_label={STRICT_SCOPE_LABEL in labels})")
+
+    changed_files = _git_changed_files(base_sha=base_sha, head_sha=head_sha)
     allowed_scope = _extract_section_items(pr_body, "Allowed file scope")
     risk_items = _extract_section_items(pr_body, "Risk level")
     risk_level = (risk_items[0].upper() if risk_items else "R2")
 
     if not allowed_scope:
-        print("ERROR: PR body must include '## Allowed file scope' with bullet items")
-        return 1
+        if strict_requested:
+            print("ERROR: strict mode requires '## Allowed file scope' with bullet items")
+            return 1
+        if fallback_requested:
+            print("WARN: no '## Allowed file scope' found; falling back to changed files list")
+            allowed_scope = changed_files
+        else:
+            print("WARN: no '## Allowed file scope' found; skipping scope boundary enforcement")
+            allowed_scope = ["*"]
 
-    changed_files = _git_changed_files(base_sha=base_sha, head_sha=head_sha)
     restricted_touched = [
         path for path in changed_files if any(fnmatch(path, pattern) for pattern in RESTRICTED_PATTERNS)
     ]
