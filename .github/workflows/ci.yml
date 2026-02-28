@@ -2,8 +2,10 @@ name: ci
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   push:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   lint:
@@ -21,8 +23,8 @@ jobs:
       - run: python -m compileall -q mitra_app
       - run: echo "lint placeholder"
 
-  tests:
-    name: ci/tests
+  smoke:
+    name: ci/smoke
     runs-on: ubuntu-latest
     needs: [lint]
     env:
@@ -42,4 +44,25 @@ jobs:
       - run: pip install -r requirements-dev.txt
       - run: python -m py_compile mitra_app/*.py
       - run: python -c "import mitra_app.main; print('IMPORT_OK')"
+      - run: pytest -q tests/test_import_smoke.py
+
+  tests-full:
+    name: ci/tests-full
+    runs-on: ubuntu-latest
+    needs: [smoke]
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.ref == 'refs/heads/main' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-tests'))
+    env:
+      TELEGRAM_BOT_TOKEN: dummy
+      TELEGRAM_WEBHOOK_SECRET: dummy
+      PUBLIC_BASE_URL: https://example.com
+      ALLOWED_TELEGRAM_USER_IDS: "134988885"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
       - run: pytest -q
