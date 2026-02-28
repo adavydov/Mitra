@@ -21,7 +21,7 @@ def test_log_event_redacts_known_env_vars(monkeypatch, tmp_path, capsys):
     assert payload["api_key"] == "[REDACTED]"
     assert payload["nested"]["privateKey"] == "[REDACTED]"
 
-    written = (tmp_path / "audit" / "audit.jsonl").read_text(encoding="utf-8").strip()
+    written = (tmp_path / "audit" / "events.ndjson").read_text(encoding="utf-8").strip()
     assert "token-123" not in written
     assert "secret-456" not in written
 
@@ -47,7 +47,7 @@ def test_log_event_redacts_drive_keys_and_pem(monkeypatch, tmp_path):
     assert payload["service_account"] == "[REDACTED]"
     assert payload["pem_block"] == "[REDACTED]"
 
-    written = (tmp_path / "audit" / "audit.jsonl").read_text(encoding="utf-8").strip()
+    written = (tmp_path / "audit" / "events.ndjson").read_text(encoding="utf-8").strip()
     assert "b64-value" not in written
     assert "pem-value" not in written
     assert "-----BEGIN" not in written
