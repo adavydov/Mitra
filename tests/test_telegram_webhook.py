@@ -16,6 +16,7 @@ from mitra_app.main import (
     RecentUpdateDeduplicator,
     _build_pr_status_reply,
     _load_allowed_user_ids,
+    _parse_evo_issue_command,
     _parse_pr_or_issue_ref,
     app,
 )
@@ -157,7 +158,7 @@ def test_start_command_lists_search(monkeypatch):
         (
             123,
             "Commands: /status, /oauth_status, /search <query>, /research <query>, /think <prompt>, "
-            "/reflect, /report <text>, /pr <title>\\n<spec>, /pr_status <issue#|pr#>, /drive_check, /budget, /smoke, /smoke_deep",
+            "/report <text>, /pr <title>\\n<spec>, /pr_status <issue#|pr#>, /evo_issue <n> [risk:R0-R3], /drive_check, /budget, /smoke, /smoke_deep",
         )
     ]
 
@@ -1252,6 +1253,86 @@ def test_pr_command_audits_error_when_github_create_fails(monkeypatch):
     pr_audit = next(event for event in audits if event.get("event") == "telegram_pr_open_issue")
     assert pr_audit["issue_number"] is None
     assert pr_audit["outcome"] == "error"
+
+
+def test_parse_evo_issue_command_accepts_optional_risk_label():
+    assert _parse_evo_issue_command("/evo_issue 1") == (1, None)
+    assert _parse_evo_issue_command("/evo_issue 2 risk:R2") == (2, "risk:R2")
+    assert _parse_evo_issue_command("/evo_issue 2 R2") is None
+
+
+def test_evo_issue_command_creates_issue_with_template_and_labels(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+    audits = []
+
+    @dataclass
+    class FakeIssue:
+        number: int
+        html_url: str
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_create_issue(title: str, body: str, labels: list[str] | None = None):
+        assert title == "EVO hands: hypothesis 1 -> executable issue"
+        assert "## Acceptance criteria" in body
+        assert "## Tests required" in body
+        assert labels == ["mitra:codex", "risk:R2"]
+        return FakeIssue(number=91, html_url="https://github.com/o/r/issues/91")
+
+    def fake_log_event(event: dict[str, object]):
+        audits.append(event)
+
+    monkeypatch.setattr(
+        "mitra_app.main._load_last_evo0_report",
+        lambda: ("1. First hypothesis\n2. Second hypothesis", "reports/mitra_governance_hierarchy_v0.md"),
+    )
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.github.create_issue", fake_create_issue)
+    monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/evo_issue 1 risk:R2", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Created EVO issue: https://github.com/o/r/issues/91")]
+
+    evo_audit = next(event for event in audits if event.get("event") == "telegram_evo_issue")
+    assert evo_audit["issue_number"] == 91
+    assert evo_audit["outcome"] == "success"
+
+
+def test_evo_issue_command_returns_not_found_when_hypothesis_is_missing(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    monkeypatch.setattr(
+        "mitra_app.main._load_last_evo0_report",
+        lambda: ("1. First hypothesis", "reports/mitra_governance_hierarchy_v0.md"),
+    )
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/evo_issue 3", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Hypothesis #3 not found in latest EVO-0 report")]
 
 
 def test_report_oauth_expired_replies_with_reauthorize_message(monkeypatch, tmp_path):
