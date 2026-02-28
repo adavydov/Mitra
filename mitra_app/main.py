@@ -594,11 +594,11 @@ _task_dialog_state_by_chat: dict[int, TaskDialogState] = {}
 
 def _normalize_provider_name(raw: str) -> str:
     value = raw.strip().lower()
-    if value in {"github", "гитхаб"}:
+    if value in {"github", "гитхаб", "git", "gh", "гит"}:
         return "GitHub"
-    if value in {"jira", "джира"}:
+    if value in {"jira", "джира", "jr"}:
         return "Jira"
-    if value in {"linear"}:
+    if value in {"linear", "lin"}:
         return "Linear"
     return ""
 
@@ -2412,7 +2412,12 @@ async def telegram_webhook(
             text = _route_plain_text_command(text)
 
         action_type = text.split()[0] if isinstance(text, str) and text else "no_command"
-        if isinstance(text, str) and text.strip() and not text.strip().startswith("/"):
+        if (
+            isinstance(text, str)
+            and text.strip()
+            and not text.strip().startswith("/")
+            and pending_task_state is None
+        ):
             text = f"/task {text.strip()}"
             action_type = "/task"
             _safe_audit_event(

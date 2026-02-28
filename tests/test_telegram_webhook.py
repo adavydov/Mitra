@@ -1688,7 +1688,7 @@ def test_task_dialog_treats_slash_text_as_answer_until_required_fields_are_fille
         )
         assert response.status_code == 200
 
-    assert calls[0][1].startswith("Уточни provider")
+    assert calls[0][1].startswith("Уточни issue provider")
     assert calls[1] == (123, "Где брать credentials (источник секретов/доступов)?")
     assert calls[2] == (123, "Какие есть risk constraints (например max risk level, ограничения по данным/продакшену)?")
     assert calls[3] == (123, "Сформулируй success criteria (как поймём, что задача выполнена).")
@@ -1696,6 +1696,61 @@ def test_task_dialog_treats_slash_text_as_answer_until_required_fields_are_fille
     assert "Issue создан: https://github.com/o/r/issues/102" in calls[5][1]
     assert len(issue_calls) == 1
     assert 123 not in _task_dialog_state_by_chat
+
+
+def test_task_dialog_accepts_git_alias_for_issue_provider(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    _task_dialog_state_by_chat.clear()
+
+    calls = []
+    build_calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    def fake_build_task_spec(request_text: str):
+        build_calls.append(request_text)
+        return {
+            "title": "Добавить /hello",
+            "summary": "Добавить простую команду.",
+            "components": ["mitra_app/main.py"],
+            "required_env_secrets": [],
+            "new_commands": ["/hello"],
+            "acceptance_criteria": ["Команда /hello отвечает hello from mitra"],
+            "tests_to_add": ["tests/test_telegram_webhook.py"],
+            "risk_level": "R1",
+        }
+
+    async def fake_create_github_issue(title: str, body: str):
+        return 111, "https://github.com/o/r/issues/111"
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main._build_task_spec", fake_build_task_spec)
+    monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_github_issue)
+    monkeypatch.setattr("mitra_app.main._safe_audit_event", lambda *args, **kwargs: "{}")
+    monkeypatch.setattr("mitra_app.main._build_gap_summary", lambda *_args, **_kwargs: "", raising=False)
+    monkeypatch.setattr(
+        "mitra_app.main.detect_capability_gaps",
+        lambda *_args, **_kwargs: {"intents": [], "matched_capabilities": [], "gaps": []},
+    )
+
+    messages = ["/task Нужна новая команда", "git", "yandex", "в vault", "нет ограничений"]
+    for message in messages:
+        response = client.post(
+            "/telegram/webhook",
+            headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+            json={"message": {"text": message, "chat": {"id": 123}, "from": {"id": 123}}},
+        )
+        assert response.status_code == 200
+
+    assert calls[0] == (123, "Уточни issue provider: где создаём задачу (GitHub/Jira/Linear)?")
+    assert calls[1] == (123, "Какой integration provider используется в задаче (например Yandex/Google/Outlook)?")
+    assert calls[2] == (123, "Где брать credentials (источник секретов/доступов)?")
+    assert calls[3] == (123, "Какие есть risk constraints (например max risk level, ограничения по данным/продакшену)?")
+    assert len(build_calls) == 1
+    assert "- issue provider: GitHub" in build_calls[0]
 
 
 def test_task_dialog_does_not_fallback_unknown_command_while_active(monkeypatch):
@@ -1724,7 +1779,7 @@ def test_task_dialog_does_not_fallback_unknown_command_while_active(monkeypatch)
 
     assert start_response.status_code == 200
     assert slash_response.status_code == 200
-    assert calls[0][1].startswith("Уточни provider")
+    assert calls[0][1].startswith("Уточни issue provider")
     assert calls[1] == (123, "Где брать credentials (источник секретов/доступов)?")
     assert all(text != "Unknown command" for _, text in calls)
 
