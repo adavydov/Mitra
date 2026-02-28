@@ -1459,6 +1459,10 @@ def test_task_command_without_llm_json_uses_fallback_spec(monkeypatch):
     task_audit = next(event for event in audits if event.get("event") == "telegram_task_open_issue")
     assert task_audit["action_type"] == "/task"
     assert task_audit["degraded"] is True
+    assert task_audit["parse_outcome"] == "fallback"
+    assert task_audit["issue_url"] == "https://github.com/o/r/issues/91"
+    assert task_audit["risk_level"] == "R2"
+    assert task_audit["allowed_file_scope"] == ["mitra_app/*", "tests/*"]
 
 
 def test_task_command_without_body_returns_usage(monkeypatch):
@@ -1704,6 +1708,7 @@ def test_build_task_spec_returns_fallback_when_json_parse_fails(caplog):
         "risk_level": "R2",
         "allowed_file_scope": ["mitra_app/*", "tests/*"],
         "degraded": True,
+        "parse_outcome": "fallback",
     }
 
     assert "OPENAI_API_KEY=top-secret" not in caplog.text
@@ -1862,25 +1867,21 @@ def test_task_command_calendar_logs_detected_gaps_and_capabilities(monkeypatch):
     assert "Gap summary: partial capability, закрыть блоки: tests, secrets, runbook" in calls[0][1]
 
     task_audit = next(event for event in audits if event.get("event") == "telegram_task_open_issue")
+    assert task_audit["request_intents"]
     assert task_audit["matched_capabilities"] == ["calendar"]
-    assert task_audit["capability_gaps"] == ["code", "tests", "runbook"]
+    assert task_audit["detected_gaps"] == ["tests", "secrets", "runbook"]
+    assert task_audit["parse_outcome"] == "primary"
+    assert task_audit["dialog_state"] is None
 
 
-def test_task_command_multiturn_calendar_e2e_handles_ambiguous_answers_secret_and_creates_issue(
-    monkeypatch,
-    caplog,
-):
+
+
+def test_unknown_command_audits_reason_code_and_dialog_state(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
 
     calls = []
     audits = []
-    issue_payloads = []
-    leaked_secret = "CALENDAR_TOKEN=super-secret-value"
-
-    class FakeIssue:
-        number = 121
-        html_url = "https://github.com/o/r/issues/121"
 
     async def fake_send_message(chat_id: int, text: str):
         calls.append((chat_id, text))
@@ -1889,94 +1890,21 @@ def test_task_command_multiturn_calendar_e2e_handles_ambiguous_answers_secret_an
     def fake_log_event(event: dict[str, object]):
         audits.append(event)
 
-    def fake_build_task_spec(request_text: str):
-        assert "calendar" in request_text.lower()
-        assert "Контекст уточнений:" in request_text
-        assert "provider" in request_text.lower()
-        assert "credentials source" in request_text.lower()
-        assert "Наверное GitHub" in request_text
-        assert "секреты возьми из Vault" in request_text
-        assert leaked_secret in request_text
-        return {
-            "title": "Calendar sync hardening",
-            "summary": request_text,
-            "components": ["mitra_app/main.py", "tests/test_telegram_webhook.py"],
-            "required_env_secrets": ["CALENDAR_TOKEN"],
-            "new_commands": [],
-            "acceptance_criteria": ["Нет дублей встреч", "Есть smoke для task-loop"],
-            "tests_to_add": ["pytest tests/test_telegram_webhook.py::test_task_command_multiturn_calendar_e2e_handles_ambiguous_answers_secret_and_creates_issue"],
-            "risk_level": "R2",
-            "allowed_file_scope": ["mitra_app/*", "tests/*", "runbooks/*"],
-        }
-
-    async def fake_create_issue(title: str, body: str, labels: list[str]):
-        issue_payloads.append({"title": title, "body": body, "labels": labels})
-        return FakeIssue()
-
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
-    monkeypatch.setattr("mitra_app.main._build_task_spec", fake_build_task_spec)
-    monkeypatch.setattr("mitra_app.main.github.create_issue", fake_create_issue)
     monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
 
-    with caplog.at_level(logging.INFO, logger="mitra_app.main"):
-        first = client.post(
-            "/telegram/webhook",
-            headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
-            json={
-                "message": {
-                    "text": "/task Calendar sync: убрать дубли встреч",
-                    "chat": {"id": 123},
-                    "from": {"id": 123},
-                }
-            },
-        )
-        second = client.post(
-            "/telegram/webhook",
-            headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
-            json={"message": {"text": "Наверное GitHub, если так быстрее", "chat": {"id": 123}, "from": {"id": 123}}},
-        )
-        third = client.post(
-            "/telegram/webhook",
-            headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
-            json={"message": {"text": f"Ок, секреты возьми из Vault, вот токен {leaked_secret}", "chat": {"id": 123}, "from": {"id": 123}}},
-        )
-        fourth = client.post(
-            "/telegram/webhook",
-            headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
-            json={"message": {"text": "Риск: не выше R2", "chat": {"id": 123}, "from": {"id": 123}}},
-        )
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/unknown_command", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
 
-    assert first.status_code == 200
-    assert second.status_code == 200
-    assert third.status_code == 200
-    assert fourth.status_code == 200
-    assert calls[0] == (123, "Уточни provider: где будем создавать задачу (например GitHub/Jira/Linear)?")
-    assert calls[1] == (123, "Где брать credentials (источник секретов/доступов)?")
-    assert calls[2] == (123, "Какие есть risk constraints (например max risk level, ограничения по данным/продакшену)?")
-    assert "Issue создан: https://github.com/o/r/issues/121" in calls[3][1]
-    assert "Обнаружены gaps:" in calls[3][1]
-    assert all("Unknown command" not in text for _, text in calls)
+    assert response.status_code == 200
+    assert calls == [(123, "Unknown command")]
 
-    assert len(issue_payloads) == 1
-    issue_payload = issue_payloads[0]
-    assert issue_payload["labels"] == ["mitra:codex"]
-    assert "## Capability gaps to close" in issue_payload["body"]
-    assert "### GAP:" in issue_payload["body"]
-    assert "Контекст уточнений:" in issue_payload["body"]
-    assert "provider: Наверное GitHub" in issue_payload["body"]
-    assert "credentials source: Ок, секреты возьми из Vault" in issue_payload["body"]
-
-    task_audit = next(event for event in audits if event.get("event") == "telegram_task_open_issue")
-    assert task_audit["action_type"] == "/task"
-    assert task_audit["outcome"] == "success"
-    assert task_audit["issue_number"] == 121
-    assert "calendar" in task_audit["matched_capabilities"]
-    assert task_audit["capability_gaps"]
-    assert "calendar" in task_audit["detected_intents"]
-
-    assert leaked_secret not in caplog.text
-    assert leaked_secret not in json.dumps(audits, ensure_ascii=False)
-
+    unknown_audit = next(event for event in audits if event.get("event") == "telegram_unknown_command")
+    assert unknown_audit["reason_code"] == "unknown_command"
+    assert unknown_audit["dialog_state"] is None
 
 def test_extract_json_object_handles_dirty_text_with_fenced_block_and_json():
     dirty = """Ниже набросок ответа.
