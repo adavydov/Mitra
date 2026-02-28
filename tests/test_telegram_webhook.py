@@ -17,6 +17,7 @@ from mitra_app.main import (
     HELP_TEXT,
     RecentUpdateDeduplicator,
     _COMMAND_POLICIES,
+    _REFLECT_SYSTEM_PROMPT,
     _build_task_spec,
     _build_pr_status_reply,
     _extract_think_prompt,
