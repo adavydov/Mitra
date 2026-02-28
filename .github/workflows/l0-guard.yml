@@ -2,7 +2,7 @@ name: L0 Guard
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened]
 
 jobs:
   l0-guard:
