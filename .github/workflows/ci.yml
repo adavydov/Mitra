@@ -21,6 +21,11 @@ jobs:
     name: ci/tests
     runs-on: ubuntu-latest
     needs: [lint]
+    env:
+      TELEGRAM_BOT_TOKEN: dummy
+      TELEGRAM_WEBHOOK_SECRET: dummy
+      PUBLIC_BASE_URL: https://example.com
+      ALLOWED_TELEGRAM_USER_IDS: "134988885"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -28,4 +33,5 @@ jobs:
           python-version: '3.11'
       - run: pip install -r requirements.txt
       - run: python -m py_compile mitra_app/*.py
+      - run: python -c "import mitra_app.main; print('IMPORT_OK')"
       - run: pytest -q

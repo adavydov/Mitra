@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 _THINK_PROMPT_MAX_CHARS = 1200
 _THINK_OUTPUT_MAX_CHARS = 900
-_GOAL_PREVIEW_MAX_CHARS = 500
+_GOAL_PREVIEW_MAX_CHARS = 160
 _SECRET_ENV_NAME_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|PRIVATE|API_KEY|ACCESS_KEY|CLIENT_SECRET)", re.IGNORECASE)
 _THINK_SYSTEM_PROMPT = (
     "Ты помощник в режиме /think. Нужен только анализ текста пользователя без внешних действий. "
@@ -78,6 +78,14 @@ _TASK_EXAMPLE_HINT = (
     "Тестовый кейс для полного цикла: /task Добавь команду /hello которая отвечает \"hello from mitra\" "
     "и покрыта тестом."
 )
+
+
+_REFLECT_SYSTEM_PROMPT = (
+    "Ты формируешь только EVO-0 отчёт для человека-оператора в режиме AL0. "
+    "Не выполняй действия, не вызывай инструменты и не предлагай автозапуски. "
+    "Верни только итоговый отчёт без chain-of-thought."
+)
+
 
 
 def _sensitive_env_names() -> set[str]:
