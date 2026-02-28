@@ -1599,7 +1599,7 @@ def test_task_command_includes_gap_sections_in_issue_body(monkeypatch):
         headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
         json={
             "message": {
-                "text": "/task Добавить новую способность CRM с синхронизацией",
+                "text": "/task Добавить новую способность CRM с синхронизацией в Jira, секреты в env, риск R2, команда должна отдавать статус CRM, дедлайн 2026-02-10",
                 "chat": {"id": 123},
                 "from": {"id": 123},
             }
@@ -1610,6 +1610,68 @@ def test_task_command_includes_gap_sections_in_issue_body(monkeypatch):
     assert len(calls) == 1
     assert "Issue создан: https://github.com/o/r/issues/109" in calls[0][1]
     assert "Обнаружены gaps: code, policy, config, tests, secrets, runbook" in calls[0][1]
+
+
+def test_task_command_calendar_logs_detected_gaps_and_capabilities(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+    audits = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_create_github_issue(title: str, body: str):
+        assert title == "Calendar sync hardening"
+        assert "## Capability gaps to close" in body
+        assert "### GAP: tests" in body
+        assert "### GAP: secrets" in body
+        assert "### GAP: runbook" in body
+        return 120, "https://github.com/o/r/issues/120"
+
+    def fake_build_task_spec(request_text: str):
+        assert "calendar" in request_text.lower()
+        return {
+            "title": "Calendar sync hardening",
+            "summary": "Улучшить обработку calendar webhooks.",
+            "components": ["mitra_app/main.py"],
+            "required_env_secrets": [],
+            "new_commands": [],
+            "acceptance_criteria": ["Calendar workflow стабилен"],
+            "tests_to_add": ["tests/test_telegram_webhook.py"],
+            "risk_level": "R2",
+            "allowed_file_scope": ["mitra_app/*", "tests/*"],
+        }
+
+    def fake_log_event(event: dict[str, object]):
+        audits.append(event)
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main._build_task_spec", fake_build_task_spec)
+    monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_github_issue)
+    monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={
+            "message": {
+                "text": "/task Improve calendar sync in Jira, secrets in env, risk R2, acceptance criteria: no duplicate meetings, deadline 2026-03-01",
+                "chat": {"id": 123},
+                "from": {"id": 123},
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert "Обнаружены gaps: tests, secrets, runbook" in calls[0][1]
+
+    task_audit = next(event for event in audits if event.get("event") == "telegram_task_open_issue")
+    assert task_audit["matched_capabilities"] == ["calendar"]
+    assert task_audit["capability_gaps"] == ["tests", "secrets", "runbook"]
 
 
 def test_extract_json_object_handles_dirty_text_with_fenced_block_and_json():
