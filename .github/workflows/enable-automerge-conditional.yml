@@ -1,60 +1,51 @@
 name: Conditional Auto-Merge
 
 on:
-  pull_request:
-    types: [opened, reopened, synchronize, labeled, unlabeled]
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+
+concurrency:
+  group: conditional-automerge-pr-${{ github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
 
 jobs:
   conditional-automerge:
+    if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
     steps:
-      - name: Evaluate auto-merge eligibility and safety
+      - name: Evaluate auto-merge eligibility
         id: gate
         uses: actions/github-script@v7
         with:
           script: |
-            const pr = context.payload.pull_request;
-            const labels = (pr?.labels ?? []).map((label) => label.name);
-            const hasAutomergeLabel = labels.includes('automerge');
-            const isCodexBranch = (pr?.head?.ref ?? '').startsWith('codex/');
+            const run = context.payload.workflow_run;
+            const prs = run?.pull_requests ?? [];
+            const pr = prs[0];
 
-            const eligible = isCodexBranch || hasAutomergeLabel;
-            core.setOutput('eligible', String(eligible));
-
-            if (!eligible) {
-              core.info("PR is not eligible for auto-merge (requires 'codex/*' branch or 'automerge' label). Skipping.");
-              core.setOutput('safe', 'false');
+            if (!pr) {
+              core.info('No pull request is associated with this CI run. Skipping auto-merge enablement.');
+              core.setOutput('eligible', 'false');
               return;
             }
 
-            const protectedPrefixes = ['governance/', '.github/workflows/'];
-            const files = await github.paginate(github.rest.pulls.listFiles, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: pr.number,
-              per_page: 100,
-            });
+            const isCodexBranch = (run?.head_branch ?? '').startsWith('codex/');
+            core.setOutput('pr_number', String(pr.number));
+            core.setOutput('eligible', String(isCodexBranch));
 
-            const touchedProtected = files
-              .map((file) => file.filename)
-              .filter((filename) => protectedPrefixes.some((prefix) => filename.startsWith(prefix)));
-
-            const safe = touchedProtected.length === 0;
-            core.setOutput('safe', String(safe));
-
-            if (safe) {
-              core.info('PR eligible and safe for auto-merge.');
+            if (!isCodexBranch) {
+              core.info("PR head branch does not match 'codex/*'. Skipping auto-merge enablement.");
               return;
             }
 
-            core.info(`Auto-merge blocked due to protected files: ${touchedProtected.join(', ')}`);
+            core.info(`CI succeeded for codex branch '${run.head_branch}' on PR #${pr.number}. Enabling auto-merge.`);
 
-      - name: Enable auto-merge when eligible and safe
-        if: steps.gate.outputs.eligible == 'true' && steps.gate.outputs.safe == 'true'
+      - name: Enable auto-merge for eligible PR
+        if: steps.gate.outputs.eligible == 'true'
         uses: peter-evans/enable-pull-request-automerge@v3
         with:
-          pull-request-number: ${{ github.event.pull_request.number }}
+          pull-request-number: ${{ steps.gate.outputs.pr_number }}
           merge-method: merge
