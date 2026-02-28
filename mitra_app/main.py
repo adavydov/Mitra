@@ -84,6 +84,10 @@ _TASK_EXAMPLE_HINT = (
     "и покрыта тестом."
 )
 
+_CAPABILITY_CATALOG_PATH = Path(__file__).resolve().parents[1] / "capabilities" / "catalog.json"
+_CAPABILITY_GAP_TYPES = ("code", "policy", "config", "tests", "secrets", "runbook")
+_INTENT_TOKEN_RE = re.compile(r"[a-zA-Zа-яА-Я0-9_\-/]{3,}")
+
 
 _REFLECT_SYSTEM_PROMPT = (
     "Ты формируешь только EVO-0 отчёт для человека-оператора в режиме AL0. "
@@ -722,6 +726,89 @@ def _build_task_parse_diagnostics(content: Any) -> dict[str, Any]:
     return diagnostics
 
 
+def _load_capability_catalog() -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(_CAPABILITY_CATALOG_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        logger.warning("capability_catalog_unavailable", extra={"path": str(_CAPABILITY_CATALOG_PATH)})
+        return []
+
+    if not isinstance(payload, list):
+        logger.warning("capability_catalog_invalid_shape", extra={"path": str(_CAPABILITY_CATALOG_PATH)})
+        return []
+    return [entry for entry in payload if isinstance(entry, dict)]
+
+
+def _extract_intents_from_request(request_text: str) -> set[str]:
+    lowered = request_text.lower()
+    intents: set[str] = set(_INTENT_TOKEN_RE.findall(lowered))
+
+    intent_hints = {
+        "нов": "new_capability",
+        "способ": "new_capability",
+        "ability": "new_capability",
+        "capability": "new_capability",
+        "github": "github",
+        "issue": "github",
+        "search": "search",
+        "web": "search",
+        "telegram": "telegram",
+        "webhook": "telegram",
+        "drive": "drive",
+        "calendar": "calendar",
+        "report": "reporting",
+    }
+    for marker, intent in intent_hints.items():
+        if marker in lowered:
+            intents.add(intent)
+    return intents
+
+
+def detect_capability_gaps(request_text: str) -> dict[str, Any]:
+    intents = _extract_intents_from_request(request_text)
+    catalog = _load_capability_catalog()
+
+    matched: list[dict[str, Any]] = []
+    for capability in catalog:
+        capability_intents = {str(item).lower() for item in capability.get("intents", []) if str(item).strip()}
+        if capability_intents.intersection(intents):
+            matched.append(capability)
+
+    if not matched:
+        return {
+            "intents": sorted(intents),
+            "matched_capabilities": [],
+            "gaps": list(_CAPABILITY_GAP_TYPES),
+        }
+
+    has_policy = any(cap.get("policies") for cap in matched)
+    has_tests = any(cap.get("tests") for cap in matched)
+    has_secrets = any(cap.get("required_env") for cap in matched)
+    has_code = any(cap.get("tools") for cap in matched)
+    has_config = any(cap.get("tools") or cap.get("required_env") for cap in matched)
+    has_runbook = any((Path(__file__).resolve().parents[1] / "runbooks" / f"{cap.get('id', '')}.md").exists() for cap in matched)
+
+    gaps: list[str] = []
+    if not has_code:
+        gaps.append("code")
+    if not has_policy:
+        gaps.append("policy")
+    if not has_config:
+        gaps.append("config")
+    if not has_tests:
+        gaps.append("tests")
+    if not has_secrets:
+        gaps.append("secrets")
+    if not has_runbook:
+        gaps.append("runbook")
+
+    return {
+        "intents": sorted(intents),
+        "matched_capabilities": [str(cap.get("id", "unknown")) for cap in matched],
+        "gaps": gaps,
+    }
+
+
 def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = None) -> dict[str, Any]:
     client = llm_client or AnthropicClient(max_tokens_out=900)
     response = client.create_message(
@@ -736,6 +823,8 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
                 text = block.get("text")
                 if isinstance(text, str) and text.strip():
                     text_blocks.append(text.strip())
+
+    parse_diagnostics = _build_task_parse_diagnostics(content)
 
     parsed = _extract_json_object("\n".join(text_blocks))
     if not parsed:
@@ -766,7 +855,7 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
         parsed = _extract_json_object("\n".join(retry_text_blocks))
         if not parsed:
             logger.warning(
-                "task_spec_fallback_used",
+                "task_spec_degraded_json_parse_failed",
                 extra={
                     "parse_outcome": "fallback_used",
                     "primary_parse": parse_diagnostics,
@@ -832,6 +921,18 @@ def _render_task_issue(spec: dict[str, Any]) -> tuple[str, str]:
     body_lines.extend(render_list("Tests to add", spec.get("tests_to_add", [])))
     body_lines.append("")
     body_lines.append(f"## Risk level\n- {spec.get('risk_level', 'R2')}")
+
+    capability_gaps = [str(item) for item in spec.get("capability_gaps", []) if str(item).strip()]
+    if capability_gaps:
+        body_lines.append("")
+        body_lines.append("## Capability gaps to close")
+        body_lines.append("Заполнить каждый раздел ниже перед началом реализации.")
+        for gap in capability_gaps:
+            body_lines.append("")
+            body_lines.append(f"### GAP: {gap}")
+            body_lines.append("- Context:")
+            body_lines.append("- Proposed change:")
+            body_lines.append("- Validation:")
 
     return title, "\n".join(body_lines).strip()
 
@@ -1804,8 +1905,10 @@ async def telegram_webhook(
                 issue_number: int | None = None
                 degraded = False
                 try:
+                    gap_detection = detect_capability_gaps(request_text)
                     spec = _build_task_spec(request_text)
                     degraded = bool(spec.get("degraded"))
+                    spec["capability_gaps"] = gap_detection.get("gaps", [])
                     issue_title, issue_body = _render_task_issue(spec)
                     issue_number, issue_url = await _create_github_issue(title=issue_title, body=issue_body)
                     await budget_ledger.record_github_write()
@@ -1819,6 +1922,8 @@ async def telegram_webhook(
                         lines.append("Ожидаемая новая команда: " + ", ".join(expected_commands))
                     if degraded:
                         lines.append("Spec auto-filled from request (LLM JSON parse failed)")
+                    if gap_detection.get("gaps"):
+                        lines.append("Обнаружены gaps: " + ", ".join(gap_detection["gaps"]))
                     lines.append(_TASK_EXAMPLE_HINT)
                     reply_text = "\n".join(lines)
                     outcome = "degraded" if degraded else "success"
