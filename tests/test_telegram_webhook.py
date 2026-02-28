@@ -1972,6 +1972,7 @@ def test_command_policies_cover_supported_webhook_commands():
         "/research",
         "/report",
         "/pr_status",
+        "/tasks",
         "/task",
         "/pr",
         "/evo_issue",

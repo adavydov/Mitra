@@ -3,6 +3,7 @@ import hashlib
 import logging
 import os
 import re
+import asyncio
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -36,6 +37,7 @@ from mitra_app.research import ResearchError, build_research_reply, run_research
 from mitra_app.telegram import ensure_webhook, send_message
 from mitra_app.search import SearchRateLimitExceeded, brave_web_search, format_search_results
 from mitra_app import github
+from mitra_app.task_tracker import TaskTrackerStore, TrackedTask
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
@@ -55,7 +57,7 @@ _THINK_SYSTEM_PROMPT = (
 
 HELP_TEXT = (
     "Commands: /status, /oauth_status, /search <query>, /research <query>, /think <prompt>, "
-    "/report <text>, /pr <title>\\n<spec>, /task <request>, /pr_status <issue#|pr#>, /drive_check, /budget, "
+    "/report <text>, /pr <title>\\n<spec>, /task <request>, /tasks, /pr_status <issue#|pr#>, /drive_check, /budget, "
     "/smoke, /smoke_deep"
 )
 
@@ -269,6 +271,7 @@ _COMMAND_POLICIES: dict[str, CommandPolicy] = {
     "/research": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="llm"),
     "/report": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
     "/pr_status": CommandPolicy(required_al="AL1", risk_level="R1", budget_category="search"),
+    "/tasks": CommandPolicy(required_al="AL1", risk_level="R1", budget_category="search"),
     "/task": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="github"),
     "/pr": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="github"),
     "/evo_issue": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="github"),
@@ -360,6 +363,7 @@ def _enforce_command_policy(
 
 @app.on_event("startup")
 async def startup_sync_webhook() -> None:
+    global _task_watcher_task
     try:
         if budget_ledger:
             await budget_ledger.load()
@@ -376,6 +380,23 @@ async def startup_sync_webhook() -> None:
             logger.warning("startup_webhook_sync_failed", extra={"detail": detail})
     except Exception:
         logger.exception("startup_webhook_sync_failed")
+
+    if _task_watcher_task is None:
+        _task_watcher_task = asyncio.create_task(_task_watcher_loop())
+
+
+@app.on_event("shutdown")
+async def shutdown_background_tasks() -> None:
+    global _task_watcher_task
+    if _task_watcher_task is None:
+        return
+    _task_watcher_task.cancel()
+    try:
+        await _task_watcher_task
+    except asyncio.CancelledError:
+        pass
+    finally:
+        _task_watcher_task = None
 
 
 class RecentUpdateDeduplicator:
@@ -423,6 +444,72 @@ class PerUserRateLimiter:
 
 
 _pr_rate_limiter = PerUserRateLimiter(limit=5, window_seconds=3600)
+
+_TASK_TRACKER_STATE_PATH = Path(os.getenv("TRACKED_TASKS_STATE_PATH", "state/tracked_tasks.json"))
+_TASK_WATCHER_INTERVAL_SECONDS = int(os.getenv("TASK_WATCHER_INTERVAL_SECONDS", "60"))
+_task_tracker = TaskTrackerStore(_TASK_TRACKER_STATE_PATH)
+_task_watcher_task: asyncio.Task[None] | None = None
+
+
+def _derive_watcher_state(
+    linked_pr: github.GitHubLinkedPullRequest | None,
+    pr_status: github.GitHubPullRequestStatus | None,
+) -> str:
+    if linked_pr is None:
+        return "waiting_for_pr"
+    if pr_status is None:
+        return "linked_pr"
+    if pr_status.merged:
+        return "pr_merged"
+    if pr_status.state == "closed":
+        return "pr_closed"
+    if pr_status.draft:
+        return "pr_draft"
+    return f"pr_{pr_status.state or 'unknown'}"
+
+
+def _build_watcher_message(
+    task: TrackedTask,
+    state: str,
+    linked_pr: github.GitHubLinkedPullRequest | None,
+    pr_status: github.GitHubPullRequestStatus | None,
+) -> str:
+    issue_line = f"Task watcher: issue #{task.issue_number}"
+    if state == "waiting_for_pr":
+        return f"{issue_line}\nСтатус: PR пока не найден"
+    if linked_pr is None:
+        return f"{issue_line}\nСтатус: неизвестно"
+    if pr_status is None:
+        return f"{issue_line}\nPR найден: #{linked_pr.number} {linked_pr.html_url}"
+    return (
+        f"{issue_line}\n"
+        f"PR: #{pr_status.number} {pr_status.html_url}\n"
+        f"State: {state}"
+    )
+
+
+async def _run_task_watcher_iteration() -> None:
+    tracked_tasks = _task_tracker.load()
+    for task in tracked_tasks:
+        try:
+            linked_pr = await github.find_linked_pr(task.issue_number)
+            pr_status = await github.get_pr_status(linked_pr.number) if linked_pr is not None else None
+            state = _derive_watcher_state(linked_pr, pr_status)
+            if state == task.last_notified_state:
+                continue
+            await send_message(
+                chat_id=task.chat_id,
+                text=_build_watcher_message(task=task, state=state, linked_pr=linked_pr, pr_status=pr_status),
+            )
+            _task_tracker.update_last_notified_state(task.issue_number, state)
+        except Exception:
+            logger.exception("task_watcher_iteration_failed", extra={"issue_number": task.issue_number})
+
+
+async def _task_watcher_loop() -> None:
+    while True:
+        await _run_task_watcher_iteration()
+        await asyncio.sleep(max(5, _TASK_WATCHER_INTERVAL_SECONDS))
 
 
 @dataclass
@@ -1138,6 +1225,18 @@ def _remember_admin_chat_if_allowed(user_id: int | None, chat_id: int | None, al
 def _parse_pr_status_command(text: str) -> str | None:
     body = text[len("/pr_status") :].strip()
     return body or None
+
+
+def _build_tasks_reply() -> str:
+    tracked_tasks = _task_tracker.load()
+    if not tracked_tasks:
+        return "Активных задач нет"
+
+    lines = ["Активные задачи:"]
+    for task in tracked_tasks:
+        state = task.last_notified_state or "new"
+        lines.append(f"- issue #{task.issue_number} — {state} (chat_id={task.chat_id})")
+    return "\n".join(lines)
 
 
 def _parse_pr_or_issue_ref(ref: str) -> tuple[str, int] | None:
@@ -1904,6 +2003,8 @@ async def telegram_webhook(
                     issue_title, issue_body = _render_task_issue(spec)
                     issue_number, issue_url = await _create_github_issue(title=issue_title, body=issue_body)
                     await budget_ledger.record_github_write()
+                    if isinstance(chat_id, int):
+                        _task_tracker.add(issue_number=issue_number, chat_id=chat_id)
 
                     required_secrets = spec.get("required_env_secrets") or []
                     expected_commands = spec.get("new_commands") or []
@@ -2255,6 +2356,8 @@ async def telegram_webhook(
                 reply_text = "Usage: /pr_status <issue#|pr#>"
             else:
                 reply_text = await _build_pr_status_reply(ref)
+        elif text.startswith("/tasks"):
+            reply_text = _build_tasks_reply()
         elif text.startswith("/task"):
             request_text = _parse_task_command(text)
             if not request_text:
@@ -2286,6 +2389,8 @@ async def telegram_webhook(
                         issue_title, issue_body = _render_task_issue(spec)
                         issue_number, issue_url = await _create_github_issue(title=issue_title, body=issue_body)
                         await budget_ledger.record_github_write()
+                        if isinstance(chat_id, int):
+                            _task_tracker.add(issue_number=issue_number, chat_id=chat_id)
 
                         required_secrets = spec.get("required_env_secrets") or []
                         expected_commands = spec.get("new_commands") or []
