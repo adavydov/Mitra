@@ -21,6 +21,7 @@ from mitra_app.main import (
     _extract_json_object,
     _build_task_spec,
     _build_pr_status_reply,
+    _render_task_issue,
     _extract_think_prompt,
     _load_allowed_user_ids,
     _parse_evo_issue_command,
@@ -1420,6 +1421,83 @@ def test_task_command_without_body_returns_usage(monkeypatch):
     assert calls == [(123, "Usage: /task <request>")]
 
 
+def test_task_command_new_capability_does_not_create_issue_when_mandatory_sections_empty(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+    create_called = False
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    def fake_build_task_spec(request_text: str):
+        assert request_text
+        return {
+            "title": "Новая capability",
+            "summary": "Добавить новую capability",
+            "components": ["mitra_app/main.py"],
+            "required_env_secrets": [],
+            "new_commands": ["/hello"],
+            "acceptance_criteria": ["Команда существует"],
+            "tests_to_add": ["pytest tests/test_telegram_webhook.py"],
+            "risk_level": "R2",
+            "task_type": "new capability",
+            "missing_capabilities": [],
+            "required_code_changes": ["mitra_app/main.py"],
+            "policy_config_updates": ["policy/merge_rules.md"],
+            "acceptance_checks": [],
+            "rollback_safety": [],
+        }
+
+    async def fake_create_github_issue(title: str, body: str):
+        nonlocal create_called
+        create_called = True
+        return 1, "https://github.com/o/r/issues/1"
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main._build_task_spec", fake_build_task_spec)
+    monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_github_issue)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/task Добавь capability", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert create_called is False
+    assert len(calls) == 1
+    assert "Task issue not created" in calls[0][1]
+    assert "Missing capabilities" in calls[0][1]
+
+
+def test_render_task_issue_includes_new_capability_sections_and_ci_block():
+    title, body = _render_task_issue(
+        {
+            "title": "Add new capability",
+            "summary": "Introduce hello",
+            "task_type": "new capability",
+            "missing_capabilities": ["Missing /hello command"],
+            "required_code_changes": ["mitra_app/main.py"],
+            "policy_config_updates": ["config/autonomy.json"],
+            "acceptance_checks": ["pytest tests/test_telegram_webhook.py -k task"],
+            "rollback_safety": ["Revert the /hello handler"],
+        }
+    )
+
+    assert title == "Add new capability"
+    assert "## Missing capabilities" in body
+    assert "## Required code changes (paths/modules)" in body
+    assert "## Policy/config updates" in body
+    assert "## Acceptance checks" in body
+    assert "## Rollback/safety" in body
+    assert "## CI completeness block" in body
+    assert '"task_type": "new capability"' in body
+    assert '"mandatory_sections_complete": true' in body
+
+
 def test_build_task_spec_returns_fallback_when_json_parse_fails(caplog):
     class FakeClient:
         def create_message(self, *, messages, system):
@@ -1442,11 +1520,17 @@ def test_build_task_spec_returns_fallback_when_json_parse_fails(caplog):
         "acceptance_criteria": [],
         "tests_to_add": [],
         "risk_level": "R2",
+        "task_type": "maintenance",
+        "missing_capabilities": [],
+        "required_code_changes": [],
+        "policy_config_updates": [],
+        "acceptance_checks": [],
+        "rollback_safety": [],
         "degraded": True,
     }
 
     assert "OPENAI_API_KEY=top-secret" not in caplog.text
-    assert any(rec.message == "task_spec_degraded_json_parse_failed" for rec in caplog.records)
+    assert any(rec.message == "task_spec_fallback_used" for rec in caplog.records)
 
 
 def test_build_task_spec_returns_fallback_when_multiple_non_json_text_blocks_returned(caplog):
@@ -1464,7 +1548,7 @@ def test_build_task_spec_returns_fallback_when_multiple_non_json_text_blocks_ret
 
     assert spec["degraded"] is True
     assert spec["summary"] == "Нужен fallback"
-    assert any(rec.message == "task_spec_degraded_json_parse_failed" for rec in caplog.records)
+    assert any(rec.message == "task_spec_fallback_used" for rec in caplog.records)
 
 
 def test_extract_json_object_handles_dirty_text_with_fenced_block_and_json():
