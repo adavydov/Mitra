@@ -1980,6 +1980,7 @@ def test_command_policies_cover_supported_webhook_commands():
         "/budget",
         "/help",
         "/start",
+        "/autoevo",
     }
 
     assert supported_action_types == set(_COMMAND_POLICIES)
