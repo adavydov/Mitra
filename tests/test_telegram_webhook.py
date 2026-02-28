@@ -17,6 +17,7 @@ from mitra_app.main import (
     HELP_TEXT,
     RecentUpdateDeduplicator,
     _COMMAND_POLICIES,
+    _build_task_spec,
     _build_pr_status_reply,
     _extract_think_prompt,
     _load_allowed_user_ids,
@@ -1342,6 +1343,26 @@ def test_task_command_without_body_returns_usage(monkeypatch):
 
     assert response.status_code == 200
     assert calls == [(123, "Usage: /task <request>")]
+
+
+def test_build_task_spec_logs_warning_with_diagnostics_on_non_json_response(caplog):
+    class FakeClient:
+        def create_message(self, *, messages, system):
+            return {
+                "content": [
+                    {"type": "thinking", "thinking": "internal"},
+                    {"type": "text", "text": "Not JSON. OPENAI_API_KEY=top-secret"},
+                ]
+            }
+
+    with caplog.at_level(logging.WARNING, logger="mitra_app.main"):
+        with pytest.raises(ValueError, match="LLM did not return JSON spec"):
+            _build_task_spec("Сделай команду /hello", llm_client=FakeClient())
+
+    record = next(rec for rec in caplog.records if rec.message == "task_spec_parse_failed")
+    assert record.content_type == "list"
+    assert record.block_types == ["thinking", "text"]
+    assert record.text_previews == ["Not JSON. OPENAI_API_KEY=[REDACTED]"]
 
 
 def test_github_actions_callback_posts_to_admin_chat(monkeypatch):
