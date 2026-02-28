@@ -15,6 +15,14 @@ Required evals: EVAL-SEC-TOOLCALL-01
 - IF AL/Risk ниже требуемых порогов THEN deny.
 - ELSE allow только для разрешённых инструментов.
 
+## Scope control matrix
+
+| Scope class | Path patterns | Default decision | Required approval labels |
+|---|---|---|---|
+| Auto-allowed paths | `mitra_app/*`, `tests/*`, `src/*` | allow | `mitra:codex` |
+| Restricted paths | `governance/*`, `.github/workflows/*`, `policy/*` | deny unless override | `sovereign-override` (или `l0-approved`) |
+| High-risk changes | `Risk level` = `R3`/`R4` или изменение restricted paths | pending approval | `security-review` + `governance-approved` |
+
 ## GitHub token controls
 - Разрешён только `repo`-scoped токен (или fine-grained эквивалент с доступом к одному репозиторию).
 - Принцип минимальных прав: 

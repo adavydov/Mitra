@@ -8,6 +8,24 @@ on:
   workflow_dispatch:
 
 jobs:
+  scope-check:
+    name: ci/scope-check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python scripts/ci/check_declared_scope.py
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
   lint:
     name: ci/lint
     runs-on: ubuntu-latest
@@ -26,7 +44,7 @@ jobs:
   smoke:
     name: ci/smoke
     runs-on: ubuntu-latest
-    needs: [lint]
+    needs: [scope-check, lint]
     env:
       TELEGRAM_BOT_TOKEN: dummy
       TELEGRAM_WEBHOOK_SECRET: dummy

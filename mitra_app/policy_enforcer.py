@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
 _AL_ORDER = ["AL0", "AL1", "AL2", "AL3", "AL4"]
 _RISK_ORDER = ["R0", "R1", "R2", "R3", "R4"]
+_DEFAULT_RESTRICTED_SCOPE = ("governance/*", ".github/workflows/*", "policy/*")
+_DEFAULT_OVERRIDE_LABELS = ("sovereign-override", "l0-approved")
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,34 @@ class CommandPolicyEnforcer:
                 allowed=False,
                 reason=_required_gate_message(policy),
             )
+
+        return EnforcementDecision(allowed=True)
+
+    def enforce_file_scope(
+        self,
+        *,
+        changed_paths: Iterable[str],
+        allowed_scope: Iterable[str],
+        labels: Iterable[str] | None = None,
+    ) -> EnforcementDecision:
+        scope_patterns = tuple(pattern.strip() for pattern in allowed_scope if pattern and pattern.strip())
+        changed = tuple(path.strip() for path in changed_paths if path and path.strip())
+        normalized_labels = {str(label).strip().lower() for label in (labels or []) if str(label).strip()}
+
+        for changed_path in changed:
+            if any(fnmatch(changed_path, pattern) for pattern in _DEFAULT_RESTRICTED_SCOPE):
+                if normalized_labels.intersection(_DEFAULT_OVERRIDE_LABELS):
+                    continue
+                return EnforcementDecision(
+                    allowed=False,
+                    reason=f"Denied: restricted scope requires override ({changed_path})",
+                )
+
+            if scope_patterns and not any(fnmatch(changed_path, pattern) for pattern in scope_patterns):
+                return EnforcementDecision(
+                    allowed=False,
+                    reason=f"Denied: path out of allowed scope ({changed_path})",
+                )
 
         return EnforcementDecision(allowed=True)
 

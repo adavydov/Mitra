@@ -130,3 +130,16 @@ def test_policy_enforcer_denies_when_budget_category_limit_is_zero(tmp_path):
 
     assert decision.allowed is False
     assert decision.reason == "Denied: requires AL2/R2"
+
+
+def test_policy_enforcer_denies_restricted_scope_without_override_label(tmp_path):
+    enforcer = _make_enforcer(tmp_path, al2_max_risk="R2", llm_budget=10)
+
+    decision = enforcer.enforce_file_scope(
+        changed_paths=["governance/constitution.md"],
+        allowed_scope=["mitra_app/*", "tests/*"],
+        labels=["mitra:codex"],
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "Denied: restricted scope requires override (governance/constitution.md)"

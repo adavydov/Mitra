@@ -62,8 +62,8 @@ HELP_TEXT = (
 _TASK_SYSTEM_PROMPT = (
     "Ты переводишь пользовательскую задачу в codex-ready спецификацию issue для GitHub. "
     "Верни только JSON-объект с ключами: title, summary, components, required_env_secrets, "
-    "new_commands, acceptance_criteria, tests_to_add, risk_level. "
-    "components/new_commands/required_env_secrets/acceptance_criteria/tests_to_add должны быть массивами строк. "
+    "new_commands, acceptance_criteria, tests_to_add, risk_level, allowed_file_scope. "
+    "components/new_commands/required_env_secrets/acceptance_criteria/tests_to_add/allowed_file_scope должны быть массивами строк. "
     "risk_level должен быть одним из R0,R1,R2,R3,R4. "
     "required_env_secrets указывай только именами переменных без значений."
 )
@@ -73,8 +73,8 @@ _TASK_RETRY_SYSTEM_PROMPT = (
     "Ответь строго одним валидным JSON-объектом и ничем больше. "
     "Запрещены markdown-блоки, комментарии, пояснения, префиксы/суффиксы текста. "
     "Ключи JSON: title, summary, components, required_env_secrets, new_commands, "
-    "acceptance_criteria, tests_to_add, risk_level. "
-    "components/new_commands/required_env_secrets/acceptance_criteria/tests_to_add — массивы строк. "
+    "acceptance_criteria, tests_to_add, risk_level, allowed_file_scope. "
+    "components/new_commands/required_env_secrets/acceptance_criteria/tests_to_add/allowed_file_scope — массивы строк. "
     "risk_level — одно из R0,R1,R2,R3,R4. "
     "required_env_secrets указывай только именами переменных без значений."
 )
@@ -691,6 +691,7 @@ def _build_fallback_task_spec(request_text: str) -> dict[str, Any]:
         "acceptance_criteria": [],
         "tests_to_add": [],
         "risk_level": "R2",
+        "allowed_file_scope": ["mitra_app/*", "tests/*"],
         "degraded": True,
     }
 
@@ -737,6 +738,7 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
                 if isinstance(text, str) and text.strip():
                     text_blocks.append(text.strip())
 
+    parse_diagnostics = _build_task_parse_diagnostics(content)
     parsed = _extract_json_object("\n".join(text_blocks))
     if not parsed:
         logger.warning("task_spec_parse_primary_failed", extra=parse_diagnostics)
@@ -773,6 +775,7 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
                     "retry_parse": retry_diagnostics,
                 },
             )
+            logger.warning("task_spec_degraded_json_parse_failed")
             return _build_fallback_task_spec(request_text)
 
         logger.info(
@@ -804,6 +807,7 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
         "acceptance_criteria": _normalize_string_list(parsed.get("acceptance_criteria")),
         "tests_to_add": _normalize_string_list(parsed.get("tests_to_add")),
         "risk_level": risk_level,
+        "allowed_file_scope": _normalize_string_list(parsed.get("allowed_file_scope")) or ["mitra_app/*", "tests/*"],
         "degraded": False,
     }
 
@@ -832,6 +836,8 @@ def _render_task_issue(spec: dict[str, Any]) -> tuple[str, str]:
     body_lines.extend(render_list("Tests to add", spec.get("tests_to_add", [])))
     body_lines.append("")
     body_lines.append(f"## Risk level\n- {spec.get('risk_level', 'R2')}")
+    body_lines.append("")
+    body_lines.extend(render_list("Allowed file scope", spec.get("allowed_file_scope", ["mitra_app/*", "tests/*"])))
 
     return title, "\n".join(body_lines).strip()
 
