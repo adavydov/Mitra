@@ -44,6 +44,18 @@ _THINK_PROMPT_MAX_CHARS = 1200
 _THINK_OUTPUT_MAX_CHARS = 900
 _GOAL_PREVIEW_MAX_CHARS = 160
 _SECRET_ENV_NAME_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|PRIVATE|API_KEY|ACCESS_KEY|CLIENT_SECRET)", re.IGNORECASE)
+_PROBABLE_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?i)client[ _-]?secret\s*[:=]\s*[^\s,;]{6,}"),
+    re.compile(r"(?i)oauth[ _-]?token\s*[:=]\s*[^\s,;]{8,}"),
+    re.compile(r"(?i)(?:api|access|private)[ _-]?key\s*[:=]\s*[^\s,;]{8,}"),
+    re.compile(r"\beyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9._-]{10,}\.[a-zA-Z0-9._-]{10,}\b"),
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|(?=[A-Za-z0-9+/_-]{32,}\b)(?=.*[A-Za-z])(?=.*\\d)[A-Za-z0-9+/_-]{32,})\b"),
+)
+_SECRET_STORE_GUIDANCE = (
+    "Похоже, в сообщении есть секрет (token/key/client secret). "
+    "Я не обрабатываю секреты в Telegram. Передайте значение через approved secret store "
+    "и пришлите только имя секрета/переменной (например, GITHUB_TOKEN)."
+)
 _THINK_SYSTEM_PROMPT = (
     "Ты помощник в режиме /think. Нужен только анализ текста пользователя без внешних действий. "
     "Не используйте веб, GitHub, Drive, интеграции, инструменты или вызовы функций. "
@@ -122,6 +134,14 @@ _FAILURE_REASON_TO_GAP: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(lint|format|type check|mypy|ruff|black)\b", re.IGNORECASE), "quality_gate"),
 ]
 
+
+
+def _contains_probable_secret(text: str) -> bool:
+    sanitized = text.strip()
+    if not sanitized:
+        return False
+
+    return any(pattern.search(sanitized) for pattern in _PROBABLE_SECRET_PATTERNS)
 
 
 def _sensitive_env_names() -> set[str]:
@@ -1952,6 +1972,23 @@ async def telegram_webhook(
                 if chat_id is not None:
                     await send_message(chat_id=chat_id, text=deny_reason)
                 return {"status": "ok"}
+
+        if isinstance(text, str) and _contains_probable_secret(text):
+            _safe_audit_event(
+                {
+                    "event": "telegram_secret_detected",
+                    "action_id": action_id,
+                    "telegram_update_id": telegram_update_id,
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "action_type": action_type,
+                    "outcome": "blocked",
+                    "log_level": "warning",
+                }
+            )
+            if chat_id is not None:
+                await send_message(chat_id=chat_id, text=_SECRET_STORE_GUIDANCE)
+            return {"status": "ok"}
 
         pending_task_state = _task_dialog_state_by_chat.get(chat_id) if isinstance(chat_id, int) else None
         if pending_task_state is not None and isinstance(text, str) and text.strip():
