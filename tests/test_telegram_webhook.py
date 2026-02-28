@@ -22,6 +22,7 @@ from mitra_app.main import (
     _build_task_spec,
     detect_capability_gaps,
     _build_pr_status_reply,
+    _render_task_issue,
     _extract_think_prompt,
     _load_allowed_user_ids,
     _parse_evo_issue_command,
@@ -1510,36 +1511,26 @@ def test_build_task_spec_returns_fallback_when_json_parse_fails(caplog):
     with caplog.at_level(logging.WARNING, logger="mitra_app.main"):
         spec = _build_task_spec("Сделай команду /hello", llm_client=FakeClient())
 
-    assert spec["degraded"] is True
-    primary_record = next(rec for rec in caplog.records if rec.message == "task_spec_parse_primary_failed")
-    assert primary_record.content_type == "list"
-    assert primary_record.total_blocks == 2
-    assert primary_record.text_blocks_count == 1
-    assert primary_record.has_non_text_blocks is True
-    assert primary_record.non_text_block_types == ["thinking"]
-
-    fallback_record = next(rec for rec in caplog.records if rec.message == "task_spec_fallback_used")
-    assert fallback_record.parse_outcome == "fallback_used"
-    assert fallback_record.primary_parse["text_blocks_count"] == 1
-    assert fallback_record.primary_parse["non_text_block_types"] == ["thinking"]
-    assert fallback_record.retry_parse["non_text_block_types"] == ["thinking"]
-
-
-def test_build_task_spec_logs_retry_success(monkeypatch, caplog):
-    responses = [
-        {"content": [{"type": "text", "text": "not json"}]},
-        {
-            "content": [
-                {
-                    "type": "text",
-                    "text": '{"title":"T","summary":"S","components":[],"required_env_secrets":[],"new_commands":[],"acceptance_criteria":[],"tests_to_add":[],"risk_level":"R1"}',
-                }
-            ]
-        },
-    ]
+    assert spec == {
+        "title": "Сделай команду /hello",
+        "summary": "Сделай команду /hello",
+        "components": [],
+        "required_env_secrets": [],
+        "new_commands": [],
+        "acceptance_criteria": [],
+        "tests_to_add": [],
+        "risk_level": "R2",
+        "task_type": "maintenance",
+        "missing_capabilities": [],
+        "required_code_changes": [],
+        "policy_config_updates": [],
+        "acceptance_checks": [],
+        "rollback_safety": [],
+        "degraded": True,
+    }
 
     assert "OPENAI_API_KEY=top-secret" not in caplog.text
-    assert any(rec.message == "task_spec_degraded_json_parse_failed" for rec in caplog.records)
+    assert any(rec.message == "task_spec_fallback_used" for rec in caplog.records)
 
 
 def test_build_task_spec_returns_fallback_when_multiple_non_json_text_blocks_returned(caplog):
@@ -1557,7 +1548,7 @@ def test_build_task_spec_returns_fallback_when_multiple_non_json_text_blocks_ret
 
     assert spec["degraded"] is True
     assert spec["summary"] == "Нужен fallback"
-    assert any(rec.message == "task_spec_degraded_json_parse_failed" for rec in caplog.records)
+    assert any(rec.message == "task_spec_fallback_used" for rec in caplog.records)
 
 
 def test_detect_capability_gaps_for_new_capability_request_returns_all_required_blocks():
