@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass
 
 import httpx
+import pytest
 
 import httplib2
 from googleapiclient.errors import HttpError
@@ -13,7 +14,9 @@ from fastapi.testclient import TestClient
 
 from mitra_app.drive import DriveNotConfiguredError, DriveUploadResult, OAuthRefreshInvalidGrant
 from mitra_app.main import (
+    HELP_TEXT,
     RecentUpdateDeduplicator,
+    _COMMAND_POLICIES,
     _build_pr_status_reply,
     _load_allowed_user_ids,
     _parse_evo_issue_command,
@@ -1459,6 +1462,117 @@ def test_research_returns_search_results_and_summary(monkeypatch):
     assert "Top 5 results" in calls[0][1]
     assert "Что нашёл:" in calls[0][1]
     assert "/report <text>" in calls[0][1]
+
+
+
+def test_command_policies_cover_supported_webhook_commands():
+    supported_action_types = {
+        "/status",
+        "/smoke_deep",
+        "/smoke",
+        "/oauth_status",
+        "/whoami",
+        "/search",
+        "/llm_check",
+        "/goal",
+        "/goal set",
+        "/think",
+        "/reflect",
+        "/reports",
+        "/research",
+        "/report",
+        "/pr_status",
+        "/task",
+        "/pr",
+        "/evo_issue",
+        "/drive_check",
+        "/budget_reset_day",
+        "/budget",
+        "/help",
+        "/start",
+    }
+
+    assert supported_action_types == set(_COMMAND_POLICIES)
+
+    help_commands = {token for token in HELP_TEXT.split() if token.startswith("/")}
+    normalized_help_commands = {token.split("\n")[0].rstrip(",") for token in help_commands}
+    assert normalized_help_commands <= supported_action_types
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/search ai",
+        "/research ai",
+        "/pr Title\nSpec",
+        "/think plan",
+        "/goal set Improve MTTR",
+        "/llm_check",
+        "/evo_issue 1",
+        "/budget_reset_day",
+    ],
+)
+def test_policy_denies_synced_commands_before_handler(monkeypatch, text):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    def fake_enforce(*, current_al: str, policy):
+        return type("Decision", (), {"allowed": False, "reason": "Denied: requires AL2/R2"})()
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main._policy_enforcer.enforce", fake_enforce)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": text, "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Denied: requires AL2/R2")]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_reply"),
+    [
+        ("/search ai", "Search not configured"),
+        ("/research", "Usage: /research <query>"),
+        ("/pr", "Usage: /pr <title>\n<spec>"),
+        ("/evo_issue", "Usage: /evo_issue <n> [risk:R0-R3]"),
+        ("/budget_reset_day", "Forbidden"),
+    ],
+)
+def test_policy_allows_synced_commands(monkeypatch, text, expected_reply):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    def fake_enforce(*, current_al: str, policy):
+        return type("Decision", (), {"allowed": True, "reason": None})()
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main._policy_enforcer.enforce", fake_enforce)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": text, "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, expected_reply)]
 
 
 def test_policy_enforcement_exception_never_crashes_webhook(monkeypatch):
