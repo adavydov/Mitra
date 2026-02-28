@@ -53,11 +53,15 @@ _THINK_SYSTEM_PROMPT = (
 
 HELP_TEXT = (
     "Commands: /status, /oauth_status, /search <query>, /research <query>, /think <prompt>, "
-    "/goal, /goal set <text>, /report <text>, /pr <title>\\n<spec>, /pr_status <issue#|pr#>, /drive_check, /budget, "
+    "/reflect, /report <text>, /pr <title>\\n<spec>, /pr_status <issue#|pr#>, /drive_check, /budget, "
     "/smoke, /smoke_deep"
 )
 
-_GOAL_PREVIEW_MAX_CHARS = 500
+_REFLECT_SYSTEM_PROMPT = (
+    "Ты MITRA EVO brain в режиме AL0: только гипотезы, без выполнения действий. "
+    "Верни EVO-0 отчёт на русском языке в markdown с разделами: "
+    "Краткая выжимка, Гипотезы (3-7 пунктов), Риски (R0-R3), Что тестировать, Не трогать."
+)
 
 
 def _sensitive_env_names() -> set[str]:
@@ -198,8 +202,7 @@ _COMMAND_POLICIES: dict[str, CommandPolicy] = {
     "/pr_status": CommandPolicy(required_al="AL1", risk_level="R1", budget_category="search"),
     "/drive_check": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
     "/budget": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
-    "/goal": CommandPolicy(required_al="AL1", risk_level="R1", budget_category="drive"),
-    "/goal set": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
+    "/reflect": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
 }
 
 _policy_enforcer = CommandPolicyEnforcer(Path(__file__).resolve().parents[1])
@@ -688,6 +691,138 @@ def _sanitize_research_error(exc: Exception) -> str:
     return "Research failed"
 
 
+def _final_only_sanitize(text: str) -> str:
+    sanitized = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    sanitized = re.sub(r"</?thinking>", "", sanitized, flags=re.IGNORECASE)
+    return sanitized.strip()
+
+
+def _extract_llm_text(response: dict[str, Any]) -> str:
+    content = response.get("content")
+    if not isinstance(content, list):
+        return ""
+
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+    return "\n".join(parts).strip()
+
+
+def _audit_log_path() -> str:
+    return os.getenv("MITRA_AUDIT_LOG", "audit/audit.jsonl")
+
+
+def _load_recent_audit_events(limit: int = 12) -> list[dict[str, Any]]:
+    path = Path(_audit_log_path())
+    if not path.exists():
+        return []
+
+    events: list[dict[str, Any]] = []
+    for raw_line in reversed(path.read_text(encoding="utf-8").splitlines()):
+        if len(events) >= limit:
+            break
+        try:
+            payload = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            events.append(payload)
+    events.reverse()
+    return events
+
+
+def _load_current_goal() -> str:
+    env_goal = os.getenv("MITRA_CURRENT_GOAL", "").strip()
+    if env_goal:
+        return env_goal
+
+    for event in reversed(_load_recent_audit_events(limit=60)):
+        for key in ("goal", "current_goal"):
+            value = event.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return "Goal is not set. Use /goal in PR-1 flow."
+
+
+def _deploy_revision_hint() -> str:
+    for env_name in ("MITRA_DEPLOY_VERSION", "MITRA_DEPLOY_COMMIT", "GIT_COMMIT"):
+        value = os.getenv(env_name, "").strip()
+        if value:
+            return value
+    return "unknown"
+
+
+def _build_reflect_prompt(goal: str, audit_events: list[dict[str, Any]], budget_status: str) -> str:
+    events_preview = json.dumps(audit_events, ensure_ascii=False, indent=2)
+    return (
+        "Собери EVO-0 отчёт по входным фактам.\n"
+        f"Текущая цель:\n{goal}\n\n"
+        f"Последние audit-события:\n{events_preview}\n\n"
+        f"Статус бюджета:\n{budget_status}\n\n"
+        f"Версия/коммит деплоя: {_deploy_revision_hint()}\n\n"
+        "Требования:\n"
+        "1) Дай 3-7 гипотез улучшения.\n"
+        "2) Для каждой: польза, риск (R0-R3), что тестировать.\n"
+        "3) Добавь раздел 'Не трогать' (например governance/*).\n"
+        "4) Только предложения; ничего не выполнять."
+    )
+
+
+def _extract_summary_points(report_text: str, *, min_items: int = 3, max_items: int = 7) -> list[str]:
+    candidates: list[str] = []
+    for line in report_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        cleaned = re.sub(r"^[-*•]\s+", "", stripped)
+        cleaned = re.sub(r"^\d+[\.)]\s+", "", cleaned)
+        if cleaned != stripped or re.match(r"^Гипотеза\s*\d+", cleaned, flags=re.IGNORECASE):
+            candidates.append(cleaned)
+        if len(candidates) >= max_items:
+            break
+
+    while len(candidates) < min_items:
+        candidates.append("Гипотеза: уточнить узкое место по последним аудит-событиям и проверить на dry-run.")
+    return candidates[:max_items]
+
+
+async def _run_reflect() -> tuple[str, str, str]:
+    goal = _load_current_goal()
+    audit_events = _load_recent_audit_events(limit=12)
+    budget_status = await budget_ledger.render_budget()
+    prompt = _build_reflect_prompt(goal, audit_events, budget_status)
+
+    payload = AnthropicClient(max_tokens_out=1200).create_message(
+        messages=[{"role": "user", "content": prompt}],
+        system=_REFLECT_SYSTEM_PROMPT,
+    )
+    await budget_ledger.record_llm_usage(payload.get("usage") if isinstance(payload, dict) else None)
+
+    report = _final_only_sanitize(_extract_llm_text(payload))
+    if not report:
+        report = "# EVO-0\n\nГипотеза 1: Уточнить целевой KPI и baseline."
+
+    summary_points = _extract_summary_points(report)
+    summary = "\n".join(f"- {point}" for point in summary_points)
+
+    title = f"mitra-evo0-reflect {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}"
+    full_report = (
+        "# EVO-0 report\n\n"
+        f"## Goal\n{goal}\n\n"
+        f"## Budget\n{budget_status}\n\n"
+        f"## Model output\n{report}\n"
+    )
+    upload = await upload_markdown(title=title, markdown_body=full_report)
+    await budget_ledger.record_drive_write()
+    link = upload.web_view_link or upload.file_id
+
+    reply = _final_only_sanitize(f"EVO-0 hypotheses:\n{summary}\n\nDrive: {link}")
+    return reply, upload.file_id, link
+
+
 def _audit_drive_check(user_id: int | None, chat_id: int | None, auth_mode: str, outcome: str, detail: str) -> None:
     event = {
         "event": "drive_check",
@@ -1065,6 +1200,34 @@ async def telegram_webhook(
                     logger.exception("think_command_failed")
                     reply_text = "Не удалось получить ответ LLM для /think"
                     _audit_think_command(action_id=action_id, user_id=user_id, command="/think", outcome="error")
+        elif text.startswith("/reflect"):
+            file_id = ""
+            try:
+                reply_text, file_id, link = await _run_reflect()
+                log_report_event(
+                    action_id=action_id,
+                    telegram_update_id=telegram_update_id,
+                    file_id=file_id,
+                    outcome="success",
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    link=link,
+                    action_type="/reflect",
+                    log_level="info",
+                )
+            except Exception as exc:
+                logger.exception("reflect_command_failed")
+                reply_text = _sanitize_report_error(exc)
+                log_report_event(
+                    action_id=action_id,
+                    telegram_update_id=telegram_update_id,
+                    file_id=file_id,
+                    outcome="error",
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    action_type="/reflect",
+                    log_level="error",
+                )
         elif text.startswith("/reports"):
             try:
                 files = await list_recent_files(limit=5)
