@@ -4,7 +4,7 @@ import logging
 import os
 import re
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 import time
@@ -93,6 +93,18 @@ _REFLECT_SYSTEM_PROMPT = (
     "Не выполняй действия, не вызывай инструменты и не предлагай автозапуски. "
     "Верни только итоговый отчёт без chain-of-thought."
 )
+
+_CAPABILITY_GAPS_REPORT_PATH = "reports/capability_gaps.md"
+_GAP_REPEAT_THRESHOLD = 3
+_GAP_REPEAT_WINDOW_DAYS = 14
+
+_FAILURE_REASON_TO_GAP: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\b(test|pytest|unit test|integration test|assert)\b", re.IGNORECASE), "tests_missing"),
+    (re.compile(r"\b(policy|permission|allowlist|forbidden|unauthorized|compliance)\b", re.IGNORECASE), "policy_mismatch"),
+    (re.compile(r"\b(env|secret|token|key|credential|missing variable|not configured)\b", re.IGNORECASE), "env_missing"),
+    (re.compile(r"\b(timeout|flaky|race|intermittent|network|connection reset)\b", re.IGNORECASE), "infra_instability"),
+    (re.compile(r"\b(lint|format|type check|mypy|ruff|black)\b", re.IGNORECASE), "quality_gate"),
+]
 
 
 
@@ -1044,6 +1056,93 @@ async def _build_pr_status_reply(ref: str) -> str:
     )
 
 
+def _map_failure_reason_to_gap(failure_reason: str) -> str:
+    reason = failure_reason.strip()
+    if not reason:
+        return "unknown"
+
+    for pattern, gap_type in _FAILURE_REASON_TO_GAP:
+        if pattern.search(reason):
+            return gap_type
+    return "other"
+
+
+def _append_capability_gap_report(*, pr_number: int, pr_url: str, failure_reason: str, gap_type: str) -> None:
+    path = Path(_CAPABILITY_GAPS_REPORT_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text(
+            "# Capability gaps\n\n"
+            "Автогенерируемый backlog повторяющихся провалов PR/CI.\n\n"
+            "| Timestamp (UTC) | PR | Gap type | Failure reason |\n"
+            "|---|---:|---|---|\n",
+            encoding="utf-8",
+        )
+
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    reason_cell = failure_reason.replace("\n", " ").strip() or "unspecified"
+    row = f"| {timestamp} | [#{pr_number}]({pr_url}) | `{gap_type}` | {reason_cell} |\n"
+    with path.open("a", encoding="utf-8") as report_file:
+        report_file.write(row)
+
+
+def _count_recent_gap_failures(gap_type: str, *, pr_number: int | None = None) -> int:
+    since = datetime.now(timezone.utc) - timedelta(days=_GAP_REPEAT_WINDOW_DAYS)
+    count = 0
+    for event in _load_recent_audit_events(limit=400):
+        if event.get("event") != "github_pr_ci_status":
+            continue
+        if event.get("outcome") != "failed":
+            continue
+        if event.get("gap_type") != gap_type:
+            continue
+
+        event_ts = event.get("timestamp")
+        if isinstance(event_ts, str):
+            try:
+                parsed_ts = datetime.fromisoformat(event_ts.replace("Z", "+00:00"))
+            except ValueError:
+                parsed_ts = None
+            if parsed_ts and parsed_ts.tzinfo is not None and parsed_ts < since:
+                continue
+
+        if pr_number is not None and event.get("pr_number") != pr_number:
+            continue
+        count += 1
+    return count
+
+
+def _build_gap_issue_template(*, gap_type: str, failure_reason: str, pr_number: int) -> str:
+    return (
+        "``\n"
+        f"/task Root-cause fix для gap `{gap_type}` после провалов CI в PR #{pr_number}.\n"
+        "Контекст:\n"
+        f"- Симптом: {failure_reason or 'unspecified'}\n"
+        "- Требуется устранить корневую причину, а не только починить текущий PR.\n"
+        "Acceptance criteria:\n"
+        "1) Добавлен guardrail/валидация на этапе до CI.\n"
+        "2) Добавлены тесты, воспроизводящие прошлый провал.\n"
+        "3) Обновлена документация/политика при необходимости.\n"
+        "4) В audit фиксируется снижение повторов по этому gap.\n"
+        "``"
+    )
+
+
+async def _poll_pr_ci_snapshot(pr_number: int) -> tuple[str, str, github.GitHubPullRequestStatus | None, github.GitHubChecksSummary | None]:
+    try:
+        pr_status = await github.get_pr_status(pr_number)
+        checks = await github.get_pr_checks_summary(pr_status.head_sha)
+    except Exception:
+        logger.exception("pr_ci_poll_failed", extra={"pr_number": pr_number})
+        return "unknown", "", None, None
+
+    if checks.failed > 0:
+        return "failed", "ci_checks_failed", pr_status, checks
+    if checks.pending > 0:
+        return "pending", "checks_pending", pr_status, checks
+    return "passed", "", pr_status, checks
+
+
 def _load_allowed_user_ids() -> set[int]:
     raw = os.getenv("ALLOWED_TELEGRAM_USER_IDS", "")
     allowed: set[int] = set()
@@ -1213,7 +1312,7 @@ def _extract_llm_text(response: dict[str, Any]) -> str:
 
 
 def _audit_log_path() -> str:
-    return os.getenv("MITRA_AUDIT_LOG", "audit/audit.jsonl")
+    return os.getenv("MITRA_AUDIT_LOG", "audit/events.ndjson")
 
 
 def _load_recent_audit_events(limit: int = 12) -> list[dict[str, Any]]:
@@ -1505,14 +1604,70 @@ async def github_actions_callback(
 
     event_name = str(payload.get("event") or "").strip().lower()
     issue_number = payload.get("issue_number")
-    pr_number = payload.get("pr_number")
-    pr_url = payload.get("pr_url")
+    raw_pr_number = payload.get("pr_number")
+    pr_number = int(raw_pr_number) if isinstance(raw_pr_number, int) or (isinstance(raw_pr_number, str) and raw_pr_number.isdigit()) else None
+    pr_url = str(payload.get("pr_url") or "").strip()
     commit_sha = payload.get("commit_sha")
+    conclusion = str(payload.get("conclusion") or "").strip().lower()
+    failure_reason = str(payload.get("failure_reason") or "").strip()
+
+    polled_status: github.GitHubPullRequestStatus | None = None
+    polled_checks: github.GitHubChecksSummary | None = None
+    polled_outcome = "unknown"
+    if pr_number is not None:
+        polled_outcome, polled_reason, polled_status, polled_checks = await _poll_pr_ci_snapshot(pr_number)
+        if not failure_reason and polled_outcome == "failed":
+            failure_reason = polled_reason
+        if not pr_url and polled_status is not None:
+            pr_url = polled_status.html_url
+
+    failed_conclusions = {"failure", "cancelled", "timed_out", "action_required", "startup_failure"}
+    is_failed = event_name in {"ci_failed", "pr_failed"} or conclusion in failed_conclusions or polled_outcome == "failed"
+    gap_type = _map_failure_reason_to_gap(failure_reason) if is_failed else "none"
+
+    _safe_audit_event(
+        {
+            "event": "github_pr_ci_status",
+            "source": "github_actions_callback",
+            "action_type": "github/pr_ci_status",
+            "issue_number": issue_number,
+            "pr_number": pr_number,
+            "pr_url": pr_url,
+            "commit_sha": commit_sha,
+            "event_name": event_name,
+            "conclusion": conclusion,
+            "outcome": "failed" if is_failed else (polled_outcome if polled_outcome != "unknown" else "updated"),
+            "failure_reason": failure_reason,
+            "gap_type": gap_type,
+            "checks": None
+            if polled_checks is None
+            else {
+                "total": polled_checks.total,
+                "successful": polled_checks.successful,
+                "failed": polled_checks.failed,
+                "pending": polled_checks.pending,
+            },
+            "log_level": "warning" if is_failed else "info",
+        }
+    )
 
     if event_name == "pr_opened":
         text = f"PR открыт: #{pr_number} (issue #{issue_number})\n{pr_url}".strip()
     elif event_name == "pr_merged":
         text = f"PR смержен: #{pr_number}\ncommit: {commit_sha or '-'}"
+    elif is_failed:
+        reason_text = failure_reason or "ci_failure"
+        text = f"CI/PR провал: #{pr_number or '?'}\nGap: {gap_type}\nReason: {reason_text}"
+        if pr_number is not None and pr_url:
+            _append_capability_gap_report(pr_number=pr_number, pr_url=pr_url, failure_reason=reason_text, gap_type=gap_type)
+            repeat_count = _count_recent_gap_failures(gap_type, pr_number=pr_number)
+            if repeat_count >= _GAP_REPEAT_THRESHOLD:
+                text += (
+                    "\n\nПовторяющийся провал. Предложенный /task шаблон:\n"
+                    + _build_gap_issue_template(gap_type=gap_type, failure_reason=reason_text, pr_number=pr_number)
+                )
+    elif event_name in {"ci_success", "pr_checks_passed"} or conclusion == "success" or polled_outcome == "passed":
+        text = f"CI зелёный: #{pr_number or '?'}\n{pr_url}".strip()
     else:
         text = f"GitHub update: {json.dumps(payload, ensure_ascii=False)}"
 
