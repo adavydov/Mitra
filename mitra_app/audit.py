@@ -8,6 +8,13 @@ import re
 
 _SENSITIVE_KEY_RE = re.compile(r"(token|secret|password|private|api[_-]?key|access[_-]?key)", re.IGNORECASE)
 _PEM_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----", re.IGNORECASE)
+_CREDENTIAL_LIKE_RE = re.compile(
+    r"(" 
+    r"eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9._-]{10,}\.[a-zA-Z0-9._-]{10,}"  # JWT
+    r"|gh[pousr]_[A-Za-z0-9]{20,}"  # GitHub-like tokens
+    r"|(?=[A-Za-z0-9+/_-]{32,})(?=.*[A-Za-z])(?=.*\\d)[A-Za-z0-9+/_-]{32,}"  # long mixed credential-like strings
+    r")"
+)
 
 
 def _sensitive_values() -> set[str]:
@@ -51,6 +58,7 @@ def _redact_value(value: object, *, key: str | None = None) -> object:
         for sensitive in _sensitive_values():
             if sensitive and sensitive in redacted:
                 redacted = redacted.replace(sensitive, "[REDACTED]")
+        redacted = _CREDENTIAL_LIKE_RE.sub("[REDACTED]", redacted)
         return redacted
 
     return value

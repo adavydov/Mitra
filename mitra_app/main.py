@@ -44,6 +44,18 @@ _THINK_PROMPT_MAX_CHARS = 1200
 _THINK_OUTPUT_MAX_CHARS = 900
 _GOAL_PREVIEW_MAX_CHARS = 160
 _SECRET_ENV_NAME_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|PRIVATE|API_KEY|ACCESS_KEY|CLIENT_SECRET)", re.IGNORECASE)
+_PROBABLE_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?i)client[ _-]?secret\s*[:=]\s*[^\s,;]{6,}"),
+    re.compile(r"(?i)oauth[ _-]?token\s*[:=]\s*[^\s,;]{8,}"),
+    re.compile(r"(?i)(?:api|access|private)[ _-]?key\s*[:=]\s*[^\s,;]{8,}"),
+    re.compile(r"\beyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9._-]{10,}\.[a-zA-Z0-9._-]{10,}\b"),
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|(?=[A-Za-z0-9+/_-]{32,}\b)(?=.*[A-Za-z])(?=.*\\d)[A-Za-z0-9+/_-]{32,})\b"),
+)
+_SECRET_STORE_GUIDANCE = (
+    "Похоже, в сообщении есть секрет (token/key/client secret). "
+    "Я не обрабатываю секреты в Telegram. Передайте значение через approved secret store "
+    "и пришлите только имя секрета/переменной (например, GITHUB_TOKEN)."
+)
 _THINK_SYSTEM_PROMPT = (
     "Ты помощник в режиме /think. Нужен только анализ текста пользователя без внешних действий. "
     "Не используйте веб, GitHub, Drive, интеграции, инструменты или вызовы функций. "
@@ -122,6 +134,14 @@ _FAILURE_REASON_TO_GAP: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(lint|format|type check|mypy|ruff|black)\b", re.IGNORECASE), "quality_gate"),
 ]
 
+
+
+def _contains_probable_secret(text: str) -> bool:
+    sanitized = text.strip()
+    if not sanitized:
+        return False
+
+    return any(pattern.search(sanitized) for pattern in _PROBABLE_SECRET_PATTERNS)
 
 
 def _sensitive_env_names() -> set[str]:
@@ -906,12 +926,62 @@ def _extract_intents_from_request(request_text: str) -> set[str]:
         "webhook": "telegram",
         "drive": "drive",
         "calendar": "calendar",
+        "календар": "calendar",
+        "встреч": "calendar",
+        "доступност": "calendar",
         "report": "reporting",
     }
     for marker, intent in intent_hints.items():
         if marker in lowered:
             intents.add(intent)
     return intents
+
+
+def _paths_exist(relative_paths: list[str]) -> bool:
+    project_root = Path(__file__).resolve().parents[1]
+    for rel in relative_paths:
+        candidate = (project_root / rel).resolve()
+        if candidate.exists():
+            return True
+    return False
+
+
+def _resolve_capability_artifacts(capability: dict[str, Any]) -> dict[str, bool]:
+    capability_id = str(capability.get("id", "")).strip().lower()
+    artifacts = capability.get("artifacts")
+    if not isinstance(artifacts, dict):
+        artifacts = {}
+
+    code_paths = [str(item).strip() for item in artifacts.get("code", []) if str(item).strip()]
+    if not code_paths and capability_id == "calendar":
+        code_paths = [
+            "mitra_app/handlers/calendar.py",
+            "mitra_app/modules/calendar.py",
+            "service/calendar.py",
+        ]
+
+    tests_paths = [str(item).strip() for item in capability.get("tests", []) if str(item).strip()]
+    runbook_paths = [str(item).strip() for item in artifacts.get("runbook", []) if str(item).strip()]
+    if not runbook_paths and capability_id:
+        runbook_paths = [f"runbooks/{capability_id}.md"]
+
+    policy_paths = [str(item).strip() for item in capability.get("policies", []) if str(item).strip()]
+
+    required_env = capability.get("required_env")
+    if isinstance(required_env, list):
+        required_env_values = [str(item).strip() for item in required_env if str(item).strip()]
+    else:
+        required_env_values = []
+
+    return {
+        "has_code": _paths_exist(code_paths),
+        "has_tests": _paths_exist(tests_paths),
+        "has_runbook": _paths_exist(runbook_paths),
+        "has_policy": _paths_exist(policy_paths),
+        "has_config": bool(capability.get("tools") or required_env_values),
+        "has_secrets": bool(required_env_values),
+        "requires_secrets": bool(required_env_values),
+    }
 
 
 def detect_capability_gaps(request_text: str) -> dict[str, Any]:
@@ -936,26 +1006,49 @@ def detect_capability_gaps(request_text: str) -> dict[str, Any]:
             ],
         }
 
-    has_policy = any(cap.get("policies") for cap in matched)
-    has_tests = any(cap.get("tests") for cap in matched)
-    has_secrets = any(cap.get("required_env") for cap in matched)
-    has_code = any(cap.get("tools") for cap in matched)
-    has_config = any(cap.get("tools") or cap.get("required_env") for cap in matched)
-    has_runbook = any((Path(__file__).resolve().parents[1] / "runbooks" / f"{cap.get('id', '')}.md").exists() for cap in matched)
+    artifact_state = [_resolve_capability_artifacts(capability) for capability in matched]
+
+    has_policy = any(state["has_policy"] for state in artifact_state)
+    has_tests = any(state["has_tests"] for state in artifact_state)
+    has_secrets = any(state["has_secrets"] for state in artifact_state)
+    has_code = any(state["has_code"] for state in artifact_state)
+    has_config = any(state["has_config"] for state in artifact_state)
+    has_runbook = any(state["has_runbook"] for state in artifact_state)
+
+    required_gaps: set[str] = set()
+    for capability in matched:
+        for criterion in capability.get("minimum_implementation", []):
+            if isinstance(criterion, str) and criterion.strip():
+                required_gaps.add(criterion.strip().lower())
+
+    availability = {
+        "code": has_code,
+        "policy": has_policy,
+        "config": has_config,
+        "tests": has_tests,
+        "secrets": has_secrets,
+        "runbook": has_runbook,
+    }
 
     gaps: list[str] = []
-    if not has_code:
-        gaps.append("code")
-    if not has_policy:
-        gaps.append("policy")
-    if not has_config:
-        gaps.append("config")
-    if not has_tests:
-        gaps.append("tests")
-    if not has_secrets:
-        gaps.append("secrets")
-    if not has_runbook:
-        gaps.append("runbook")
+    if required_gaps:
+        for gap_type in _CAPABILITY_GAP_TYPES:
+            if gap_type in required_gaps and not availability.get(gap_type, False):
+                gaps.append(gap_type)
+    else:
+        if not has_code:
+            gaps.append("code")
+        if not has_policy:
+            gaps.append("policy")
+        if not has_config:
+            gaps.append("config")
+        if not has_tests:
+            gaps.append("tests")
+        requires_secrets = any(state["requires_secrets"] for state in artifact_state)
+        if requires_secrets and not has_secrets:
+            gaps.append("secrets")
+        if not has_runbook:
+            gaps.append("runbook")
 
     return {
         "intents": sorted(intents),
@@ -1906,11 +1999,28 @@ async def telegram_webhook(
                     await send_message(chat_id=chat_id, text=deny_reason)
                 return {"status": "ok"}
 
+        if isinstance(text, str) and _contains_probable_secret(text):
+            _safe_audit_event(
+                {
+                    "event": "telegram_secret_detected",
+                    "action_id": action_id,
+                    "telegram_update_id": telegram_update_id,
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "action_type": action_type,
+                    "outcome": "blocked",
+                    "log_level": "warning",
+                }
+            )
+            if chat_id is not None:
+                await send_message(chat_id=chat_id, text=_SECRET_STORE_GUIDANCE)
+            return {"status": "ok"}
+
         pending_task_state = _task_dialog_state_by_chat.get(chat_id) if isinstance(chat_id, int) else None
-        if pending_task_state is not None and isinstance(text, str) and text.strip() and not text.strip().startswith("/"):
+        if pending_task_state is not None and isinstance(text, str) and text.strip():
             _merge_context_answer(pending_task_state, text)
             next_question = _build_context_question(pending_task_state.context)
-            if next_question is not None and not _context_above_threshold(pending_task_state.context):
+            if next_question is not None:
                 field_name, question = next_question
                 pending_task_state.last_question_field = field_name
                 reply_text = question

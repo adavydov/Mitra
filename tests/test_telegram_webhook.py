@@ -27,6 +27,7 @@ from mitra_app.main import (
     _load_allowed_user_ids,
     _parse_evo_issue_command,
     _parse_pr_or_issue_ref,
+    _task_dialog_state_by_chat,
     app,
 )
 
@@ -65,6 +66,54 @@ def test_webhook_with_secret_status_returns_200_and_sends_message(monkeypatch):
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
     assert calls == [(123, "Mitra alive")]
+
+
+
+def test_webhook_blocks_probable_secret_and_sends_safe_guidance(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fail_create_issue(*args, **kwargs):
+        raise AssertionError("task flow must be blocked on probable secret")
+
+    audits = []
+
+    def fake_log_event(event: dict[str, object]):
+        audits.append(event)
+        return "{}"
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main._create_github_issue", fail_create_issue)
+    monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={
+            "message": {
+                "text": "/task client secret=supersecretvalue123",
+                "chat": {"id": 123},
+                "from": {"id": 123},
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert len(calls) == 1
+    assert "approved secret store" in calls[0][1]
+
+    event = [entry for entry in audits if entry.get("event") == "telegram_secret_detected"][0]
+    assert event["outcome"] == "blocked"
+    assert "text" not in event
+    assert "supersecretvalue123" not in json.dumps(event)
+
 
 
 def test_load_allowed_user_ids_parses_and_ignores_invalid_values(monkeypatch):
@@ -1437,6 +1486,7 @@ def test_task_command_without_body_returns_usage(monkeypatch):
 def test_task_command_multiturn_collects_context_before_issue_creation(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    _task_dialog_state_by_chat.clear()
 
     calls = []
     build_calls = []
@@ -1486,7 +1536,7 @@ def test_task_command_multiturn_collects_context_before_issue_creation(monkeypat
         headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
         json={
             "message": {
-                "text": "/task Добавь /hello, команда должна отвечать hello",
+                "text": "/task Добавь /hello",
                 "chat": {"id": 123},
                 "from": {"id": 123},
             }
@@ -1502,17 +1552,132 @@ def test_task_command_multiturn_collects_context_before_issue_creation(monkeypat
         headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
         json={"message": {"text": "Секреты в Vault", "chat": {"id": 123}, "from": {"id": 123}}},
     )
+    fourth = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "R1 only", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+    fifth = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "Команда работает корректно", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+    sixth = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "2026-01-10", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
 
     assert first.status_code == 200
     assert second.status_code == 200
     assert third.status_code == 200
+    assert fourth.status_code == 200
+    assert fifth.status_code == 200
+    assert sixth.status_code == 200
     assert calls[0] == (123, "Уточни provider: где будем создавать задачу (например GitHub/Jira/Linear)?")
     assert calls[1] == (123, "Где брать credentials (источник секретов/доступов)?")
-    assert "Issue создан: https://github.com/o/r/issues/101" in calls[2][1]
+    assert calls[2] == (123, "Какие есть risk constraints (например max risk level, ограничения по данным/продакшену)?")
+    assert calls[3] == (123, "Сформулируй success criteria (как поймём, что задача выполнена).")
+    assert calls[4] == (123, "Есть ли deadline/срок для задачи?")
+    assert "Issue создан: https://github.com/o/r/issues/101" in calls[5][1]
     assert len(build_calls) == 1
     assert len(issue_calls) == 1
     assert detect_calls == ["Добавь /hello, команда должна отвечать hello"]
     assert "Gap summary: missing capability, закрыть блоки: code" in calls[2][1]
+
+
+def test_task_dialog_treats_slash_text_as_answer_until_required_fields_are_filled(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    _task_dialog_state_by_chat.clear()
+
+    calls = []
+    issue_calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    def fake_build_task_spec(request_text: str):
+        assert "- provider: /status" in request_text
+        assert "- credentials source: Vault" in request_text
+        assert "- risk constraints: R1 only" in request_text
+        assert "- success criteria: /help" in request_text
+        assert "- deadlines: 2026-02-10" in request_text
+        return {
+            "title": "Добавить /hello",
+            "summary": "Добавить простую команду.",
+            "components": ["mitra_app/main.py"],
+            "required_env_secrets": [],
+            "new_commands": ["/hello"],
+            "acceptance_criteria": ["Команда /hello отвечает hello from mitra"],
+            "tests_to_add": ["tests/test_telegram_webhook.py"],
+            "risk_level": "R1",
+        }
+
+    async def fake_create_github_issue(title: str, body: str):
+        issue_calls.append((title, body))
+        return 102, "https://github.com/o/r/issues/102"
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main._build_task_spec", fake_build_task_spec)
+    monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_github_issue)
+
+    messages = [
+        "/task Нужна новая команда",
+        "/status",
+        "Vault",
+        "R1 only",
+        "/help",
+        "2026-02-10",
+    ]
+    for message in messages:
+        response = client.post(
+            "/telegram/webhook",
+            headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+            json={"message": {"text": message, "chat": {"id": 123}, "from": {"id": 123}}},
+        )
+        assert response.status_code == 200
+
+    assert calls[0][1].startswith("Уточни provider")
+    assert calls[1] == (123, "Где брать credentials (источник секретов/доступов)?")
+    assert calls[2] == (123, "Какие есть risk constraints (например max risk level, ограничения по данным/продакшену)?")
+    assert calls[3] == (123, "Сформулируй success criteria (как поймём, что задача выполнена).")
+    assert calls[4] == (123, "Есть ли deadline/срок для задачи?")
+    assert "Issue создан: https://github.com/o/r/issues/102" in calls[5][1]
+    assert len(issue_calls) == 1
+    assert 123 not in _task_dialog_state_by_chat
+
+
+def test_task_dialog_does_not_fallback_unknown_command_while_active(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    _task_dialog_state_by_chat.clear()
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+
+    start_response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/task Нужна новая команда", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+    slash_response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/unknown", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert start_response.status_code == 200
+    assert slash_response.status_code == 200
+    assert calls[0][1].startswith("Уточни provider")
+    assert calls[1] == (123, "Где брать credentials (источник секретов/доступов)?")
+    assert all(text != "Unknown command" for _, text in calls)
 
 
 def test_build_task_spec_returns_fallback_when_json_parse_fails(caplog):
@@ -1630,6 +1795,13 @@ def test_task_command_includes_gap_sections_in_issue_body(monkeypatch):
     assert "Gap summary: missing capability, закрыть блоки: code, policy, config, tests, secrets, runbook" in calls[0][1]
 
 
+def test_detect_capability_gaps_for_calendar_management_request_returns_calendar_artifact_gaps():
+    detection = detect_capability_gaps("Нужно управлять календарём: перенос встреч и проверка доступности команды")
+
+    assert detection["matched_capabilities"] == ["calendar"]
+    assert detection["gaps"] == ["code", "tests", "runbook"]
+
+
 def test_task_command_calendar_logs_detected_gaps_and_capabilities(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
@@ -1644,8 +1816,8 @@ def test_task_command_calendar_logs_detected_gaps_and_capabilities(monkeypatch):
     async def fake_create_github_issue(title: str, body: str):
         assert title == "Calendar sync hardening"
         assert "## Capability gaps to close" in body
+        assert "### GAP: code" in body
         assert "### GAP: tests" in body
-        assert "### GAP: secrets" in body
         assert "### GAP: runbook" in body
         assert "capability частично реализована (calendar)" in body
         return 120, "https://github.com/o/r/issues/120"
@@ -1691,7 +1863,7 @@ def test_task_command_calendar_logs_detected_gaps_and_capabilities(monkeypatch):
 
     task_audit = next(event for event in audits if event.get("event") == "telegram_task_open_issue")
     assert task_audit["matched_capabilities"] == ["calendar"]
-    assert task_audit["capability_gaps"] == ["tests", "secrets", "runbook"]
+    assert task_audit["capability_gaps"] == ["code", "tests", "runbook"]
 
 
 def test_extract_json_object_handles_dirty_text_with_fenced_block_and_json():
