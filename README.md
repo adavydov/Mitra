@@ -19,5 +19,5 @@
 - Triggers: every pull request and every push to `main`.
 - Stable branch-protection checks:
   - `ci/lint` — validates IDs.
-  - `ci/config-validate` — validates config schemas.
-  - `ci/tests` — runs regression evals after lint/config checks.
+  - `ci/smoke` — быстрые smoke-проверки импорта и `/healthz` (`py_compile`, import, `tests/test_import_smoke.py`).
+  - `ci/tests-full` — полный `pytest -q`; запускается на `push` в `main`, вручную через `workflow_dispatch` или в PR с label `full-tests`.
