@@ -27,12 +27,19 @@ from mitra_app.main import (
     _load_allowed_user_ids,
     _parse_evo_issue_command,
     _parse_pr_or_issue_ref,
+    _pr_rate_limiter,
     _task_dialog_state_by_chat,
     app,
 )
 
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _reset_task_rate_limiter_and_dialog_state():
+    _pr_rate_limiter._events_by_user.clear()
+    _task_dialog_state_by_chat.clear()
 
 
 def test_webhook_without_secret_header_returns_401(monkeypatch):
@@ -1513,8 +1520,10 @@ def test_task_command_multiturn_collects_context_before_issue_creation(monkeypat
 
     def fake_build_task_spec(request_text: str):
         build_calls.append(request_text)
-        assert "- provider: GitHub" in request_text
-        assert "- credentials source: Секреты в Vault" in request_text
+        assert "- issue provider: GitHub" in request_text
+        assert "- integration provider: Yandex" in request_text
+        assert "- credentials source: я тебе дам в 1password" in request_text
+        assert '- risk constraints: {"has_constraints": false, "details": []}' in request_text
         return {
             "title": "Добавить /hello",
             "summary": "Добавить простую команду.",
@@ -1540,7 +1549,7 @@ def test_task_command_multiturn_collects_context_before_issue_creation(monkeypat
         headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
         json={
             "message": {
-                "text": "/task Добавь /hello",
+                "text": "/task Добавь /hello в GitHub, команда должна отвечать hello",
                 "chat": {"id": 123},
                 "from": {"id": 123},
             }
@@ -1549,12 +1558,22 @@ def test_task_command_multiturn_collects_context_before_issue_creation(monkeypat
     second = client.post(
         "/telegram/webhook",
         headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
-        json={"message": {"text": "GitHub", "chat": {"id": 123}, "from": {"id": 123}}},
+        json={"message": {"text": "яндекс", "chat": {"id": 123}, "from": {"id": 123}}},
     )
     third = client.post(
         "/telegram/webhook",
         headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
-        json={"message": {"text": "Секреты в Vault", "chat": {"id": 123}, "from": {"id": 123}}},
+        json={"message": {"text": "я тебе дам", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+    fourth = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "я тебе дам в 1password", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+    fifth = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "нет ограниченийъ", "chat": {"id": 123}, "from": {"id": 123}}},
     )
     fourth = client.post(
         "/telegram/webhook",
@@ -1577,13 +1596,14 @@ def test_task_command_multiturn_collects_context_before_issue_creation(monkeypat
     assert third.status_code == 200
     assert fourth.status_code == 200
     assert fifth.status_code == 200
-    assert sixth.status_code == 200
-    assert calls[0] == (123, "Уточни provider: где будем создавать задачу (например GitHub/Jira/Linear)?")
+    assert calls[0] == (123, "Какой integration provider используется в задаче (например Yandex/Google/Outlook)?")
     assert calls[1] == (123, "Где брать credentials (источник секретов/доступов)?")
-    assert calls[2] == (123, "Какие есть risk constraints (например max risk level, ограничения по данным/продакшену)?")
-    assert calls[3] == (123, "Сформулируй success criteria (как поймём, что задача выполнена).")
-    assert calls[4] == (123, "Есть ли deadline/срок для задачи?")
-    assert "Issue создан: https://github.com/o/r/issues/101" in calls[5][1]
+    assert calls[2] == (
+        123,
+        "Нужно чуть подробнее: где именно брать credentials. Где брать credentials (источник секретов/доступов)?",
+    )
+    assert calls[3] == (123, "Какие есть risk constraints (например max risk level, ограничения по данным/продакшену)?")
+    assert "Issue создан: https://github.com/o/r/issues/101" in calls[4][1]
     assert len(build_calls) == 1
     assert len(issue_calls) == 1
     assert detect_calls == ["Добавь /hello, команда должна отвечать hello"]
