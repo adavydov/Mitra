@@ -67,6 +67,54 @@ def test_webhook_with_secret_status_returns_200_and_sends_message(monkeypatch):
     assert calls == [(123, "Mitra alive")]
 
 
+
+def test_webhook_blocks_probable_secret_and_sends_safe_guidance(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fail_create_issue(*args, **kwargs):
+        raise AssertionError("task flow must be blocked on probable secret")
+
+    audits = []
+
+    def fake_log_event(event: dict[str, object]):
+        audits.append(event)
+        return "{}"
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main._create_github_issue", fail_create_issue)
+    monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={
+            "message": {
+                "text": "/task client secret=supersecretvalue123",
+                "chat": {"id": 123},
+                "from": {"id": 123},
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert len(calls) == 1
+    assert "approved secret store" in calls[0][1]
+
+    event = [entry for entry in audits if entry.get("event") == "telegram_secret_detected"][0]
+    assert event["outcome"] == "blocked"
+    assert "text" not in event
+    assert "supersecretvalue123" not in json.dumps(event)
+
+
+
 def test_load_allowed_user_ids_parses_and_ignores_invalid_values(monkeypatch):
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", " 1,2, bad, ,3 ")
 
