@@ -130,7 +130,7 @@ def _build_think_reply(question: str) -> str:
     if not llm_reply:
         return "Не удалось получить ответ LLM для /think"
 
-    return _cap_output_chars(llm_reply, _THINK_OUTPUT_MAX_CHARS)
+    return _cap_output_chars(_final_only_sanitize(llm_reply), _THINK_OUTPUT_MAX_CHARS)
 
 
 def _invoke_think_llm(prompt: str, llm_client: AnthropicClient | None = None) -> str:
@@ -150,7 +150,7 @@ def _invoke_think_llm(prompt: str, llm_client: AnthropicClient | None = None) ->
             if isinstance(text, str) and text.strip():
                 parts.append(text.strip())
 
-    return "\n".join(parts).strip()
+    return _final_only_sanitize("\n".join(parts).strip())
 
 
 def _cap_output_chars(text: str, limit: int) -> str:
