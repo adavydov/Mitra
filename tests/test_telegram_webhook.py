@@ -1422,6 +1422,10 @@ def test_task_command_creates_codex_issue_and_reports_expected_command(monkeypat
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
     monkeypatch.setattr("mitra_app.main._build_task_spec", fake_build_task_spec)
     monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_github_issue)
+    monkeypatch.setattr(
+        "mitra_app.main.detect_capability_gaps",
+        lambda _text: {"intents": [], "matched_capabilities": [], "gaps": []},
+    )
     monkeypatch.setattr("mitra_app.main._pr_rate_limiter.allow", lambda user_id: True)
 
     response = client.post(
@@ -1635,7 +1639,7 @@ def test_task_command_multiturn_collects_context_before_issue_creation(monkeypat
     assert "Gap summary: missing capability, закрыть блоки: code" in calls[2][1]
 
 
-def test_task_dialog_treats_slash_text_as_answer_until_required_fields_are_filled(monkeypatch):
+def test_task_dialog_safe_commands_append_reminder_until_required_fields_are_filled(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
     _task_dialog_state_by_chat.clear()
@@ -1648,11 +1652,10 @@ def test_task_dialog_treats_slash_text_as_answer_until_required_fields_are_fille
         return True
 
     def fake_build_task_spec(request_text: str):
-        assert "- provider: /status" in request_text
+        assert "- issue provider: GitHub" in request_text
+        assert "- integration provider: Yandex" in request_text
         assert "- credentials source: Vault" in request_text
-        assert "- risk constraints: R1 only" in request_text
-        assert "- success criteria: /help" in request_text
-        assert "- deadlines: 2026-02-10" in request_text
+        assert '- risk constraints: {"has_constraints": true, "details": ["R1 only"]}' in request_text
         return {
             "title": "Добавить /hello",
             "summary": "Добавить простую команду.",
@@ -1671,14 +1674,19 @@ def test_task_dialog_treats_slash_text_as_answer_until_required_fields_are_fille
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
     monkeypatch.setattr("mitra_app.main._build_task_spec", fake_build_task_spec)
     monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_github_issue)
+    monkeypatch.setattr(
+        "mitra_app.main.detect_capability_gaps",
+        lambda _text: {"intents": [], "matched_capabilities": [], "gaps": []},
+    )
 
     messages = [
         "/task Нужна новая команда",
         "/status",
+        "GitHub",
+        "/help",
+        "Yandex",
         "Vault",
         "R1 only",
-        "/help",
-        "2026-02-10",
     ]
     for message in messages:
         response = client.post(
@@ -1782,6 +1790,49 @@ def test_task_dialog_does_not_fallback_unknown_command_while_active(monkeypatch)
     assert calls[0][1].startswith("Уточни issue provider")
     assert calls[1] == (123, "Где брать credentials (источник секретов/доступов)?")
     assert all(text != "Unknown command" for _, text in calls)
+
+
+def test_task_dialog_status_keeps_state_and_repeats_pending_question(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    _task_dialog_state_by_chat.clear()
+
+    calls = []
+    audits = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    def fake_log_event(event: dict[str, object]):
+        audits.append(event)
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
+
+    task_response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/task Нужна новая команда", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+    status_response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/status", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert task_response.status_code == 200
+    assert status_response.status_code == 200
+    assert calls[0] == (123, "Уточни issue provider: где создаём задачу (GitHub/Jira/Linear)?")
+    assert "Mitra alive" in calls[1][1]
+    assert "Напоминание: диалог не завершён (шаг: issue_provider)." in calls[1][1]
+    assert "Уточни issue provider: где создаём задачу (GitHub/Jira/Linear)?" in calls[1][1]
+    assert 123 in _task_dialog_state_by_chat
+
+    status_audit = next(event for event in audits if event.get("event") == "telegram_status")
+    assert status_audit["action_type"] == "/status"
+    assert status_audit["dialog_state"]["last_question_field"] == "issue_provider"
+    assert "issue_provider" in status_audit["dialog_state"]["missing_fields"]
 
 
 def test_build_task_spec_returns_fallback_when_json_parse_fails(caplog):
