@@ -4,6 +4,8 @@ import logging
 import os
 import re
 import asyncio
+import sys
+import traceback
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
@@ -715,6 +717,18 @@ def _build_context_question(context: MissingContext) -> tuple[str, str] | None:
     if not question:
         return None
     return field_name, question
+
+
+def _build_dialog_pending_reminder(state: TaskDialogState | None) -> str:
+    if state is None:
+        return ""
+    field_name = state.last_question_field
+    if not isinstance(field_name, str) or not field_name:
+        return ""
+    question = _TASK_CONTEXT_QUESTIONS.get(field_name)
+    if not question:
+        return ""
+    return f"Напоминание: диалог не завершён (шаг: {field_name}). {question}"
 
 
 def _context_above_threshold(context: MissingContext) -> bool:
@@ -2412,7 +2426,7 @@ async def telegram_webhook(
             text = _route_plain_text_command(text)
 
         action_type = text.split()[0] if isinstance(text, str) and text else "no_command"
-        if isinstance(text, str) and text.strip() and not text.strip().startswith("/"):
+        if isinstance(text, str) and text.strip() and not text.strip().startswith("/") and pending_task_state is None:
             text = f"/task {text.strip()}"
             action_type = "/task"
             _safe_audit_event(
@@ -2470,7 +2484,14 @@ async def telegram_webhook(
                     await send_message(chat_id=chat_id, text=deny_reason)
                 return {"status": "ok"}
 
-        if pending_task_state is not None and isinstance(text, str) and text.strip() and not text.strip().startswith("/"):
+        pending_safe_commands = {"/status", "/help", "/start"}
+        pending_action = text.split()[0] if isinstance(text, str) and text.strip() else ""
+        if (
+            pending_task_state is not None
+            and isinstance(text, str)
+            and text.strip()
+            and (not text.strip().startswith("/") or pending_action not in pending_safe_commands)
+        ):
             validation_error: str | None = None
             if pending_task_state.last_question_field in _TASK_CONTEXT_FIELD_ORDER:
                 is_valid, normalized, error_message = _validate_context_answer(
@@ -2569,7 +2590,23 @@ async def telegram_webhook(
                 if isinstance(chat_id, int):
                     _task_dialog_state_by_chat.pop(chat_id, None)
         elif text.startswith("/status"):
+            reminder = _build_dialog_pending_reminder(pending_task_state)
             reply_text = "Mitra alive"
+            if reminder:
+                reply_text = f"{reply_text}\n\n{reminder}"
+            _safe_audit_event(
+                {
+                    "event": "telegram_status",
+                    "action_id": action_id,
+                    "telegram_update_id": telegram_update_id,
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "action_type": "/status",
+                    "dialog_state": _serialize_task_dialog_state(pending_task_state),
+                    "outcome": "completed",
+                    "log_level": "info",
+                }
+            )
         elif text.startswith("/smoke_deep"):
             reply_text, smoke_audit = await _run_smoke_deep_checks()
             _safe_audit_event(
@@ -3115,7 +3152,10 @@ async def telegram_webhook(
                 reply_text = "Forbidden"
         elif text.startswith("/budget"):
             reply_text = await budget_ledger.render_budget()
-        elif text.startswith("/help") or text.startswith("/start"):
+        elif text.startswith("/help"):
+            reminder = _build_dialog_pending_reminder(pending_task_state)
+            reply_text = HELP_TEXT if not reminder else f"{HELP_TEXT}\n\n{reminder}"
+        elif text.startswith("/start"):
             reply_text = HELP_TEXT
         else:
             reply_text = "Unknown command"
