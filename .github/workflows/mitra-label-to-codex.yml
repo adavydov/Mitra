@@ -1,4 +1,4 @@
-name: "Mitra: label -> @codex task"
+name: Mitra: label -> @codex
 
 on:
   issues:
