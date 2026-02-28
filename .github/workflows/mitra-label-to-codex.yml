@@ -1,0 +1,59 @@
+name: "Mitra: label -> @codex task"
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  issues: write
+
+concurrency:
+  group: mitra-codex-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  trigger_codex:
+    if: github.event.label.name == 'mitra:codex'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Post @codex task comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const allowActors = ["adavydov"]; // добавь сюда бота, если Митра будет ставить лейбл отдельным юзером
+            if (!allowActors.includes(context.actor)) {
+              core.info(`Actor ${context.actor} not allowed; skipping.`);
+              return;
+            }
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue_number = context.payload.issue.number;
+
+            // анти-дубль: если уже есть такой триггер-коммент, второй раз не пишем
+            const marker = "<!-- mitra:codex-trigger -->";
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100
+            });
+
+            if (comments.some(c => (c.body || "").includes(marker))) {
+              core.info("Trigger comment already exists; skipping.");
+              return;
+            }
+
+            const body =
+`${marker}
+@codex Please implement this GitHub issue.
+
+Constraints:
+- Minimal diff
+- Do NOT modify governance/* (needs explicit user approval)
+- Do NOT add/request/log secrets
+- Add or update tests so CI passes (pytest -q)
+
+When finished:
+- Open a PR against main referencing #${issue_number}
+- Comment the PR link here.`;
+
+            await github.rest.issues.createComment({ owner, repo, issue_number, body });
