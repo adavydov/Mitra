@@ -113,7 +113,6 @@ class BudgetLedger:
 
     async def render_budget(self) -> str:
         async with self._lock:
-            self._reset_day_if_needed()
             state = deepcopy(self._state)
 
         usage = state["usage"]

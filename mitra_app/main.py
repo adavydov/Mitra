@@ -2,12 +2,11 @@ import json
 import logging
 import os
 import re
-import json
-import traceback
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
+import time
 from time import perf_counter
 from typing import Any
 from uuid import uuid4
@@ -17,7 +16,6 @@ from fastapi import FastAPI, Header, HTTPException
 from googleapiclient.errors import HttpError
 
 import mitra_app.audit as audit
-import mitra_app.github as github
 from mitra_app.audit import log_report_event
 from mitra_app.budget_ledger import budget_ledger
 from mitra_app.policy_enforcer import CommandPolicy, CommandPolicyEnforcer, EnforcementDecision
@@ -711,11 +709,11 @@ async def healthz() -> dict[str, str]:
 @app.get("/drive_check")
 async def drive_check() -> dict[str, str]:
     auth_mode = get_drive_auth_mode()
-    payload = {"auth_mode": auth_mode}
-    last_refresh_at = get_last_oauth_refresh_time()
-    if auth_mode == "oauth" and last_refresh_at:
-        payload["last_refresh_at"] = last_refresh_at
-
+    try:
+        status, _ = await _run_drive_check(auth_mode)
+    except Exception as exc:
+        status = _safe_drive_check_error(exc)
+    payload = {"auth_mode": auth_mode, "status": status}
     return payload
 
 
@@ -912,8 +910,8 @@ async def telegram_webhook(
                         chat_id=chat_id,
                         reason="research_error",
                     )
-                except Exception:
-                    reply_text = "Research failed. Please try again later."
+                except Exception as exc:
+                    reply_text = f"Research failed: {str(exc).replace(chr(10), ' ').strip()}"
                     logger.exception("research_command_failed")
                     _audit_research_failure(
                         action_id=action_id,
@@ -1074,7 +1072,7 @@ async def telegram_webhook(
         elif text.startswith("/budget"):
             reply_text = await budget_ledger.render_budget()
         elif text.startswith("/help") or text.startswith("/start"):
-            reply_text = "Commands: /status, /oauth_status, /search <query>, /research <query>, /report <text>"
+            reply_text = "Commands: /status, /oauth_status, /search <query>, /research <query>, /report <text>, /smoke, /smoke_deep"
         else:
             reply_text = "Unknown command"
 

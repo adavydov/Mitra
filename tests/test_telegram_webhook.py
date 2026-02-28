@@ -147,7 +147,7 @@ def test_start_command_lists_search(monkeypatch):
 
     assert response.status_code == 200
     assert calls == [
-        (123, "Commands: /status, /oauth_status, /search <query>, /research <query>, /report <text>")
+        (123, "Commands: /status, /oauth_status, /search <query>, /research <query>, /report <text>, /smoke, /smoke_deep")
     ]
 
 
