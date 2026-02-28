@@ -45,5 +45,6 @@ jobs:
 
             core.setFailed(
               "Protected files were changed (governance/** or .github/workflows/**). " +
-              "A sovereign override label is required: add 'sovereign-override' (or legacy 'l0-approved')."
+              "A sovereign override label is required: add 'sovereign-override' (or legacy 'l0-approved'). " +
+              "This is a governance guard failure, not a test failure."
             );
