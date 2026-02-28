@@ -20,4 +20,4 @@
 - Stable branch-protection checks:
   - `ci/lint` — validates IDs.
   - `ci/smoke` — быстрые smoke-проверки импорта и `/healthz` (`py_compile`, import, `tests/test_import_smoke.py`).
-  - `ci/tests-full` — полный `pytest -q`; запускается на `push` в `main`, вручную через `workflow_dispatch` или в PR с label `full-tests`.
+  - `ci/tests-full` — устанавливает `requirements-dev.txt` и запускает полный `pytest -q`; запускается на `push` в `main`, вручную через `workflow_dispatch` или в PR с label `full-tests`.
