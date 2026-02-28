@@ -16,7 +16,10 @@ jobs:
       - name: Check for protected files
         run: |
           PROTECTED="governance/constitution.md governance/identity.md governance/normative_hierarchy.md"
+          WORKFLOW_PATH=".github/workflows/"
           CHANGED="${{ steps.changed.outputs.all_changed_files }}"
+          ACTOR="${{ github.actor }}"
+          LABELS="${{ github.event.pull_request.labels.*.name }}"
           FAIL=false
 
           for p in $PROTECTED; do
@@ -25,8 +28,17 @@ jobs:
             fi
           done
 
+          if echo "$CHANGED" | grep -Fq "$WORKFLOW_PATH"; then
+            if [ "$ACTOR" = "adavydov" ] || [[ "$LABELS" =~ "allow-workflows" ]]; then
+              echo "Workflow changes allowed for sovereign actor/label override."
+            else
+              echo "Workflow files are protected. Only adavydov or PRs with 'allow-workflows' label may change them."
+              exit 1
+            fi
+          fi
+
           if [ "$FAIL" = true ]; then
-            if [[ "${{ github.event.pull_request.labels.*.name }}" =~ "l0-approved" ]]; then
+            if [[ "$LABELS" =~ "l0-approved" ]]; then
               echo "L0 override label found. Allowing."
             else
               echo "Protected files changed. Add label 'l0-approved' to merge."
