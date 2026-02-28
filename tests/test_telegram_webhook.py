@@ -1342,7 +1342,7 @@ def test_task_command_creates_codex_issue_and_reports_expected_command(monkeypat
     response = client.post(
         "/telegram/webhook",
         headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
-        json={"message": {"text": "/task Добавь /hello", "chat": {"id": 123}, "from": {"id": 123}}},
+        json={"message": {"text": "/task Добавь /hello в GitHub, секреты в Vault, риск R1, команда должна отвечать hello, дедлайн 2026-01-10", "chat": {"id": 123}, "from": {"id": 123}}},
     )
 
     assert response.status_code == 200
@@ -1370,7 +1370,7 @@ def test_task_command_without_llm_json_uses_fallback_spec(monkeypatch):
             return {"content": [{"type": "text", "text": "Не JSON ответ"}]}
 
     async def fake_create_github_issue(title: str, body: str):
-        assert title == "Добавь новую команду, которая отвечает текущим временем и коротким статусом сист"
+        assert "Добавь новую команду" in title
         assert "## Summary" in body
         assert "## Risk level\n- R2" in body
         assert "Добавь новую команду" in body
@@ -1385,7 +1385,7 @@ def test_task_command_without_llm_json_uses_fallback_spec(monkeypatch):
         headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
         json={
             "message": {
-                "text": "/task Добавь новую команду, которая отвечает текущим временем и коротким статусом системы",
+                "text": "/task Добавь новую команду в GitHub, секреты в env, риск R2, команда должна отвечать текущим временем и коротким статусом системы, дедлайн 2026-02-01",
                 "chat": {"id": 123},
                 "from": {"id": 123},
             }
@@ -1418,6 +1418,73 @@ def test_task_command_without_body_returns_usage(monkeypatch):
 
     assert response.status_code == 200
     assert calls == [(123, "Usage: /task <request>")]
+
+
+def test_task_command_multiturn_collects_context_before_issue_creation(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+    build_calls = []
+    issue_calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    def fake_build_task_spec(request_text: str):
+        build_calls.append(request_text)
+        assert "- provider: GitHub" in request_text
+        assert "- credentials source: Секреты в Vault" in request_text
+        return {
+            "title": "Добавить /hello",
+            "summary": "Добавить простую команду.",
+            "components": ["mitra_app/main.py"],
+            "required_env_secrets": ["OPENAI_API_KEY"],
+            "new_commands": ["/hello"],
+            "acceptance_criteria": ["Команда /hello отвечает hello from mitra"],
+            "tests_to_add": ["pytest для /telegram/webhook"],
+            "risk_level": "R1",
+        }
+
+    async def fake_create_github_issue(title: str, body: str):
+        issue_calls.append((title, body))
+        return 101, "https://github.com/o/r/issues/101"
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main._build_task_spec", fake_build_task_spec)
+    monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_github_issue)
+
+    first = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={
+            "message": {
+                "text": "/task Добавь /hello, команда должна отвечать hello",
+                "chat": {"id": 123},
+                "from": {"id": 123},
+            }
+        },
+    )
+    second = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "GitHub", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+    third = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "Секреты в Vault", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert third.status_code == 200
+    assert calls[0] == (123, "Уточни provider: где будем создавать задачу (например GitHub/Jira/Linear)?")
+    assert calls[1] == (123, "Где брать credentials (источник секретов/доступов)?")
+    assert "Issue создан: https://github.com/o/r/issues/101" in calls[2][1]
+    assert len(build_calls) == 1
+    assert len(issue_calls) == 1
 
 
 def test_build_task_spec_returns_fallback_when_json_parse_fails(caplog):
