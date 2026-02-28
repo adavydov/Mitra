@@ -50,6 +50,12 @@ _THINK_SYSTEM_PROMPT = (
     "Следующие шаги: ..."
 )
 
+HELP_TEXT = (
+    "Commands: /status, /oauth_status, /search <query>, /research <query>, /think <prompt>, "
+    "/report <text>, /pr <title>\\n<spec>, /pr_status <issue#|pr#>, /drive_check, /budget, "
+    "/smoke, /smoke_deep"
+)
+
 
 def _sensitive_env_names() -> set[str]:
     defaults = {
@@ -1072,7 +1078,7 @@ async def telegram_webhook(
         elif text.startswith("/budget"):
             reply_text = await budget_ledger.render_budget()
         elif text.startswith("/help") or text.startswith("/start"):
-            reply_text = "Commands: /status, /oauth_status, /search <query>, /research <query>, /report <text>, /smoke, /smoke_deep"
+            reply_text = HELP_TEXT
         else:
             reply_text = "Unknown command"
 

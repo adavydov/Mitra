@@ -147,7 +147,11 @@ def test_start_command_lists_search(monkeypatch):
 
     assert response.status_code == 200
     assert calls == [
-        (123, "Commands: /status, /oauth_status, /search <query>, /research <query>, /report <text>, /smoke, /smoke_deep")
+        (
+            123,
+            "Commands: /status, /oauth_status, /search <query>, /research <query>, /think <prompt>, "
+            "/report <text>, /pr <title>\\n<spec>, /pr_status <issue#|pr#>, /drive_check, /budget, /smoke, /smoke_deep",
+        )
     ]
 
 
@@ -988,6 +992,29 @@ def test_start_help_lists_smoke_command(monkeypatch):
 
     assert response.status_code == 200
     assert "/smoke" in calls[0][1]
+
+
+def test_start_help_lists_pr_commands(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/start", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert "/pr <title>\\n<spec>" in calls[0][1]
+    assert "/pr_status <issue#|pr#>" in calls[0][1]
 
 
 def test_pr_status_command_uses_builder_and_returns_result(monkeypatch):
