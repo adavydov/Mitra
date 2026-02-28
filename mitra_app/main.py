@@ -96,6 +96,20 @@ _TASK_EXAMPLE_HINT = (
     "и покрыта тестом."
 )
 
+_NL_ROUTER_SYSTEM_PROMPT = (
+    "Ты intent-router для Telegram-бота Mitra. "
+    "Верни только JSON без markdown и пояснений. "
+    "Поддерживаемые ответы:\n"
+    '{"action":"invoke","command":"/report","args":"..."}\n'
+    '{"action":"create_task","request":"..."}'
+)
+
+_NL_HEURISTIC_COMMANDS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("статус", "status", "жив", "alive"), "/status"),
+    (("отчёт", "отчет", "report", "запиши", "зафиксируй"), "/report"),
+    (("поищи", "найди", "search", "исследуй"), "/research"),
+)
+
 _TASK_CONTEXT_COMPLETENESS_THRESHOLD = 3
 _TASK_CONTEXT_FIELD_ORDER = (
     "issue_provider",
@@ -887,6 +901,81 @@ def _build_evo_issue_body(*, hypothesis: str, report_source: str, risk_level: st
 def _parse_task_command(text: str) -> str | None:
     body = text[len("/task") :].strip()
     return body or None
+
+
+def _route_plain_text_heuristic(text: str) -> str | None:
+    lowered = text.lower()
+    for markers, command in _NL_HEURISTIC_COMMANDS:
+        if any(marker in lowered for marker in markers):
+            if command == "/status":
+                return command
+            return f"{command} {text.strip()}".strip()
+    return None
+
+
+def _invoke_nl_router(text: str, llm_client: AnthropicClient | None = None) -> dict[str, Any] | None:
+    client = llm_client or AnthropicClient()
+    response = client.create_message(
+        messages=[{"role": "user", "content": text.strip()}],
+        system=_NL_ROUTER_SYSTEM_PROMPT,
+    )
+    payload = _extract_json_object(_extract_text_from_response(response))
+    if not payload:
+        return None
+
+    action = str(payload.get("action", "")).strip()
+    if action == "invoke":
+        command = str(payload.get("command", "")).strip()
+        if command not in _COMMAND_POLICIES:
+            return None
+        args = str(payload.get("args", "")).strip()
+        return {"action": "invoke", "command": command, "args": args}
+
+    if action == "create_task":
+        request = str(payload.get("request", "")).strip()
+        if not request:
+            return None
+        return {"action": "create_task", "request": request}
+
+    return None
+
+
+def _route_plain_text_command(text: str, llm_client: AnthropicClient | None = None) -> str:
+    heuristic = _route_plain_text_heuristic(text)
+    if heuristic is not None:
+        return heuristic
+
+    try:
+        routed = _invoke_nl_router(text, llm_client=llm_client)
+    except Exception:
+        logger.exception("nl_router_failed")
+        routed = None
+
+    if routed is None:
+        return f"/task {text.strip()}".strip()
+
+    if routed.get("action") == "invoke":
+        command = str(routed.get("command", "")).strip()
+        args = str(routed.get("args", "")).strip()
+        return f"{command} {args}".strip()
+
+    request = str(routed.get("request", "")).strip()
+    return f"/task {request or text.strip()}".strip()
+
+
+def _extract_text_from_response(response: dict[str, Any]) -> str:
+    content = response.get("content")
+    if not isinstance(content, list):
+        return ""
+
+    blocks: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str) and text.strip():
+                blocks.append(text.strip())
+
+    return "\n".join(blocks)
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -2060,6 +2149,15 @@ async def telegram_webhook(
         chat_id = chat.get("id")
         from_user = message.get("from") or {}
         user_id = from_user.get("id")
+        pending_task_state = _task_dialog_state_by_chat.get(chat_id) if isinstance(chat_id, int) else None
+        if (
+            isinstance(text, str)
+            and text.strip()
+            and not text.strip().startswith("/")
+            and pending_task_state is None
+        ):
+            text = _route_plain_text_command(text)
+
         action_type = text.split()[0] if isinstance(text, str) and text else "no_command"
         if isinstance(text, str) and text.strip().startswith("/goal set"):
             action_type = "/goal set"
@@ -2102,24 +2200,6 @@ async def telegram_webhook(
                     await send_message(chat_id=chat_id, text=deny_reason)
                 return {"status": "ok"}
 
-        if isinstance(text, str) and _contains_probable_secret(text):
-            _safe_audit_event(
-                {
-                    "event": "telegram_secret_detected",
-                    "action_id": action_id,
-                    "telegram_update_id": telegram_update_id,
-                    "user_id": user_id,
-                    "chat_id": chat_id,
-                    "action_type": action_type,
-                    "outcome": "blocked",
-                    "log_level": "warning",
-                }
-            )
-            if chat_id is not None:
-                await send_message(chat_id=chat_id, text=_SECRET_STORE_GUIDANCE)
-            return {"status": "ok"}
-
-        pending_task_state = _task_dialog_state_by_chat.get(chat_id) if isinstance(chat_id, int) else None
         if pending_task_state is not None and isinstance(text, str) and text.strip() and not text.strip().startswith("/"):
             validation_error: str | None = None
             if pending_task_state.last_question_field in _TASK_CONTEXT_FIELD_ORDER:
