@@ -1,34 +1,59 @@
-name: Conditional Auto‑Merge
+name: Conditional Auto-Merge
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize]
+    types: [opened, reopened, synchronize, labeled, unlabeled]
 
 jobs:
   conditional-automerge:
-    if: startsWith(github.head_ref, 'codex/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
     steps:
-      - name: Check changed files
-        id: files
-        uses: tj-actions/changed-files@v34
-      - name: Determine if safe to auto‑merge
-        id: safe
-        run: |
-          echo "PROTECTED_PATTERNS=governance/constitution.md governance/identity.md governance/normative_hierarchy.md" >>$GITHUB_OUTPUT
-          SAFE="true"
-          for p in $PROTECTED_PATTERNS; do
-            if echo "${{ steps.files.changed_files }}" | grep -E "$p"; then
-              SAFE="false"
-              break
-            fi
-          done
-          echo "safe=$SAFE" >>$GITHUB_OUTPUT
-      - name: Enable auto‑merge when safe
-        if: steps.safe.outputs.safe == 'true'
+      - name: Evaluate auto-merge eligibility and safety
+        id: gate
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const labels = (pr?.labels ?? []).map((label) => label.name);
+            const hasAutomergeLabel = labels.includes('automerge');
+            const isCodexBranch = (pr?.head?.ref ?? '').startsWith('codex/');
+
+            const eligible = isCodexBranch || hasAutomergeLabel;
+            core.setOutput('eligible', String(eligible));
+
+            if (!eligible) {
+              core.info("PR is not eligible for auto-merge (requires 'codex/*' branch or 'automerge' label). Skipping.");
+              core.setOutput('safe', 'false');
+              return;
+            }
+
+            const protectedPrefixes = ['governance/', '.github/workflows/'];
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+
+            const touchedProtected = files
+              .map((file) => file.filename)
+              .filter((filename) => protectedPrefixes.some((prefix) => filename.startsWith(prefix)));
+
+            const safe = touchedProtected.length === 0;
+            core.setOutput('safe', String(safe));
+
+            if (safe) {
+              core.info('PR eligible and safe for auto-merge.');
+              return;
+            }
+
+            core.info(`Auto-merge blocked due to protected files: ${touchedProtected.join(', ')}`);
+
+      - name: Enable auto-merge when eligible and safe
+        if: steps.gate.outputs.eligible == 'true' && steps.gate.outputs.safe == 'true'
         uses: peter-evans/enable-pull-request-automerge@v3
         with:
           pull-request-number: ${{ github.event.pull_request.number }}

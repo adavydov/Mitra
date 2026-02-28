@@ -2,7 +2,7 @@ name: L0 Guard
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 jobs:
   l0-guard:
@@ -10,40 +10,40 @@ jobs:
     permissions:
       pull-requests: read
     steps:
-      - name: Check for protected L0 files via GitHub API
+      - name: Check protected perimeter via GitHub API
         uses: actions/github-script@v7
         with:
           script: |
-            const protectedFiles = new Set([
-              'governance/constitution.md',
-              'governance/identity.md',
-              'governance/normative_hierarchy.md',
-            ]);
+            const OVERRIDE_LABELS = new Set(['sovereign-override', 'l0-approved']);
+            const PROTECTED_PREFIXES = ['governance/', '.github/workflows/'];
 
             const labels = (context.payload.pull_request?.labels ?? []).map((label) => label.name);
-            const hasOverride = labels.includes('l0-approved');
+            const hasOverride = labels.some((name) => OVERRIDE_LABELS.has(name));
 
             const changedFiles = await github.paginate(github.rest.pulls.listFiles, {
               owner: context.repo.owner,
               repo: context.repo.repo,
-              pull_number: context.issue.number,
+              pull_number: context.payload.pull_request.number,
               per_page: 100,
             });
 
-            const touchedL0 = changedFiles
+            const touchedProtected = changedFiles
               .map((file) => file.filename)
-              .filter((filename) => protectedFiles.has(filename));
+              .filter((filename) => PROTECTED_PREFIXES.some((prefix) => filename.startsWith(prefix)));
 
-            if (touchedL0.length === 0) {
-              core.info('No L0 files changed.');
+            if (touchedProtected.length === 0) {
+              core.info('No protected L0 perimeter files changed. Guard passed.');
               return;
             }
 
-            core.warning(`Touched L0 files: ${touchedL0.join(', ')}`);
+            core.warning(`Protected perimeter touched: ${touchedProtected.join(', ')}`);
 
             if (hasOverride) {
-              core.info("L0 override label 'l0-approved' found. Allowing.");
+              core.info("Override label found (sovereign-override/l0-approved). Guard passed.");
               return;
             }
 
-            core.setFailed("Protected L0 files changed. Add label 'l0-approved' to merge.");
+            core.setFailed(
+              "Protected files were changed (governance/** or .github/workflows/**). " +
+              "A sovereign override label is required: add 'sovereign-override' (or legacy 'l0-approved')."
+            );
