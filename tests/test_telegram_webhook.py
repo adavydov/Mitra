@@ -1422,6 +1422,7 @@ def test_task_command_creates_codex_issue_and_reports_expected_command(monkeypat
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
     monkeypatch.setattr("mitra_app.main._build_task_spec", fake_build_task_spec)
     monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_github_issue)
+    monkeypatch.setattr("mitra_app.main._pr_rate_limiter.allow", lambda user_id: True)
 
     response = client.post(
         "/telegram/webhook",
@@ -2436,3 +2437,48 @@ def test_build_pr_status_reply_accepts_pr_reference(monkeypatch):
         "State: open\n"
         "Checks: total=3, success=2, failed=1, pending=0"
     )
+
+
+def test_task_command_creates_issue_when_llm_raises(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    class FailingAnthropicClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def create_message(self, messages, system):
+            raise RuntimeError("llm unavailable")
+
+    async def fake_create_github_issue(title: str, body: str):
+        assert "Добавь команду /hello" in title
+        assert "## Mitra meta" in body
+        return 131, "https://github.com/o/r/issues/131"
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.AnthropicClient", FailingAnthropicClient)
+    monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_github_issue)
+    monkeypatch.setattr("mitra_app.main._pr_rate_limiter.allow", lambda user_id: True)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={
+            "message": {
+                "text": "/task Добавь команду /hello в GitHub, секреты в env, риск R2, команда должна отвечать hello, дедлайн 2026-04-01",
+                "chat": {"id": 123},
+                "from": {"id": 123},
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert "Issue создан: https://github.com/o/r/issues/131" in calls[0][1]
+    assert "Spec auto-filled from request (LLM JSON parse failed)" in calls[0][1]
