@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from mitra_app.policy_enforcer import CommandPolicy, CommandPolicyEnforcer
 
 
@@ -84,3 +86,47 @@ def test_policy_enforcer_handles_invalid_or_missing_json(tmp_path):
 
     assert decision.allowed is False
     assert decision.reason == "Denied: requires AL1/R1"
+
+
+@pytest.mark.parametrize(
+    ("policy", "current_al", "expected_allowed", "expected_reason"),
+    [
+        (CommandPolicy(required_al="AL1", risk_level="R1", budget_category="search"), "AL2", True, None),
+        (CommandPolicy(required_al="AL2", risk_level="R2", budget_category="github"), "AL1", False, "Denied: requires AL2/R2"),
+        (CommandPolicy(required_al="AL3", risk_level="R3", budget_category="search"), "AL2", False, "Denied: requires AL3/R3"),
+    ],
+)
+def test_policy_enforcer_handles_synced_command_profiles(tmp_path, policy, current_al, expected_allowed, expected_reason):
+    enforcer = _make_enforcer(tmp_path, al2_max_risk="R2", llm_budget=10)
+
+    decision = enforcer.enforce(current_al=current_al, policy=policy)
+
+    assert decision.allowed is expected_allowed
+    assert decision.reason == expected_reason
+
+
+def test_policy_enforcer_denies_when_budget_category_limit_is_zero(tmp_path):
+    _write_config(
+        tmp_path,
+        "config/autonomy.json",
+        {"levels": {"AL2": {"max_risk": "R2"}}},
+    )
+    _write_config(
+        tmp_path,
+        "config/risk.json",
+        {"levels": {"R0": {}, "R1": {}, "R2": {}, "R3": {}}},
+    )
+    _write_config(
+        tmp_path,
+        "config/budget.json",
+        {"category_limits": {"llm": 0, "drive": 1, "github": 1, "search": 1}},
+    )
+    enforcer = CommandPolicyEnforcer(tmp_path)
+
+    decision = enforcer.enforce(
+        current_al="AL2",
+        policy=CommandPolicy(required_al="AL2", risk_level="R2", budget_category="llm"),
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "Denied: requires AL2/R2"
