@@ -43,7 +43,6 @@ logger = logging.getLogger(__name__)
 _THINK_PROMPT_MAX_CHARS = 1200
 _THINK_OUTPUT_MAX_CHARS = 900
 _GOAL_PREVIEW_MAX_CHARS = 160
-_TASK_PARSE_PREVIEW_MAX_CHARS = 260
 _SECRET_ENV_NAME_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|PRIVATE|API_KEY|ACCESS_KEY|CLIENT_SECRET)", re.IGNORECASE)
 _THINK_SYSTEM_PROMPT = (
     "Ты помощник в режиме /think. Нужен только анализ текста пользователя без внешних действий. "
@@ -813,26 +812,107 @@ def _build_task_parse_diagnostics(content: Any) -> dict[str, Any]:
     if not isinstance(content, list):
         return diagnostics
 
-    block_types: list[str] = []
-    text_previews: list[str] = []
+    text_blocks_count = 0
+    non_text_block_types: list[str] = []
     for block in content:
         if not isinstance(block, dict):
-            block_types.append(type(block).__name__)
+            non_text_block_types.append(type(block).__name__)
             continue
 
         block_type = str(block.get("type", "unknown"))
-        block_types.append(block_type)
-        if block_type != "text":
+        if block_type == "text":
+            text_blocks_count += 1
             continue
+        non_text_block_types.append(block_type)
 
-        text = block.get("text")
-        if isinstance(text, str) and text.strip():
-            sanitized = _sanitize_think_prompt(text.strip())
-            text_previews.append(_cap_output_chars(sanitized, _TASK_PARSE_PREVIEW_MAX_CHARS))
-
-    diagnostics["block_types"] = block_types
-    diagnostics["text_previews"] = text_previews
+    diagnostics["total_blocks"] = len(content)
+    diagnostics["text_blocks_count"] = text_blocks_count
+    diagnostics["has_non_text_blocks"] = bool(non_text_block_types)
+    diagnostics["non_text_block_types"] = sorted(set(non_text_block_types))
     return diagnostics
+
+
+def _load_capability_catalog() -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(_CAPABILITY_CATALOG_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        logger.warning("capability_catalog_unavailable", extra={"path": str(_CAPABILITY_CATALOG_PATH)})
+        return []
+
+    if not isinstance(payload, list):
+        logger.warning("capability_catalog_invalid_shape", extra={"path": str(_CAPABILITY_CATALOG_PATH)})
+        return []
+    return [entry for entry in payload if isinstance(entry, dict)]
+
+
+def _extract_intents_from_request(request_text: str) -> set[str]:
+    lowered = request_text.lower()
+    intents: set[str] = set(_INTENT_TOKEN_RE.findall(lowered))
+
+    intent_hints = {
+        "нов": "new_capability",
+        "способ": "new_capability",
+        "ability": "new_capability",
+        "capability": "new_capability",
+        "github": "github",
+        "issue": "github",
+        "search": "search",
+        "web": "search",
+        "telegram": "telegram",
+        "webhook": "telegram",
+        "drive": "drive",
+        "calendar": "calendar",
+        "report": "reporting",
+    }
+    for marker, intent in intent_hints.items():
+        if marker in lowered:
+            intents.add(intent)
+    return intents
+
+
+def detect_capability_gaps(request_text: str) -> dict[str, Any]:
+    intents = _extract_intents_from_request(request_text)
+    catalog = _load_capability_catalog()
+
+    matched: list[dict[str, Any]] = []
+    for capability in catalog:
+        capability_intents = {str(item).lower() for item in capability.get("intents", []) if str(item).strip()}
+        if capability_intents.intersection(intents):
+            matched.append(capability)
+
+    if not matched:
+        return {
+            "intents": sorted(intents),
+            "matched_capabilities": [],
+            "gaps": list(_CAPABILITY_GAP_TYPES),
+        }
+
+    has_policy = any(cap.get("policies") for cap in matched)
+    has_tests = any(cap.get("tests") for cap in matched)
+    has_secrets = any(cap.get("required_env") for cap in matched)
+    has_code = any(cap.get("tools") for cap in matched)
+    has_config = any(cap.get("tools") or cap.get("required_env") for cap in matched)
+    has_runbook = any((Path(__file__).resolve().parents[1] / "runbooks" / f"{cap.get('id', '')}.md").exists() for cap in matched)
+
+    gaps: list[str] = []
+    if not has_code:
+        gaps.append("code")
+    if not has_policy:
+        gaps.append("policy")
+    if not has_config:
+        gaps.append("config")
+    if not has_tests:
+        gaps.append("tests")
+    if not has_secrets:
+        gaps.append("secrets")
+    if not has_runbook:
+        gaps.append("runbook")
+
+    return {
+        "intents": sorted(intents),
+        "matched_capabilities": [str(cap.get("id", "unknown")) for cap in matched],
+        "gaps": gaps,
+    }
 
 
 def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = None) -> dict[str, Any]:
@@ -946,6 +1026,18 @@ def _render_task_issue(spec: dict[str, Any]) -> tuple[str, str]:
     body_lines.extend(render_list("Tests to add", spec.get("tests_to_add", [])))
     body_lines.append("")
     body_lines.append(f"## Risk level\n- {spec.get('risk_level', 'R2')}")
+
+    capability_gaps = [str(item) for item in spec.get("capability_gaps", []) if str(item).strip()]
+    if capability_gaps:
+        body_lines.append("")
+        body_lines.append("## Capability gaps to close")
+        body_lines.append("Заполнить каждый раздел ниже перед началом реализации.")
+        for gap in capability_gaps:
+            body_lines.append("")
+            body_lines.append(f"### GAP: {gap}")
+            body_lines.append("- Context:")
+            body_lines.append("- Proposed change:")
+            body_lines.append("- Validation:")
 
     return title, "\n".join(body_lines).strip()
 
