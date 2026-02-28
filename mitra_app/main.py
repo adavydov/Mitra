@@ -995,10 +995,15 @@ def detect_capability_gaps(request_text: str) -> dict[str, Any]:
             matched.append(capability)
 
     if not matched:
+        gaps = list(_CAPABILITY_GAP_TYPES)
         return {
             "intents": sorted(intents),
             "matched_capabilities": [],
-            "gaps": list(_CAPABILITY_GAP_TYPES),
+            "gaps": gaps,
+            "coverage_status": "missing",
+            "gap_closure_notes": [
+                f"{gap}: capability отсутствует в каталоге — требуется явная реализация/описание." for gap in gaps
+            ],
         }
 
     artifact_state = [_resolve_capability_artifacts(capability) for capability in matched]
@@ -1049,7 +1054,25 @@ def detect_capability_gaps(request_text: str) -> dict[str, Any]:
         "intents": sorted(intents),
         "matched_capabilities": [str(cap.get("id", "unknown")) for cap in matched],
         "gaps": gaps,
+        "coverage_status": "covered" if not gaps else "partial",
+        "gap_closure_notes": [
+            (
+                f"{gap}: capability частично реализована ({', '.join(str(cap.get('id', 'unknown')) for cap in matched)}) — "
+                "нужно закрыть недостающий блок."
+            )
+            for gap in gaps
+        ],
     }
+
+
+def _build_gap_summary(detection: dict[str, Any]) -> str:
+    gaps = _normalize_string_list(detection.get("gaps"))
+    if not gaps:
+        return "Gap summary: gaps не обнаружены."
+
+    coverage_status = str(detection.get("coverage_status", "partial")).strip() or "partial"
+    prefix = "missing capability" if coverage_status == "missing" else "partial capability"
+    return f"Gap summary: {prefix}, закрыть блоки: {', '.join(gaps)}"
 
 
 def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = None) -> dict[str, Any]:
@@ -1173,11 +1196,14 @@ def _render_task_issue(spec: dict[str, Any]) -> tuple[str, str]:
     body_lines.extend(render_list("Allowed file scope", spec.get("allowed_file_scope", ["mitra_app/*", "tests/*"])))
 
     capability_gaps = _normalize_string_list(spec.get("capability_gaps"))
+    capability_gap_notes = _normalize_string_list(spec.get("capability_gap_notes"))
     if capability_gaps:
         body_lines.append("")
         body_lines.append("## Capability gaps to close")
-        for gap in capability_gaps:
+        for idx, gap in enumerate(capability_gaps):
             body_lines.append(f"### GAP: {gap}")
+            if idx < len(capability_gap_notes):
+                body_lines.append(f"- {capability_gap_notes[idx]}")
             body_lines.append(f"- Закрыть системный разрыв `{gap}`: код, проверки, документация/политики по необходимости.")
 
     return title, "\n".join(body_lines).strip()
@@ -2009,8 +2035,9 @@ async def telegram_webhook(
                     )
                     spec = _build_task_spec(enriched_request)
                     degraded = bool(spec.get("degraded"))
-                    capability_detection = detect_capability_gaps(enriched_request)
+                    capability_detection = detect_capability_gaps(pending_task_state.request_text)
                     spec["capability_gaps"] = capability_detection.get("gaps", [])
+                    spec["capability_gap_notes"] = capability_detection.get("gap_closure_notes", [])
                     issue_title, issue_body = _render_task_issue(spec)
                     issue_number, issue_url = await _create_github_issue(title=issue_title, body=issue_body)
                     await budget_ledger.record_github_write()
@@ -2025,6 +2052,7 @@ async def telegram_webhook(
                     detected_gaps = capability_detection.get("gaps") or []
                     if detected_gaps:
                         lines.append("Обнаружены gaps: " + ", ".join(detected_gaps))
+                        lines.append(_build_gap_summary(capability_detection))
                     if degraded:
                         lines.append("Spec auto-filled from request (LLM JSON parse failed)")
                     lines.append(_TASK_EXAMPLE_HINT)
@@ -2393,6 +2421,7 @@ async def telegram_webhook(
                         degraded = bool(spec.get("degraded"))
                         capability_detection = detect_capability_gaps(request_text)
                         spec["capability_gaps"] = capability_detection.get("gaps", [])
+                        spec["capability_gap_notes"] = capability_detection.get("gap_closure_notes", [])
                         issue_title, issue_body = _render_task_issue(spec)
                         issue_number, issue_url = await _create_github_issue(title=issue_title, body=issue_body)
                         await budget_ledger.record_github_write()
@@ -2407,6 +2436,7 @@ async def telegram_webhook(
                         detected_gaps = capability_detection.get("gaps") or []
                         if detected_gaps:
                             lines.append("Обнаружены gaps: " + ", ".join(detected_gaps))
+                            lines.append(_build_gap_summary(capability_detection))
                         if degraded:
                             lines.append("Spec auto-filled from request (LLM JSON parse failed)")
                         lines.append(_TASK_EXAMPLE_HINT)
