@@ -68,6 +68,17 @@ _TASK_SYSTEM_PROMPT = (
     "required_env_secrets указывай только именами переменных без значений."
 )
 
+_TASK_RETRY_SYSTEM_PROMPT = (
+    "Ты переводишь пользовательскую задачу в codex-ready спецификацию issue для GitHub. "
+    "Ответь строго одним валидным JSON-объектом и ничем больше. "
+    "Запрещены markdown-блоки, комментарии, пояснения, префиксы/суффиксы текста. "
+    "Ключи JSON: title, summary, components, required_env_secrets, new_commands, "
+    "acceptance_criteria, tests_to_add, risk_level. "
+    "components/new_commands/required_env_secrets/acceptance_criteria/tests_to_add — массивы строк. "
+    "risk_level — одно из R0,R1,R2,R3,R4. "
+    "required_env_secrets указывай только именами переменных без значений."
+)
+
 _TASK_EXAMPLE_HINT = (
     "Тестовый кейс для полного цикла: /task Добавь команду /hello которая отвечает \"hello from mitra\" "
     "и покрыта тестом."
@@ -684,6 +695,33 @@ def _build_fallback_task_spec(request_text: str) -> dict[str, Any]:
     }
 
 
+def _build_task_parse_diagnostics(content: Any) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {"content_type": type(content).__name__}
+    if not isinstance(content, list):
+        return diagnostics
+
+    block_types: list[str] = []
+    text_previews: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            block_types.append(type(block).__name__)
+            continue
+
+        block_type = str(block.get("type", "unknown"))
+        block_types.append(block_type)
+        if block_type != "text":
+            continue
+
+        text = block.get("text")
+        if isinstance(text, str) and text.strip():
+            sanitized = _sanitize_think_prompt(text.strip())
+            text_previews.append(_cap_output_chars(sanitized, _TASK_PARSE_PREVIEW_MAX_CHARS))
+
+    diagnostics["block_types"] = block_types
+    diagnostics["text_previews"] = text_previews
+    return diagnostics
+
+
 def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = None) -> dict[str, Any]:
     client = llm_client or AnthropicClient(max_tokens_out=900)
     response = client.create_message(
@@ -702,8 +740,50 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
 
     parsed = _extract_json_object("\n".join(text_blocks))
     if not parsed:
-        logger.warning("task_spec_degraded_json_parse_failed")
-        return _build_fallback_task_spec(request_text)
+        logger.warning("task_spec_parse_primary_failed", extra=parse_diagnostics)
+
+        retry_response = client.create_message(
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "Верни строго JSON-объект по схеме из system prompt без markdown и комментариев.\n"
+                        f"Запрос пользователя: {request_text}"
+                    ),
+                }
+            ],
+            system=_TASK_RETRY_SYSTEM_PROMPT,
+        )
+        retry_content = retry_response.get("content")
+        retry_diagnostics = _build_task_parse_diagnostics(retry_content)
+        retry_text_blocks: list[str] = []
+        if isinstance(retry_content, list):
+            for block in retry_content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text")
+                    if isinstance(text, str) and text.strip():
+                        retry_text_blocks.append(text.strip())
+
+        parsed = _extract_json_object("\n".join(retry_text_blocks))
+        if not parsed:
+            logger.warning(
+                "task_spec_fallback_used",
+                extra={
+                    "parse_outcome": "fallback_used",
+                    "primary_parse": parse_diagnostics,
+                    "retry_parse": retry_diagnostics,
+                },
+            )
+            return _build_fallback_task_spec(request_text)
+
+        logger.info(
+            "task_spec_retry_success",
+            extra={
+                "parse_outcome": "retry_success",
+                "primary_parse": parse_diagnostics,
+                "retry_parse": retry_diagnostics,
+            },
+        )
 
     risk_level = str(parsed.get("risk_level", "R2")).strip().upper()
     if risk_level not in {"R0", "R1", "R2", "R3", "R4"}:
