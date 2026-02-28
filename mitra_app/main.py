@@ -52,7 +52,7 @@ _THINK_SYSTEM_PROMPT = (
 
 HELP_TEXT = (
     "Commands: /status, /oauth_status, /search <query>, /research <query>, /think <prompt>, "
-    "/report <text>, /pr <title>\\n<spec>, /pr_status <issue#|pr#>, /drive_check, /budget, "
+    "/report <text>, /pr <title>\\n<spec>, /pr_status <issue#|pr#>, /evo_issue <n> [risk:R0-R3], /drive_check, /budget, "
     "/smoke, /smoke_deep"
 )
 
@@ -193,6 +193,7 @@ _COMMAND_POLICIES: dict[str, CommandPolicy] = {
     "/reports": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
     "/report": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
     "/pr_status": CommandPolicy(required_al="AL1", risk_level="R1", budget_category="search"),
+    "/evo_issue": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="search"),
     "/drive_check": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
     "/budget": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
 }
@@ -371,6 +372,121 @@ async def _create_github_issue(title: str, body: str) -> tuple[int, str]:
         raise RuntimeError("GitHub issue create returned invalid response")
 
     return issue_number, issue_url
+
+
+def _parse_evo_issue_command(text: str) -> tuple[int, str | None] | None:
+    payload = text[len("/evo_issue") :].strip()
+    if not payload:
+        return None
+
+    parts = payload.split()
+    if not parts:
+        return None
+
+    try:
+        hypothesis_number = int(parts[0])
+    except ValueError:
+        return None
+
+    if hypothesis_number <= 0:
+        return None
+
+    risk_label: str | None = None
+    for part in parts[1:]:
+        candidate = part.strip().lower()
+        if re.fullmatch(r"risk:r[0-3]", candidate):
+            risk_label = f"risk:R{candidate[-1]}"
+            continue
+        return None
+
+    return hypothesis_number, risk_label
+
+
+def _load_last_evo0_report() -> tuple[str, str]:
+    candidates: list[Path] = []
+    configured_path = os.getenv("MITRA_EVO0_REPORT_PATH", "").strip()
+    if configured_path:
+        candidates.append(Path(configured_path))
+
+    reports_dir = Path("reports")
+    if reports_dir.exists():
+        report_files = sorted(
+            reports_dir.glob("**/*"),
+            key=lambda path: path.stat().st_mtime if path.is_file() else -1,
+            reverse=True,
+        )
+        for path in report_files:
+            if not path.is_file():
+                continue
+            name = path.name.lower()
+            if "evo" in name or "governance_hierarchy_v0" in name:
+                candidates.append(path)
+
+    for candidate in candidates:
+        try:
+            content = candidate.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if content:
+            return content, str(candidate)
+
+    raise FileNotFoundError("EVO-0 report not found")
+
+
+def _extract_evo_hypotheses(report_text: str) -> list[str]:
+    hypotheses: list[str] = []
+
+    try:
+        payload = json.loads(report_text)
+    except json.JSONDecodeError:
+        payload = None
+
+    if isinstance(payload, dict):
+        raw_items = payload.get("hypotheses")
+        if isinstance(raw_items, list):
+            for item in raw_items:
+                if isinstance(item, str) and item.strip():
+                    hypotheses.append(item.strip())
+                elif isinstance(item, dict):
+                    for key in ("statement", "title", "text", "hypothesis"):
+                        value = item.get(key)
+                        if isinstance(value, str) and value.strip():
+                            hypotheses.append(value.strip())
+                            break
+
+    if hypotheses:
+        return hypotheses
+
+    for line in report_text.splitlines():
+        match = re.match(r"^\s*\d+[\.)]\s+(.+)$", line.strip())
+        if match:
+            hypotheses.append(match.group(1).strip())
+
+    return hypotheses
+
+
+def _build_evo_issue_body(*, hypothesis: str, report_source: str, risk_level: str) -> str:
+    return (
+        "## What/Why\n"
+        f"- Hypothesis selected from latest EVO-0 report: {hypothesis}\n"
+        "- Convert analysis into a verifiable engineering contract.\n\n"
+        "## Scope\n"
+        "- Implement only the minimum changes required to validate this hypothesis.\n"
+        "- Keep solution aligned with mitra governance hierarchy constraints.\n\n"
+        "## Acceptance criteria\n"
+        "- [ ] Change is testable and tied to the selected hypothesis.\n"
+        "- [ ] Bot/API behavior is explicit (no \"make it pretty\" ambiguity).\n"
+        "- [ ] Audit trail records creation and execution outcomes.\n\n"
+        "## Tests required\n"
+        "- [ ] Unit tests for command parsing and payload construction.\n"
+        "- [ ] Integration test for webhook command happy-path and failure-path.\n\n"
+        f"## Risk level (R0-R3)\n- {risk_level}\n\n"
+        "## Guardrails\n"
+        "- Do not modify governance/* files.\n"
+        "- Do not change ALLOWED_TELEGRAM_USER_IDS behavior.\n"
+        "- Do not add new secrets in code or commit secrets.\n\n"
+        f"_Source report: `{report_source}`_"
+    )
 
 
 
@@ -1086,6 +1202,63 @@ async def telegram_webhook(
                         "issue_number": issue_number,
                         "outcome": outcome,
                         "log_level": "info" if outcome in {"success", "usage"} else "error",
+                    }
+                )
+        elif text.startswith("/evo_issue"):
+            parsed = _parse_evo_issue_command(text)
+            if not parsed:
+                reply_text = "Usage: /evo_issue <n> [risk:R0-R3]"
+            else:
+                hypothesis_number, risk_label = parsed
+                issue_number: int | None = None
+                issue_url: str | None = None
+                try:
+                    report_text, report_source = _load_last_evo0_report()
+                    hypotheses = _extract_evo_hypotheses(report_text)
+                    if not hypotheses or hypothesis_number > len(hypotheses):
+                        reply_text = f"Hypothesis #{hypothesis_number} not found in latest EVO-0 report"
+                        outcome = "not_found"
+                    else:
+                        selected = hypotheses[hypothesis_number - 1]
+                        risk_level = risk_label.replace("risk:", "") if risk_label else "R1"
+                        title = f"EVO hands: hypothesis {hypothesis_number} -> executable issue"
+                        body = _build_evo_issue_body(
+                            hypothesis=selected,
+                            report_source=report_source,
+                            risk_level=risk_level,
+                        )
+                        labels = ["mitra:codex"]
+                        if risk_label:
+                            labels.append(risk_label)
+
+                        issue = await github.create_issue(title=title, body=body, labels=labels)
+                        await budget_ledger.record_github_write()
+                        issue_number = issue.number
+                        issue_url = issue.html_url
+                        reply_text = f"Created EVO issue: {issue_url}"
+                        outcome = "success"
+                except FileNotFoundError:
+                    reply_text = "EVO-0 report not found"
+                    outcome = "missing_report"
+                except Exception:
+                    logger.exception("telegram_evo_issue_create_failed")
+                    reply_text = "Failed to create EVO issue"
+                    outcome = "error"
+
+                _safe_audit_event(
+                    {
+                        "event": "telegram_evo_issue",
+                        "action_id": action_id,
+                        "telegram_update_id": telegram_update_id,
+                        "user_id": user_id,
+                        "chat_id": chat_id,
+                        "action_type": "/evo_issue",
+                        "hypothesis_number": hypothesis_number,
+                        "issue_number": issue_number,
+                        "issue_url": issue_url,
+                        "risk_label": risk_label,
+                        "outcome": outcome,
+                        "log_level": "info" if outcome in {"success", "not_found", "missing_report"} else "error",
                     }
                 )
         elif text.startswith("/drive_check"):
