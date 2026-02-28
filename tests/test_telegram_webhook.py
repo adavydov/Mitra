@@ -1612,6 +1612,13 @@ def test_task_command_includes_gap_sections_in_issue_body(monkeypatch):
     assert "Обнаружены gaps: code, policy, config, tests, secrets, runbook" in calls[0][1]
 
 
+def test_detect_capability_gaps_for_calendar_management_request_returns_calendar_artifact_gaps():
+    detection = detect_capability_gaps("Нужно управлять календарём: перенос встреч и проверка доступности команды")
+
+    assert detection["matched_capabilities"] == ["calendar"]
+    assert detection["gaps"] == ["code", "tests", "runbook"]
+
+
 def test_task_command_calendar_logs_detected_gaps_and_capabilities(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
@@ -1626,8 +1633,8 @@ def test_task_command_calendar_logs_detected_gaps_and_capabilities(monkeypatch):
     async def fake_create_github_issue(title: str, body: str):
         assert title == "Calendar sync hardening"
         assert "## Capability gaps to close" in body
+        assert "### GAP: code" in body
         assert "### GAP: tests" in body
-        assert "### GAP: secrets" in body
         assert "### GAP: runbook" in body
         return 120, "https://github.com/o/r/issues/120"
 
@@ -1667,11 +1674,11 @@ def test_task_command_calendar_logs_detected_gaps_and_capabilities(monkeypatch):
 
     assert response.status_code == 200
     assert len(calls) == 1
-    assert "Обнаружены gaps: tests, secrets, runbook" in calls[0][1]
+    assert "Обнаружены gaps: code, tests, runbook" in calls[0][1]
 
     task_audit = next(event for event in audits if event.get("event") == "telegram_task_open_issue")
     assert task_audit["matched_capabilities"] == ["calendar"]
-    assert task_audit["capability_gaps"] == ["tests", "secrets", "runbook"]
+    assert task_audit["capability_gaps"] == ["code", "tests", "runbook"]
 
 
 def test_extract_json_object_handles_dirty_text_with_fenced_block_and_json():

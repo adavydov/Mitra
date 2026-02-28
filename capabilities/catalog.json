@@ -1,42 +1,121 @@
 [
   {
     "id": "telegram",
-    "intents": ["telegram", "webhook", "bot"],
-    "tools": ["telegram_api", "fastapi"],
-    "required_env": ["TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET"],
-    "policies": ["policy/access_control.md", "policy/self_modification.md"],
-    "tests": ["tests/test_telegram_webhook.py"]
+    "intents": [
+      "telegram",
+      "webhook",
+      "bot"
+    ],
+    "tools": [
+      "telegram_api",
+      "fastapi"
+    ],
+    "required_env": [
+      "TELEGRAM_BOT_TOKEN",
+      "TELEGRAM_WEBHOOK_SECRET"
+    ],
+    "policies": [
+      "policy/access_control.md",
+      "policy/self_modification.md"
+    ],
+    "tests": [
+      "tests/test_telegram_webhook.py"
+    ]
   },
   {
     "id": "github",
-    "intents": ["github", "issue", "pr", "repository"],
-    "tools": ["github_api"],
-    "required_env": ["GITHUB_TOKEN"],
-    "policies": ["policy/merge_rules.md", "policy/content_and_ip.md"],
-    "tests": ["tests/test_github.py", "tests/test_telegram_webhook.py"]
+    "intents": [
+      "github",
+      "issue",
+      "pr",
+      "repository"
+    ],
+    "tools": [
+      "github_api"
+    ],
+    "required_env": [
+      "GITHUB_TOKEN"
+    ],
+    "policies": [
+      "policy/merge_rules.md",
+      "policy/content_and_ip.md"
+    ],
+    "tests": [
+      "tests/test_github.py",
+      "tests/test_telegram_webhook.py"
+    ]
   },
   {
     "id": "drive",
-    "intents": ["drive", "docs", "reporting"],
-    "tools": ["google_drive_api"],
-    "required_env": ["DRIVE_SERVICE_ACCOUNT_JSON", "DRIVE_OAUTH_REFRESH_TOKEN"],
-    "policies": ["policy/data_handling.md"],
-    "tests": ["tests/test_drive.py"]
+    "intents": [
+      "drive",
+      "docs",
+      "reporting"
+    ],
+    "tools": [
+      "google_drive_api"
+    ],
+    "required_env": [
+      "DRIVE_SERVICE_ACCOUNT_JSON",
+      "DRIVE_OAUTH_REFRESH_TOKEN"
+    ],
+    "policies": [
+      "policy/data_handling.md"
+    ],
+    "tests": [
+      "tests/test_drive.py"
+    ]
   },
   {
     "id": "calendar",
-    "intents": ["calendar", "meeting", "schedule"],
-    "tools": ["google_calendar_api"],
+    "intents": [
+      "calendar",
+      "meeting",
+      "schedule"
+    ],
+    "tools": [],
     "required_env": [],
-    "policies": ["policy/calendar.md"],
-    "tests": []
+    "policies": [
+      "policy/calendar.md"
+    ],
+    "tests": [],
+    "minimum_implementation": [
+      "code",
+      "tests",
+      "runbook"
+    ],
+    "implemented": false,
+    "artifacts": {
+      "code": [
+        "mitra_app/handlers/calendar.py",
+        "mitra_app/modules/calendar.py",
+        "service/calendar.py"
+      ],
+      "runbook": [
+        "runbooks/calendar.md"
+      ]
+    }
   },
   {
     "id": "browsing",
-    "intents": ["search", "web", "browse", "research"],
-    "tools": ["brave_search"],
-    "required_env": ["BRAVE_SEARCH_API_KEY"],
-    "policies": ["policy/data_handling.md"],
-    "tests": ["tests/test_search.py", "tests/test_research.py"]
+    "intents": [
+      "search",
+      "web",
+      "browse",
+      "research"
+    ],
+    "tools": [
+      "brave_search"
+    ],
+    "required_env": [
+      "BRAVE_SEARCH_API_KEY"
+    ],
+    "policies": [
+      "policy/data_handling.md"
+    ],
+    "tests": [
+      "tests/test_search.py",
+      "tests/test_research.py"
+    ]
   }
 ]
