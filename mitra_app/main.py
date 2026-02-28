@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 _THINK_PROMPT_MAX_CHARS = 1200
 _THINK_OUTPUT_MAX_CHARS = 900
 _GOAL_PREVIEW_MAX_CHARS = 160
+_TASK_PARSE_PREVIEW_MAX_CHARS = 260
 _SECRET_ENV_NAME_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|PRIVATE|API_KEY|ACCESS_KEY|CLIENT_SECRET)", re.IGNORECASE)
 _THINK_SYSTEM_PROMPT = (
     "Ты помощник в режиме /think. Нужен только анализ текста пользователя без внешних действий. "
@@ -690,6 +691,7 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
         system=_TASK_SYSTEM_PROMPT,
     )
     content = response.get("content")
+    parse_diagnostics = _build_task_parse_diagnostics(content)
     text_blocks: list[str] = []
     if isinstance(content, list):
         for block in content:
