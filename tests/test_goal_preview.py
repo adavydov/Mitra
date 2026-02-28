@@ -1,4 +1,4 @@
-from mitra_app.main import _truncate_goal_preview
+from mitra_app.main import _GOAL_PREVIEW_MAX_CHARS, _truncate_goal_preview
 
 
 def test_truncate_goal_preview_long_text() -> None:
@@ -7,7 +7,7 @@ def test_truncate_goal_preview_long_text() -> None:
     preview = _truncate_goal_preview(long_goal)
 
     assert preview.endswith("…")
-    assert len(preview) == 501
+    assert len(preview) == _GOAL_PREVIEW_MAX_CHARS + 1
 
 
 def test_truncate_goal_preview_short_text() -> None:

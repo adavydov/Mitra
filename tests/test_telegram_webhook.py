@@ -18,6 +18,7 @@ from mitra_app.main import (
     RecentUpdateDeduplicator,
     _COMMAND_POLICIES,
     _build_pr_status_reply,
+    _extract_think_prompt,
     _load_allowed_user_ids,
     _parse_evo_issue_command,
     _parse_pr_or_issue_ref,
@@ -236,6 +237,24 @@ def test_reflect_command_returns_summary_and_drive_link_without_thinking(monkeyp
     assert "<thinking>" not in reply
     assert reply.count("- ") >= 3
     assert "https://drive.test/evo0" in reply
+
+def test_extract_think_prompt_parses_relevant_command_only():
+    assert _extract_think_prompt("/think Составь план") == "Составь план"
+    assert _extract_think_prompt("/think\nСоставь план") == "Составь план"
+
+
+def test_extract_think_prompt_ignores_irrelevant_prefixes():
+    assert _extract_think_prompt("/thinker Составь план") == ""
+    assert _extract_think_prompt("/thinking Составь план") == ""
+    assert _extract_think_prompt("/think123 Составь план") == ""
+
+
+def test_reflect_system_prompt_matches_expected_text():
+    assert _REFLECT_SYSTEM_PROMPT == (
+        "Ты формируешь только EVO-0 отчёт для человека-оператора в режиме AL0. "
+        "Не выполняй действия, не вызывай инструменты и не предлагай автозапуски. "
+        "Верни только итоговый отчёт без chain-of-thought."
+    )
 
 def test_think_command_returns_short_read_only_response(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
