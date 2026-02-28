@@ -521,6 +521,17 @@ def _enrich_task_request_with_context(request_text: str, context: MissingContext
     return "\n".join(lines).strip()
 
 
+def _serialize_task_dialog_state(state: TaskDialogState | None) -> dict[str, Any] | None:
+    if state is None:
+        return None
+    return {
+        "missing_fields": state.context.missing_fields(),
+        "filled_fields_count": state.context.filled_fields_count(),
+        "last_question_field": state.last_question_field,
+        "turns_count": len(state.turns),
+    }
+
+
 def _parse_goal_command(text: str) -> tuple[str, str | None] | None:
     normalized = text.strip()
     if normalized == "/goal":
@@ -820,6 +831,7 @@ def _build_fallback_task_spec(request_text: str) -> dict[str, Any]:
         "risk_level": "R2",
         "allowed_file_scope": ["mitra_app/*", "tests/*"],
         "degraded": True,
+        "parse_outcome": "fallback",
     }
 
 
@@ -960,6 +972,7 @@ def detect_capability_gaps(request_text: str) -> dict[str, Any]:
 
 
 def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = None) -> dict[str, Any]:
+    parse_outcome = "primary"
     client = llm_client or AnthropicClient(max_tokens_out=900)
     response = client.create_message(
         messages=[{"role": "user", "content": request_text}],
@@ -1012,9 +1025,10 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
                     "retry_parse": retry_diagnostics,
                 },
             )
-            logger.warning("task_spec_degraded_json_parse_failed")
+            logger.warning("task_spec_fallback_used")
             return _build_fallback_task_spec(request_text)
 
+        parse_outcome = "retry"
         logger.info(
             "task_spec_retry_success",
             extra={
@@ -1046,6 +1060,7 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
         "risk_level": risk_level,
         "allowed_file_scope": _normalize_string_list(parsed.get("allowed_file_scope")) or ["mitra_app/*", "tests/*"],
         "degraded": False,
+        "parse_outcome": parse_outcome,
     }
 
 
@@ -1890,8 +1905,10 @@ async def telegram_webhook(
                 reply_text = question
             else:
                 issue_number: int | None = None
+                issue_url: str | None = None
                 degraded = False
                 capability_detection = {"intents": [], "matched_capabilities": [], "gaps": []}
+                spec: dict[str, Any] = {}
                 try:
                     enriched_request = _enrich_task_request_with_context(
                         pending_task_state.request_text,
@@ -1934,10 +1951,15 @@ async def telegram_webhook(
                         "chat_id": chat_id,
                         "action_type": "/task",
                         "issue_number": issue_number,
+                        "issue_url": issue_url if outcome in {"success", "degraded"} else None,
                         "degraded": degraded,
-                        "detected_intents": capability_detection.get("intents", []),
+                        "request_intents": capability_detection.get("intents", []),
                         "matched_capabilities": capability_detection.get("matched_capabilities", []),
-                        "capability_gaps": capability_detection.get("gaps", []),
+                        "detected_gaps": capability_detection.get("gaps", []),
+                        "parse_outcome": spec.get("parse_outcome", "fallback" if degraded else "primary") if outcome in {"success", "degraded"} else "fallback",
+                        "risk_level": spec.get("risk_level") if outcome in {"success", "degraded"} else None,
+                        "allowed_file_scope": spec.get("allowed_file_scope") if outcome in {"success", "degraded"} else None,
+                        "dialog_state": _serialize_task_dialog_state(pending_task_state),
                         "outcome": outcome,
                         "log_level": "info" if outcome in {"success", "degraded"} else "error",
                     }
@@ -2276,8 +2298,10 @@ async def telegram_webhook(
                     reply_text = question
                 else:
                     issue_number: int | None = None
+                    issue_url: str | None = None
                     degraded = False
                     capability_detection = {"intents": [], "matched_capabilities": [], "gaps": []}
+                    spec: dict[str, Any] = {}
                     try:
                         spec = _build_task_spec(request_text)
                         degraded = bool(spec.get("degraded"))
@@ -2316,10 +2340,15 @@ async def telegram_webhook(
                             "chat_id": chat_id,
                             "action_type": "/task",
                             "issue_number": issue_number,
+                            "issue_url": issue_url if outcome in {"success", "degraded"} else None,
                             "degraded": degraded,
-                            "detected_intents": capability_detection.get("intents", []),
+                            "request_intents": capability_detection.get("intents", []),
                             "matched_capabilities": capability_detection.get("matched_capabilities", []),
-                            "capability_gaps": capability_detection.get("gaps", []),
+                            "detected_gaps": capability_detection.get("gaps", []),
+                            "parse_outcome": spec.get("parse_outcome", "fallback" if degraded else "primary") if outcome in {"success", "degraded"} else "fallback",
+                            "risk_level": spec.get("risk_level") if outcome in {"success", "degraded"} else None,
+                            "allowed_file_scope": spec.get("allowed_file_scope") if outcome in {"success", "degraded"} else None,
+                            "dialog_state": _serialize_task_dialog_state(None),
                             "outcome": outcome,
                             "log_level": "info" if outcome in {"success", "degraded"} else "error",
                         }
@@ -2451,6 +2480,21 @@ async def telegram_webhook(
             reply_text = HELP_TEXT
         else:
             reply_text = "Unknown command"
+            _safe_audit_event(
+                {
+                    "event": "telegram_unknown_command",
+                    "action_id": action_id,
+                    "telegram_update_id": telegram_update_id,
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "action_type": "unknown",
+                    "text": text[:200],
+                    "reason_code": "unknown_command",
+                    "dialog_state": _serialize_task_dialog_state(pending_task_state),
+                    "outcome": "ignored",
+                    "log_level": "info",
+                }
+            )
 
         if chat_id is not None:
             await send_message(chat_id=chat_id, text=reply_text)
