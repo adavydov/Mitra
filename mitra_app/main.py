@@ -61,8 +61,11 @@ HELP_TEXT = (
 _TASK_SYSTEM_PROMPT = (
     "Ты переводишь пользовательскую задачу в codex-ready спецификацию issue для GitHub. "
     "Верни только JSON-объект с ключами: title, summary, components, required_env_secrets, "
-    "new_commands, acceptance_criteria, tests_to_add, risk_level. "
-    "components/new_commands/required_env_secrets/acceptance_criteria/tests_to_add должны быть массивами строк. "
+    "new_commands, acceptance_criteria, tests_to_add, risk_level, task_type, missing_capabilities, "
+    "required_code_changes, policy_config_updates, acceptance_checks, rollback_safety. "
+    "components/new_commands/required_env_secrets/acceptance_criteria/tests_to_add/missing_capabilities/"
+    "required_code_changes/policy_config_updates/acceptance_checks/rollback_safety должны быть массивами строк. "
+    "task_type должен быть одним из: new capability, bugfix, maintenance, research. "
     "risk_level должен быть одним из R0,R1,R2,R3,R4. "
     "required_env_secrets указывай только именами переменных без значений."
 )
@@ -72,8 +75,11 @@ _TASK_RETRY_SYSTEM_PROMPT = (
     "Ответь строго одним валидным JSON-объектом и ничем больше. "
     "Запрещены markdown-блоки, комментарии, пояснения, префиксы/суффиксы текста. "
     "Ключи JSON: title, summary, components, required_env_secrets, new_commands, "
-    "acceptance_criteria, tests_to_add, risk_level. "
-    "components/new_commands/required_env_secrets/acceptance_criteria/tests_to_add — массивы строк. "
+    "acceptance_criteria, tests_to_add, risk_level, task_type, missing_capabilities, "
+    "required_code_changes, policy_config_updates, acceptance_checks, rollback_safety. "
+    "components/new_commands/required_env_secrets/acceptance_criteria/tests_to_add/missing_capabilities/"
+    "required_code_changes/policy_config_updates/acceptance_checks/rollback_safety — массивы строк. "
+    "task_type — одно из: new capability, bugfix, maintenance, research. "
     "risk_level — одно из R0,R1,R2,R3,R4. "
     "required_env_secrets указывай только именами переменных без значений."
 )
@@ -706,8 +712,42 @@ def _build_fallback_task_spec(request_text: str) -> dict[str, Any]:
         "acceptance_criteria": [],
         "tests_to_add": [],
         "risk_level": "R2",
+        "task_type": "maintenance",
+        "missing_capabilities": [],
+        "required_code_changes": [],
+        "policy_config_updates": [],
+        "acceptance_checks": [],
+        "rollback_safety": [],
         "degraded": True,
     }
+
+
+_NEW_CAPABILITY_SECTION_KEYS: "OrderedDict[str, str]" = OrderedDict(
+    [
+        ("Missing capabilities", "missing_capabilities"),
+        ("Required code changes (paths/modules)", "required_code_changes"),
+        ("Policy/config updates", "policy_config_updates"),
+        ("Acceptance checks", "acceptance_checks"),
+        ("Rollback/safety", "rollback_safety"),
+    ]
+)
+
+
+def _normalize_task_type(task_type: Any) -> str:
+    normalized = str(task_type or "maintenance").strip().lower()
+    allowed = {"new capability", "bugfix", "maintenance", "research"}
+    if normalized in allowed:
+        return normalized
+    return "maintenance"
+
+
+def _new_capability_missing_sections(spec: dict[str, Any]) -> list[str]:
+    missing: list[str] = []
+    for section_title, section_key in _NEW_CAPABILITY_SECTION_KEYS.items():
+        values = _normalize_string_list(spec.get(section_key))
+        if not values:
+            missing.append(section_title)
+    return missing
 
 
 def _build_task_parse_diagnostics(content: Any) -> dict[str, Any]:
@@ -825,6 +865,7 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
         system=_TASK_SYSTEM_PROMPT,
     )
     content = response.get("content")
+    parse_diagnostics = _build_task_parse_diagnostics(content)
     text_blocks: list[str] = []
     if isinstance(content, list):
         for block in content:
@@ -902,6 +943,12 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
         "acceptance_criteria": _normalize_string_list(parsed.get("acceptance_criteria")),
         "tests_to_add": _normalize_string_list(parsed.get("tests_to_add")),
         "risk_level": risk_level,
+        "task_type": _normalize_task_type(parsed.get("task_type")),
+        "missing_capabilities": _normalize_string_list(parsed.get("missing_capabilities")),
+        "required_code_changes": _normalize_string_list(parsed.get("required_code_changes")),
+        "policy_config_updates": _normalize_string_list(parsed.get("policy_config_updates")),
+        "acceptance_checks": _normalize_string_list(parsed.get("acceptance_checks")),
+        "rollback_safety": _normalize_string_list(parsed.get("rollback_safety")),
         "degraded": False,
     }
 
@@ -929,7 +976,25 @@ def _render_task_issue(spec: dict[str, Any]) -> tuple[str, str]:
     body_lines.append("")
     body_lines.extend(render_list("Tests to add", spec.get("tests_to_add", [])))
     body_lines.append("")
+    for section_title, section_key in _NEW_CAPABILITY_SECTION_KEYS.items():
+        body_lines.extend(render_list(section_title, spec.get(section_key, [])))
+        body_lines.append("")
     body_lines.append(f"## Risk level\n- {spec.get('risk_level', 'R2')}")
+    body_lines.append("")
+    task_type = _normalize_task_type(spec.get("task_type"))
+    missing_sections = _new_capability_missing_sections(spec) if task_type == "new capability" else []
+    machine_check_payload = {
+        "task_type": task_type,
+        "mandatory_sections": {
+            section_key: bool(_normalize_string_list(spec.get(section_key)))
+            for section_key in _NEW_CAPABILITY_SECTION_KEYS.values()
+        },
+        "mandatory_sections_complete": not missing_sections,
+    }
+    body_lines.append("## CI completeness block")
+    body_lines.append("```json")
+    body_lines.append(json.dumps(machine_check_payload, ensure_ascii=False, sort_keys=True))
+    body_lines.append("```")
 
     capability_gaps = [str(item) for item in spec.get("capability_gaps", []) if str(item).strip()]
     if capability_gaps:
@@ -2060,7 +2125,16 @@ async def telegram_webhook(
                     gap_detection = detect_capability_gaps(request_text)
                     spec = _build_task_spec(request_text)
                     degraded = bool(spec.get("degraded"))
-                    spec["capability_gaps"] = gap_detection.get("gaps", [])
+                    task_type = _normalize_task_type(spec.get("task_type"))
+                    missing_sections = _new_capability_missing_sections(spec) if task_type == "new capability" else []
+                    if missing_sections:
+                        reply_text = (
+                            "Task issue not created: mandatory sections for task type 'new capability' are empty: "
+                            + ", ".join(missing_sections)
+                        )
+                        outcome = "validation_failed"
+                        raise ValueError("new_capability_mandatory_sections_missing")
+
                     issue_title, issue_body = _render_task_issue(spec)
                     issue_number, issue_url = await _create_github_issue(title=issue_title, body=issue_body)
                     await budget_ledger.record_github_write()
@@ -2079,6 +2153,11 @@ async def telegram_webhook(
                     lines.append(_TASK_EXAMPLE_HINT)
                     reply_text = "\n".join(lines)
                     outcome = "degraded" if degraded else "success"
+                except ValueError as exc:
+                    if str(exc) == "new_capability_mandatory_sections_missing":
+                        logger.warning("telegram_task_validation_failed", extra={"task_type": "new capability"})
+                    else:
+                        logger.exception("telegram_task_validation_failed")
                 except Exception:
                     logger.exception("telegram_task_create_issue_failed")
                     reply_text = "Failed to create task issue"
