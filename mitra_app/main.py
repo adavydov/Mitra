@@ -4,6 +4,7 @@ import logging
 import os
 import re
 from collections import OrderedDict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -42,7 +43,6 @@ logger = logging.getLogger(__name__)
 _THINK_PROMPT_MAX_CHARS = 1200
 _THINK_OUTPUT_MAX_CHARS = 900
 _GOAL_PREVIEW_MAX_CHARS = 160
-_TASK_PARSE_PREVIEW_MAX_CHARS = 260
 _SECRET_ENV_NAME_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|PRIVATE|API_KEY|ACCESS_KEY|CLIENT_SECRET)", re.IGNORECASE)
 _THINK_SYSTEM_PROMPT = (
     "Ты помощник в режиме /think. Нужен только анализ текста пользователя без внешних действий. "
@@ -84,12 +84,40 @@ _TASK_EXAMPLE_HINT = (
     "и покрыта тестом."
 )
 
+_TASK_CONTEXT_COMPLETENESS_THRESHOLD = 3
+_TASK_CONTEXT_FIELD_ORDER = (
+    "provider",
+    "credentials_source",
+    "risk_constraints",
+    "success_criteria",
+    "deadlines",
+)
+_TASK_CONTEXT_QUESTIONS = {
+    "provider": "Уточни provider: где будем создавать задачу (например GitHub/Jira/Linear)?",
+    "credentials_source": "Где брать credentials (источник секретов/доступов)?",
+    "risk_constraints": "Какие есть risk constraints (например max risk level, ограничения по данным/продакшену)?",
+    "success_criteria": "Сформулируй success criteria (как поймём, что задача выполнена).",
+    "deadlines": "Есть ли deadline/срок для задачи?",
+}
+
 
 _REFLECT_SYSTEM_PROMPT = (
     "Ты формируешь только EVO-0 отчёт для человека-оператора в режиме AL0. "
     "Не выполняй действия, не вызывай инструменты и не предлагай автозапуски. "
     "Верни только итоговый отчёт без chain-of-thought."
 )
+
+_CAPABILITY_GAPS_REPORT_PATH = "reports/capability_gaps.md"
+_GAP_REPEAT_THRESHOLD = 3
+_GAP_REPEAT_WINDOW_DAYS = 14
+
+_FAILURE_REASON_TO_GAP: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\b(test|pytest|unit test|integration test|assert)\b", re.IGNORECASE), "tests_missing"),
+    (re.compile(r"\b(policy|permission|allowlist|forbidden|unauthorized|compliance)\b", re.IGNORECASE), "policy_mismatch"),
+    (re.compile(r"\b(env|secret|token|key|credential|missing variable|not configured)\b", re.IGNORECASE), "env_missing"),
+    (re.compile(r"\b(timeout|flaky|race|intermittent|network|connection reset)\b", re.IGNORECASE), "infra_instability"),
+    (re.compile(r"\b(lint|format|type check|mypy|ruff|black)\b", re.IGNORECASE), "quality_gate"),
+]
 
 
 
@@ -394,6 +422,102 @@ class PerUserRateLimiter:
 _pr_rate_limiter = PerUserRateLimiter(limit=5, window_seconds=3600)
 
 
+@dataclass
+class MissingContext:
+    provider: str | None = None
+    credentials_source: str | None = None
+    risk_constraints: str | None = None
+    success_criteria: str | None = None
+    deadlines: str | None = None
+
+    def missing_fields(self) -> list[str]:
+        missing: list[str] = []
+        for field_name in _TASK_CONTEXT_FIELD_ORDER:
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                missing.append(field_name)
+        return missing
+
+    def filled_fields_count(self) -> int:
+        return len(_TASK_CONTEXT_FIELD_ORDER) - len(self.missing_fields())
+
+
+@dataclass
+class TaskDialogState:
+    request_text: str
+    context: MissingContext = field(default_factory=MissingContext)
+    last_question_field: str | None = None
+    turns: list[dict[str, str]] = field(default_factory=list)
+
+
+_task_dialog_state_by_chat: dict[int, TaskDialogState] = {}
+
+
+def _extract_missing_context(request_text: str) -> MissingContext:
+    text = request_text.strip()
+    lowered = text.lower()
+    context = MissingContext()
+
+    provider_match = re.search(r"\b(github|gitlab|jira|linear|asana)\b", lowered)
+    if provider_match:
+        context.provider = provider_match.group(1)
+
+    if any(token in lowered for token in ("vault", "1password", "secret", "env", "переменн")):
+        context.credentials_source = text
+
+    if re.search(r"\br[0-4]\b", lowered) or "risk" in lowered or "огранич" in lowered:
+        context.risk_constraints = text
+
+    if any(token in lowered for token in ("критер", "acceptance", "готово", "должен", "должна")):
+        context.success_criteria = text
+
+    if re.search(r"\b\d{4}-\d{2}-\d{2}\b", lowered) or "дедлайн" in lowered or "до " in lowered:
+        context.deadlines = text
+
+    return context
+
+
+def _merge_context_answer(state: TaskDialogState, answer_text: str) -> None:
+    answer = answer_text.strip()
+    if not answer:
+        return
+
+    target_field = state.last_question_field
+    if target_field in _TASK_CONTEXT_FIELD_ORDER:
+        setattr(state.context, target_field, answer)
+    else:
+        for field_name in state.context.missing_fields():
+            setattr(state.context, field_name, answer)
+            break
+
+    state.turns.append({"role": "user", "content": answer})
+
+
+def _build_context_question(context: MissingContext) -> tuple[str, str] | None:
+    missing = context.missing_fields()
+    if not missing:
+        return None
+    field_name = missing[0]
+    question = _TASK_CONTEXT_QUESTIONS.get(field_name)
+    if not question:
+        return None
+    return field_name, question
+
+
+def _context_above_threshold(context: MissingContext) -> bool:
+    return context.filled_fields_count() >= _TASK_CONTEXT_COMPLETENESS_THRESHOLD
+
+
+def _enrich_task_request_with_context(request_text: str, context: MissingContext) -> str:
+    lines = [request_text.strip(), "", "Контекст уточнений:"]
+    for field_name in _TASK_CONTEXT_FIELD_ORDER:
+        value = getattr(context, field_name)
+        if isinstance(value, str) and value.strip():
+            label = field_name.replace("_", " ")
+            lines.append(f"- {label}: {value.strip()}")
+    return "\n".join(lines).strip()
+
+
 def _parse_goal_command(text: str) -> tuple[str, str | None] | None:
     normalized = text.strip()
     if normalized == "/goal":
@@ -696,31 +820,140 @@ def _build_fallback_task_spec(request_text: str) -> dict[str, Any]:
     }
 
 
+_NEW_CAPABILITY_SECTION_KEYS: "OrderedDict[str, str]" = OrderedDict(
+    [
+        ("Missing capabilities", "missing_capabilities"),
+        ("Required code changes (paths/modules)", "required_code_changes"),
+        ("Policy/config updates", "policy_config_updates"),
+        ("Acceptance checks", "acceptance_checks"),
+        ("Rollback/safety", "rollback_safety"),
+    ]
+)
+
+
+def _normalize_task_type(task_type: Any) -> str:
+    normalized = str(task_type or "maintenance").strip().lower()
+    allowed = {"new capability", "bugfix", "maintenance", "research"}
+    if normalized in allowed:
+        return normalized
+    return "maintenance"
+
+
+def _new_capability_missing_sections(spec: dict[str, Any]) -> list[str]:
+    missing: list[str] = []
+    for section_title, section_key in _NEW_CAPABILITY_SECTION_KEYS.items():
+        values = _normalize_string_list(spec.get(section_key))
+        if not values:
+            missing.append(section_title)
+    return missing
+
+
 def _build_task_parse_diagnostics(content: Any) -> dict[str, Any]:
     diagnostics: dict[str, Any] = {"content_type": type(content).__name__}
     if not isinstance(content, list):
         return diagnostics
 
-    block_types: list[str] = []
-    text_previews: list[str] = []
+    text_blocks_count = 0
+    non_text_block_types: list[str] = []
     for block in content:
         if not isinstance(block, dict):
-            block_types.append(type(block).__name__)
+            non_text_block_types.append(type(block).__name__)
             continue
 
         block_type = str(block.get("type", "unknown"))
-        block_types.append(block_type)
-        if block_type != "text":
+        if block_type == "text":
+            text_blocks_count += 1
             continue
+        non_text_block_types.append(block_type)
 
-        text = block.get("text")
-        if isinstance(text, str) and text.strip():
-            sanitized = _sanitize_think_prompt(text.strip())
-            text_previews.append(_cap_output_chars(sanitized, _TASK_PARSE_PREVIEW_MAX_CHARS))
-
-    diagnostics["block_types"] = block_types
-    diagnostics["text_previews"] = text_previews
+    diagnostics["total_blocks"] = len(content)
+    diagnostics["text_blocks_count"] = text_blocks_count
+    diagnostics["has_non_text_blocks"] = bool(non_text_block_types)
+    diagnostics["non_text_block_types"] = sorted(set(non_text_block_types))
     return diagnostics
+
+
+def _load_capability_catalog() -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(_CAPABILITY_CATALOG_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        logger.warning("capability_catalog_unavailable", extra={"path": str(_CAPABILITY_CATALOG_PATH)})
+        return []
+
+    if not isinstance(payload, list):
+        logger.warning("capability_catalog_invalid_shape", extra={"path": str(_CAPABILITY_CATALOG_PATH)})
+        return []
+    return [entry for entry in payload if isinstance(entry, dict)]
+
+
+def _extract_intents_from_request(request_text: str) -> set[str]:
+    lowered = request_text.lower()
+    intents: set[str] = set(_INTENT_TOKEN_RE.findall(lowered))
+
+    intent_hints = {
+        "нов": "new_capability",
+        "способ": "new_capability",
+        "ability": "new_capability",
+        "capability": "new_capability",
+        "github": "github",
+        "issue": "github",
+        "search": "search",
+        "web": "search",
+        "telegram": "telegram",
+        "webhook": "telegram",
+        "drive": "drive",
+        "calendar": "calendar",
+        "report": "reporting",
+    }
+    for marker, intent in intent_hints.items():
+        if marker in lowered:
+            intents.add(intent)
+    return intents
+
+
+def detect_capability_gaps(request_text: str) -> dict[str, Any]:
+    intents = _extract_intents_from_request(request_text)
+    catalog = _load_capability_catalog()
+
+    matched: list[dict[str, Any]] = []
+    for capability in catalog:
+        capability_intents = {str(item).lower() for item in capability.get("intents", []) if str(item).strip()}
+        if capability_intents.intersection(intents):
+            matched.append(capability)
+
+    if not matched:
+        return {
+            "intents": sorted(intents),
+            "matched_capabilities": [],
+            "gaps": list(_CAPABILITY_GAP_TYPES),
+        }
+
+    has_policy = any(cap.get("policies") for cap in matched)
+    has_tests = any(cap.get("tests") for cap in matched)
+    has_secrets = any(cap.get("required_env") for cap in matched)
+    has_code = any(cap.get("tools") for cap in matched)
+    has_config = any(cap.get("tools") or cap.get("required_env") for cap in matched)
+    has_runbook = any((Path(__file__).resolve().parents[1] / "runbooks" / f"{cap.get('id', '')}.md").exists() for cap in matched)
+
+    gaps: list[str] = []
+    if not has_code:
+        gaps.append("code")
+    if not has_policy:
+        gaps.append("policy")
+    if not has_config:
+        gaps.append("config")
+    if not has_tests:
+        gaps.append("tests")
+    if not has_secrets:
+        gaps.append("secrets")
+    if not has_runbook:
+        gaps.append("runbook")
+
+    return {
+        "intents": sorted(intents),
+        "matched_capabilities": [str(cap.get("id", "unknown")) for cap in matched],
+        "gaps": gaps,
+    }
 
 
 def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = None) -> dict[str, Any]:
@@ -730,6 +963,7 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
         system=_TASK_SYSTEM_PROMPT,
     )
     content = response.get("content")
+    parse_diagnostics = _build_task_parse_diagnostics(content)
     text_blocks: list[str] = []
     if isinstance(content, list):
         for block in content:
@@ -768,7 +1002,7 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
         parsed = _extract_json_object("\n".join(retry_text_blocks))
         if not parsed:
             logger.warning(
-                "task_spec_fallback_used",
+                "task_spec_degraded_json_parse_failed",
                 extra={
                     "parse_outcome": "fallback_used",
                     "primary_parse": parse_diagnostics,
@@ -835,6 +1069,9 @@ def _render_task_issue(spec: dict[str, Any]) -> tuple[str, str]:
     body_lines.append("")
     body_lines.extend(render_list("Tests to add", spec.get("tests_to_add", [])))
     body_lines.append("")
+    for section_title, section_key in _NEW_CAPABILITY_SECTION_KEYS.items():
+        body_lines.extend(render_list(section_title, spec.get(section_key, [])))
+        body_lines.append("")
     body_lines.append(f"## Risk level\n- {spec.get('risk_level', 'R2')}")
     body_lines.append("")
     body_lines.extend(render_list("Allowed file scope", spec.get("allowed_file_scope", ["mitra_app/*", "tests/*"])))
@@ -950,6 +1187,93 @@ async def _build_pr_status_reply(ref: str) -> str:
         f"State: {state}\n"
         f"Checks: total={checks.total}, success={checks.successful}, failed={checks.failed}, pending={checks.pending}"
     )
+
+
+def _map_failure_reason_to_gap(failure_reason: str) -> str:
+    reason = failure_reason.strip()
+    if not reason:
+        return "unknown"
+
+    for pattern, gap_type in _FAILURE_REASON_TO_GAP:
+        if pattern.search(reason):
+            return gap_type
+    return "other"
+
+
+def _append_capability_gap_report(*, pr_number: int, pr_url: str, failure_reason: str, gap_type: str) -> None:
+    path = Path(_CAPABILITY_GAPS_REPORT_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text(
+            "# Capability gaps\n\n"
+            "Автогенерируемый backlog повторяющихся провалов PR/CI.\n\n"
+            "| Timestamp (UTC) | PR | Gap type | Failure reason |\n"
+            "|---|---:|---|---|\n",
+            encoding="utf-8",
+        )
+
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    reason_cell = failure_reason.replace("\n", " ").strip() or "unspecified"
+    row = f"| {timestamp} | [#{pr_number}]({pr_url}) | `{gap_type}` | {reason_cell} |\n"
+    with path.open("a", encoding="utf-8") as report_file:
+        report_file.write(row)
+
+
+def _count_recent_gap_failures(gap_type: str, *, pr_number: int | None = None) -> int:
+    since = datetime.now(timezone.utc) - timedelta(days=_GAP_REPEAT_WINDOW_DAYS)
+    count = 0
+    for event in _load_recent_audit_events(limit=400):
+        if event.get("event") != "github_pr_ci_status":
+            continue
+        if event.get("outcome") != "failed":
+            continue
+        if event.get("gap_type") != gap_type:
+            continue
+
+        event_ts = event.get("timestamp")
+        if isinstance(event_ts, str):
+            try:
+                parsed_ts = datetime.fromisoformat(event_ts.replace("Z", "+00:00"))
+            except ValueError:
+                parsed_ts = None
+            if parsed_ts and parsed_ts.tzinfo is not None and parsed_ts < since:
+                continue
+
+        if pr_number is not None and event.get("pr_number") != pr_number:
+            continue
+        count += 1
+    return count
+
+
+def _build_gap_issue_template(*, gap_type: str, failure_reason: str, pr_number: int) -> str:
+    return (
+        "``\n"
+        f"/task Root-cause fix для gap `{gap_type}` после провалов CI в PR #{pr_number}.\n"
+        "Контекст:\n"
+        f"- Симптом: {failure_reason or 'unspecified'}\n"
+        "- Требуется устранить корневую причину, а не только починить текущий PR.\n"
+        "Acceptance criteria:\n"
+        "1) Добавлен guardrail/валидация на этапе до CI.\n"
+        "2) Добавлены тесты, воспроизводящие прошлый провал.\n"
+        "3) Обновлена документация/политика при необходимости.\n"
+        "4) В audit фиксируется снижение повторов по этому gap.\n"
+        "``"
+    )
+
+
+async def _poll_pr_ci_snapshot(pr_number: int) -> tuple[str, str, github.GitHubPullRequestStatus | None, github.GitHubChecksSummary | None]:
+    try:
+        pr_status = await github.get_pr_status(pr_number)
+        checks = await github.get_pr_checks_summary(pr_status.head_sha)
+    except Exception:
+        logger.exception("pr_ci_poll_failed", extra={"pr_number": pr_number})
+        return "unknown", "", None, None
+
+    if checks.failed > 0:
+        return "failed", "ci_checks_failed", pr_status, checks
+    if checks.pending > 0:
+        return "pending", "checks_pending", pr_status, checks
+    return "passed", "", pr_status, checks
 
 
 def _load_allowed_user_ids() -> set[int]:
@@ -1121,7 +1445,7 @@ def _extract_llm_text(response: dict[str, Any]) -> str:
 
 
 def _audit_log_path() -> str:
-    return os.getenv("MITRA_AUDIT_LOG", "audit/audit.jsonl")
+    return os.getenv("MITRA_AUDIT_LOG", "audit/events.ndjson")
 
 
 def _load_recent_audit_events(limit: int = 12) -> list[dict[str, Any]]:
@@ -1413,14 +1737,70 @@ async def github_actions_callback(
 
     event_name = str(payload.get("event") or "").strip().lower()
     issue_number = payload.get("issue_number")
-    pr_number = payload.get("pr_number")
-    pr_url = payload.get("pr_url")
+    raw_pr_number = payload.get("pr_number")
+    pr_number = int(raw_pr_number) if isinstance(raw_pr_number, int) or (isinstance(raw_pr_number, str) and raw_pr_number.isdigit()) else None
+    pr_url = str(payload.get("pr_url") or "").strip()
     commit_sha = payload.get("commit_sha")
+    conclusion = str(payload.get("conclusion") or "").strip().lower()
+    failure_reason = str(payload.get("failure_reason") or "").strip()
+
+    polled_status: github.GitHubPullRequestStatus | None = None
+    polled_checks: github.GitHubChecksSummary | None = None
+    polled_outcome = "unknown"
+    if pr_number is not None:
+        polled_outcome, polled_reason, polled_status, polled_checks = await _poll_pr_ci_snapshot(pr_number)
+        if not failure_reason and polled_outcome == "failed":
+            failure_reason = polled_reason
+        if not pr_url and polled_status is not None:
+            pr_url = polled_status.html_url
+
+    failed_conclusions = {"failure", "cancelled", "timed_out", "action_required", "startup_failure"}
+    is_failed = event_name in {"ci_failed", "pr_failed"} or conclusion in failed_conclusions or polled_outcome == "failed"
+    gap_type = _map_failure_reason_to_gap(failure_reason) if is_failed else "none"
+
+    _safe_audit_event(
+        {
+            "event": "github_pr_ci_status",
+            "source": "github_actions_callback",
+            "action_type": "github/pr_ci_status",
+            "issue_number": issue_number,
+            "pr_number": pr_number,
+            "pr_url": pr_url,
+            "commit_sha": commit_sha,
+            "event_name": event_name,
+            "conclusion": conclusion,
+            "outcome": "failed" if is_failed else (polled_outcome if polled_outcome != "unknown" else "updated"),
+            "failure_reason": failure_reason,
+            "gap_type": gap_type,
+            "checks": None
+            if polled_checks is None
+            else {
+                "total": polled_checks.total,
+                "successful": polled_checks.successful,
+                "failed": polled_checks.failed,
+                "pending": polled_checks.pending,
+            },
+            "log_level": "warning" if is_failed else "info",
+        }
+    )
 
     if event_name == "pr_opened":
         text = f"PR открыт: #{pr_number} (issue #{issue_number})\n{pr_url}".strip()
     elif event_name == "pr_merged":
         text = f"PR смержен: #{pr_number}\ncommit: {commit_sha or '-'}"
+    elif is_failed:
+        reason_text = failure_reason or "ci_failure"
+        text = f"CI/PR провал: #{pr_number or '?'}\nGap: {gap_type}\nReason: {reason_text}"
+        if pr_number is not None and pr_url:
+            _append_capability_gap_report(pr_number=pr_number, pr_url=pr_url, failure_reason=reason_text, gap_type=gap_type)
+            repeat_count = _count_recent_gap_failures(gap_type, pr_number=pr_number)
+            if repeat_count >= _GAP_REPEAT_THRESHOLD:
+                text += (
+                    "\n\nПовторяющийся провал. Предложенный /task шаблон:\n"
+                    + _build_gap_issue_template(gap_type=gap_type, failure_reason=reason_text, pr_number=pr_number)
+                )
+    elif event_name in {"ci_success", "pr_checks_passed"} or conclusion == "success" or polled_outcome == "passed":
+        text = f"CI зелёный: #{pr_number or '?'}\n{pr_url}".strip()
     else:
         text = f"GitHub update: {json.dumps(payload, ensure_ascii=False)}"
 
@@ -1489,7 +1869,62 @@ async def telegram_webhook(
                     await send_message(chat_id=chat_id, text=deny_reason)
                 return {"status": "ok"}
 
-        if text.startswith("/status"):
+        pending_task_state = _task_dialog_state_by_chat.get(chat_id) if isinstance(chat_id, int) else None
+        if pending_task_state is not None and isinstance(text, str) and text.strip() and not text.strip().startswith("/"):
+            _merge_context_answer(pending_task_state, text)
+            next_question = _build_context_question(pending_task_state.context)
+            if next_question is not None and not _context_above_threshold(pending_task_state.context):
+                field_name, question = next_question
+                pending_task_state.last_question_field = field_name
+                reply_text = question
+            else:
+                issue_number: int | None = None
+                degraded = False
+                try:
+                    enriched_request = _enrich_task_request_with_context(
+                        pending_task_state.request_text,
+                        pending_task_state.context,
+                    )
+                    spec = _build_task_spec(enriched_request)
+                    degraded = bool(spec.get("degraded"))
+                    issue_title, issue_body = _render_task_issue(spec)
+                    issue_number, issue_url = await _create_github_issue(title=issue_title, body=issue_body)
+                    await budget_ledger.record_github_write()
+
+                    required_secrets = spec.get("required_env_secrets") or []
+                    expected_commands = spec.get("new_commands") or []
+                    lines = [f"Issue создан: {issue_url}"]
+                    if required_secrets:
+                        lines.append("Требуются ключи/доступы: " + ", ".join(required_secrets))
+                    if expected_commands:
+                        lines.append("Ожидаемая новая команда: " + ", ".join(expected_commands))
+                    if degraded:
+                        lines.append("Spec auto-filled from request (LLM JSON parse failed)")
+                    lines.append(_TASK_EXAMPLE_HINT)
+                    reply_text = "\n".join(lines)
+                    outcome = "degraded" if degraded else "success"
+                except Exception:
+                    logger.exception("telegram_task_create_issue_failed")
+                    reply_text = "Failed to create task issue"
+                    outcome = "error"
+
+                _safe_audit_event(
+                    {
+                        "event": "telegram_task_open_issue",
+                        "action_id": action_id,
+                        "telegram_update_id": telegram_update_id,
+                        "user_id": user_id,
+                        "chat_id": chat_id,
+                        "action_type": "/task",
+                        "issue_number": issue_number,
+                        "degraded": degraded,
+                        "outcome": outcome,
+                        "log_level": "info" if outcome in {"success", "degraded"} else "error",
+                    }
+                )
+                if isinstance(chat_id, int):
+                    _task_dialog_state_by_chat.pop(chat_id, None)
+        elif text.startswith("/status"):
             reply_text = "Mitra alive"
         elif text.startswith("/smoke_deep"):
             reply_text, smoke_audit = await _run_smoke_deep_checks()
@@ -1807,46 +2242,59 @@ async def telegram_webhook(
             elif not _pr_rate_limiter.allow(user_id if isinstance(user_id, int) else None):
                 reply_text = "Rate limit exceeded: max 5 /task per hour"
             else:
-                issue_number: int | None = None
-                degraded = False
-                try:
-                    spec = _build_task_spec(request_text)
-                    degraded = bool(spec.get("degraded"))
-                    issue_title, issue_body = _render_task_issue(spec)
-                    issue_number, issue_url = await _create_github_issue(title=issue_title, body=issue_body)
-                    await budget_ledger.record_github_write()
+                context = _extract_missing_context(request_text)
+                next_question = _build_context_question(context)
+                if next_question is not None:
+                    field_name, question = next_question
+                    if isinstance(chat_id, int):
+                        _task_dialog_state_by_chat[chat_id] = TaskDialogState(
+                            request_text=request_text,
+                            context=context,
+                            last_question_field=field_name,
+                            turns=[{"role": "user", "content": request_text}],
+                        )
+                    reply_text = question
+                else:
+                    issue_number: int | None = None
+                    degraded = False
+                    try:
+                        spec = _build_task_spec(request_text)
+                        degraded = bool(spec.get("degraded"))
+                        issue_title, issue_body = _render_task_issue(spec)
+                        issue_number, issue_url = await _create_github_issue(title=issue_title, body=issue_body)
+                        await budget_ledger.record_github_write()
 
-                    required_secrets = spec.get("required_env_secrets") or []
-                    expected_commands = spec.get("new_commands") or []
-                    lines = [f"Issue создан: {issue_url}"]
-                    if required_secrets:
-                        lines.append("Требуются ключи/доступы: " + ", ".join(required_secrets))
-                    if expected_commands:
-                        lines.append("Ожидаемая новая команда: " + ", ".join(expected_commands))
-                    if degraded:
-                        lines.append("Spec auto-filled from request (LLM JSON parse failed)")
-                    lines.append(_TASK_EXAMPLE_HINT)
-                    reply_text = "\n".join(lines)
-                    outcome = "degraded" if degraded else "success"
-                except Exception:
-                    logger.exception("telegram_task_create_issue_failed")
-                    reply_text = "Failed to create task issue"
-                    outcome = "error"
+                        required_secrets = spec.get("required_env_secrets") or []
+                        expected_commands = spec.get("new_commands") or []
+                        lines = [f"Issue создан: {issue_url}"]
+                        if required_secrets:
+                            lines.append("Требуются ключи/доступы: " + ", ".join(required_secrets))
+                        if expected_commands:
+                            lines.append("Ожидаемая новая команда: " + ", ".join(expected_commands))
+                        if degraded:
+                            lines.append("Spec auto-filled from request (LLM JSON parse failed)")
+                        lines.append(_TASK_EXAMPLE_HINT)
+                        reply_text = "\n".join(lines)
+                        outcome = "degraded" if degraded else "success"
+                    except Exception:
+                        logger.exception("telegram_task_create_issue_failed")
+                        reply_text = "Failed to create task issue"
+                        outcome = "error"
 
-                _safe_audit_event(
-                    {
-                        "event": "telegram_task_open_issue",
-                        "action_id": action_id,
-                        "telegram_update_id": telegram_update_id,
-                        "user_id": user_id,
-                        "chat_id": chat_id,
-                        "action_type": "/task",
-                        "issue_number": issue_number,
-                        "degraded": degraded,
-                        "outcome": outcome,
-                        "log_level": "info" if outcome in {"success", "degraded"} else "error",
-                    }
-                )
+                    _safe_audit_event(
+                        {
+                            "event": "telegram_task_open_issue",
+                            "action_id": action_id,
+                            "telegram_update_id": telegram_update_id,
+                            "user_id": user_id,
+                            "chat_id": chat_id,
+                            "action_type": "/task",
+                            "issue_number": issue_number,
+                            "degraded": degraded,
+                            "outcome": outcome,
+                            "log_level": "info" if outcome in {"success", "degraded"} else "error",
+                        }
+                    )
         elif text.startswith("/pr"):
             parsed = _parse_pr_command(text)
             if not parsed:

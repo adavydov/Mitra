@@ -57,7 +57,7 @@ def _redact_value(value: object, *, key: str | None = None) -> object:
 
 
 def log_event(event: dict[str, object]) -> str:
-    path = os.getenv("MITRA_AUDIT_LOG", "audit/audit.jsonl")
+    path = os.getenv("MITRA_AUDIT_LOG", "audit/events.ndjson")
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     payload = {

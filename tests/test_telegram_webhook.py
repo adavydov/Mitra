@@ -20,7 +20,9 @@ from mitra_app.main import (
     _REFLECT_SYSTEM_PROMPT,
     _extract_json_object,
     _build_task_spec,
+    detect_capability_gaps,
     _build_pr_status_reply,
+    _render_task_issue,
     _extract_think_prompt,
     _load_allowed_user_ids,
     _parse_evo_issue_command,
@@ -1344,7 +1346,7 @@ def test_task_command_creates_codex_issue_and_reports_expected_command(monkeypat
     response = client.post(
         "/telegram/webhook",
         headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
-        json={"message": {"text": "/task Добавь /hello", "chat": {"id": 123}, "from": {"id": 123}}},
+        json={"message": {"text": "/task Добавь /hello в GitHub, секреты в Vault, риск R1, команда должна отвечать hello, дедлайн 2026-01-10", "chat": {"id": 123}, "from": {"id": 123}}},
     )
 
     assert response.status_code == 200
@@ -1359,6 +1361,7 @@ def test_task_command_without_llm_json_uses_fallback_spec(monkeypatch):
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
 
     calls = []
+    audits = []
 
     async def fake_send_message(chat_id: int, text: str):
         calls.append((chat_id, text))
@@ -1372,23 +1375,27 @@ def test_task_command_without_llm_json_uses_fallback_spec(monkeypatch):
             return {"content": [{"type": "text", "text": "Не JSON ответ"}]}
 
     async def fake_create_github_issue(title: str, body: str):
-        assert title == "Добавь новую команду, которая отвечает текущим временем и коротким статусом сист"
+        assert "Добавь новую команду" in title
         assert "## Summary" in body
         assert "## Risk level\n- R2" in body
         assert "## Allowed file scope\n- mitra_app/*\n- tests/*" in body
         assert "Добавь новую команду" in body
         return 91, "https://github.com/o/r/issues/91"
 
+    def fake_log_event(event: dict[str, object]):
+        audits.append(event)
+
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
     monkeypatch.setattr("mitra_app.main.AnthropicClient", FakeAnthropicClient)
     monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_github_issue)
+    monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
 
     response = client.post(
         "/telegram/webhook",
         headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
         json={
             "message": {
-                "text": "/task Добавь новую команду, которая отвечает текущим временем и коротким статусом системы",
+                "text": "/task Добавь новую команду в GitHub, секреты в env, риск R2, команда должна отвечать текущим временем и коротким статусом системы, дедлайн 2026-02-01",
                 "chat": {"id": 123},
                 "from": {"id": 123},
             }
@@ -1399,6 +1406,10 @@ def test_task_command_without_llm_json_uses_fallback_spec(monkeypatch):
     assert len(calls) == 1
     assert "Issue создан: https://github.com/o/r/issues/91" in calls[0][1]
     assert "Spec auto-filled from request (LLM JSON parse failed)" in calls[0][1]
+
+    task_audit = next(event for event in audits if event.get("event") == "telegram_task_open_issue")
+    assert task_audit["action_type"] == "/task"
+    assert task_audit["degraded"] is True
 
 
 def test_task_command_without_body_returns_usage(monkeypatch):
@@ -1421,6 +1432,73 @@ def test_task_command_without_body_returns_usage(monkeypatch):
 
     assert response.status_code == 200
     assert calls == [(123, "Usage: /task <request>")]
+
+
+def test_task_command_multiturn_collects_context_before_issue_creation(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+    build_calls = []
+    issue_calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    def fake_build_task_spec(request_text: str):
+        build_calls.append(request_text)
+        assert "- provider: GitHub" in request_text
+        assert "- credentials source: Секреты в Vault" in request_text
+        return {
+            "title": "Добавить /hello",
+            "summary": "Добавить простую команду.",
+            "components": ["mitra_app/main.py"],
+            "required_env_secrets": ["OPENAI_API_KEY"],
+            "new_commands": ["/hello"],
+            "acceptance_criteria": ["Команда /hello отвечает hello from mitra"],
+            "tests_to_add": ["pytest для /telegram/webhook"],
+            "risk_level": "R1",
+        }
+
+    async def fake_create_github_issue(title: str, body: str):
+        issue_calls.append((title, body))
+        return 101, "https://github.com/o/r/issues/101"
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main._build_task_spec", fake_build_task_spec)
+    monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_github_issue)
+
+    first = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={
+            "message": {
+                "text": "/task Добавь /hello, команда должна отвечать hello",
+                "chat": {"id": 123},
+                "from": {"id": 123},
+            }
+        },
+    )
+    second = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "GitHub", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+    third = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "Секреты в Vault", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert third.status_code == 200
+    assert calls[0] == (123, "Уточни provider: где будем создавать задачу (например GitHub/Jira/Linear)?")
+    assert calls[1] == (123, "Где брать credentials (источник секретов/доступов)?")
+    assert "Issue создан: https://github.com/o/r/issues/101" in calls[2][1]
+    assert len(build_calls) == 1
+    assert len(issue_calls) == 1
 
 
 def test_build_task_spec_returns_fallback_when_json_parse_fails(caplog):
@@ -1450,7 +1528,7 @@ def test_build_task_spec_returns_fallback_when_json_parse_fails(caplog):
     }
 
     assert "OPENAI_API_KEY=top-secret" not in caplog.text
-    assert any(rec.message == "task_spec_degraded_json_parse_failed" for rec in caplog.records)
+    assert any(rec.message == "task_spec_fallback_used" for rec in caplog.records)
 
 
 def test_build_task_spec_returns_fallback_when_multiple_non_json_text_blocks_returned(caplog):
@@ -1468,7 +1546,70 @@ def test_build_task_spec_returns_fallback_when_multiple_non_json_text_blocks_ret
 
     assert spec["degraded"] is True
     assert spec["summary"] == "Нужен fallback"
-    assert any(rec.message == "task_spec_degraded_json_parse_failed" for rec in caplog.records)
+    assert any(rec.message == "task_spec_fallback_used" for rec in caplog.records)
+
+
+def test_detect_capability_gaps_for_new_capability_request_returns_all_required_blocks():
+    detection = detect_capability_gaps("Нужна новая способность для партнёрской интеграции с CRM")
+
+    assert detection["matched_capabilities"] == []
+    assert detection["gaps"] == ["code", "policy", "config", "tests", "secrets", "runbook"]
+
+
+def test_task_command_includes_gap_sections_in_issue_body(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_create_github_issue(title: str, body: str):
+        assert title == "Добавить новую способность CRM"
+        assert "## Capability gaps to close" in body
+        assert "### GAP: code" in body
+        assert "### GAP: policy" in body
+        assert "### GAP: config" in body
+        assert "### GAP: tests" in body
+        assert "### GAP: secrets" in body
+        assert "### GAP: runbook" in body
+        return 109, "https://github.com/o/r/issues/109"
+
+    def fake_build_task_spec(request_text: str):
+        assert "новую способность" in request_text
+        return {
+            "title": "Добавить новую способность CRM",
+            "summary": "Нужно создать способность для CRM-синхронизации.",
+            "components": [],
+            "required_env_secrets": [],
+            "new_commands": [],
+            "acceptance_criteria": ["Способность документирована и интегрирована"],
+            "tests_to_add": [],
+            "risk_level": "R2",
+        }
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main._build_task_spec", fake_build_task_spec)
+    monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_github_issue)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={
+            "message": {
+                "text": "/task Добавить новую способность CRM с синхронизацией",
+                "chat": {"id": 123},
+                "from": {"id": 123},
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert "Issue создан: https://github.com/o/r/issues/109" in calls[0][1]
+    assert "Обнаружены gaps: code, policy, config, tests, secrets, runbook" in calls[0][1]
 
 
 def test_extract_json_object_handles_dirty_text_with_fenced_block_and_json():
@@ -1512,6 +1653,131 @@ def test_github_actions_callback_posts_to_admin_chat(monkeypatch):
 
     assert response.status_code == 200
     assert calls == [(777, "PR открыт: #144 (issue #55)\nhttps://github.com/o/r/pull/144")]
+
+
+def test_github_actions_callback_failed_ci_logs_gap_and_updates_backlog(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GITHUB_ACTIONS_CALLBACK_TOKEN", "cb-secret")
+    monkeypatch.setenv("TELEGRAM_ADMIN_CHAT_ID", "777")
+    monkeypatch.setenv("MITRA_AUDIT_LOG", str(tmp_path / "events.ndjson"))
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_poll(pr_number: int):
+        from mitra_app.github import GitHubChecksSummary, GitHubPullRequestStatus
+
+        return (
+            "failed",
+            "pytest failure",
+            GitHubPullRequestStatus(
+                number=pr_number,
+                state="open",
+                draft=False,
+                merged=False,
+                mergeable=True,
+                head_sha="abc",
+                html_url=f"https://github.com/o/r/pull/{pr_number}",
+            ),
+            GitHubChecksSummary(total=2, successful=1, failed=1, pending=0),
+        )
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main._poll_pr_ci_snapshot", fake_poll)
+
+    response = client.post(
+        "/github/actions_callback",
+        headers={"X-Mitra-Actions-Token": "cb-secret"},
+        json={"event": "ci_failed", "pr_number": 145},
+    )
+
+    assert response.status_code == 200
+    assert calls and "Gap: tests_missing" in calls[0][1]
+
+    backlog = (tmp_path / "reports" / "capability_gaps.md").read_text(encoding="utf-8")
+    assert "#145" in backlog
+    assert "tests_missing" in backlog
+
+    audit_lines = (tmp_path / "events.ndjson").read_text(encoding="utf-8").strip().splitlines()
+    payload = json.loads(audit_lines[-1])
+    assert payload["event"] == "github_pr_ci_status"
+    assert payload["failure_reason"] == "pytest failure"
+    assert payload["gap_type"] == "tests_missing"
+
+
+def test_github_actions_callback_repeated_failure_suggests_task_template(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GITHUB_ACTIONS_CALLBACK_TOKEN", "cb-secret")
+    monkeypatch.setenv("TELEGRAM_ADMIN_CHAT_ID", "777")
+    monkeypatch.setenv("MITRA_AUDIT_LOG", str(tmp_path / "events.ndjson"))
+
+    (tmp_path / "events.ndjson").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "timestamp": "2026-02-25T10:00:00+00:00",
+                        "event": "github_pr_ci_status",
+                        "outcome": "failed",
+                        "gap_type": "env_missing",
+                        "pr_number": 99,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-02-25T11:00:00+00:00",
+                        "event": "github_pr_ci_status",
+                        "outcome": "failed",
+                        "gap_type": "env_missing",
+                        "pr_number": 99,
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_poll(pr_number: int):
+        from mitra_app.github import GitHubChecksSummary, GitHubPullRequestStatus
+
+        return (
+            "failed",
+            "missing secret",
+            GitHubPullRequestStatus(
+                number=pr_number,
+                state="open",
+                draft=False,
+                merged=False,
+                mergeable=True,
+                head_sha="abc",
+                html_url=f"https://github.com/o/r/pull/{pr_number}",
+            ),
+            GitHubChecksSummary(total=1, successful=0, failed=1, pending=0),
+        )
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main._poll_pr_ci_snapshot", fake_poll)
+
+    response = client.post(
+        "/github/actions_callback",
+        headers={"X-Mitra-Actions-Token": "cb-secret"},
+        json={"event": "ci_failed", "pr_number": 99},
+    )
+
+    assert response.status_code == 200
+    assert calls
+    assert "Повторяющийся провал" in calls[0][1]
+    assert "/task Root-cause fix" in calls[0][1]
 
 def test_report_oauth_expired_replies_with_reauthorize_message(monkeypatch, tmp_path):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
