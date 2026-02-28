@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 _THINK_PROMPT_MAX_CHARS = 1200
 _THINK_OUTPUT_MAX_CHARS = 900
+_GOAL_PREVIEW_MAX_CHARS = 500
 _SECRET_ENV_NAME_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|PRIVATE|API_KEY|ACCESS_KEY|CLIENT_SECRET)", re.IGNORECASE)
 _THINK_SYSTEM_PROMPT = (
     "Ты помощник в режиме /think. Нужен только анализ текста пользователя без внешних действий. "
@@ -49,6 +50,13 @@ _THINK_SYSTEM_PROMPT = (
     "Короткий ответ: ...\n"
     "Допущения: ...\n"
     "Следующие шаги: ..."
+)
+
+_REFLECT_SYSTEM_PROMPT = (
+    "Ты формируешь краткий EVO-0 отчет по текущему состоянию Mitra. "
+    "Учитывай цель, последние audit-события и бюджет. "
+    "Оценивай только факты из контекста, не придумывай новые данные. "
+    "Сформируй 3 короткие гипотезы улучшений для AL0 и next actions."
 )
 
 HELP_TEXT = (
@@ -371,7 +379,9 @@ def _parse_goal_command(text: str) -> tuple[str, str | None] | None:
     return None
 
 
-def _truncate_goal_preview(goal_text: str, limit: int = _GOAL_PREVIEW_MAX_CHARS) -> str:
+def _truncate_goal_preview(goal_text: str, limit: int | None = None) -> str:
+    if limit is None:
+        limit = _GOAL_PREVIEW_MAX_CHARS
     if len(goal_text) <= limit:
         return goal_text
     return f"{goal_text[:limit].rstrip()}…"
