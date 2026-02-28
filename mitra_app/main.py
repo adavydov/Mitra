@@ -52,13 +52,6 @@ _THINK_SYSTEM_PROMPT = (
     "Следующие шаги: ..."
 )
 
-_REFLECT_SYSTEM_PROMPT = (
-    "Ты формируешь краткий EVO-0 отчет по текущему состоянию Mitra. "
-    "Учитывай цель, последние audit-события и бюджет. "
-    "Оценивай только факты из контекста, не придумывай новые данные. "
-    "Сформируй 3 короткие гипотезы улучшений для AL0 и next actions."
-)
-
 HELP_TEXT = (
     "Commands: /status, /oauth_status, /search <query>, /research <query>, /think <prompt>, "
     "/report <text>, /pr <title>\\n<spec>, /task <request>, /pr_status <issue#|pr#>, /drive_check, /budget, "
@@ -165,13 +158,6 @@ def _cap_output_chars(text: str, limit: int) -> str:
     return f"{text[:limit].rstrip()}…"
 
 
-def _extract_think_prompt(text: str) -> str:
-    command, _, remainder = text.partition(" ")
-    if command.startswith("/think"):
-        return remainder.strip()
-    return ""
-
-
 def _audit_think_command(action_id: str, user_id: int | None, command: str, outcome: str) -> None:
     _safe_audit_event(
         {
@@ -186,7 +172,17 @@ def _audit_think_command(action_id: str, user_id: int | None, command: str, outc
 
 
 def _extract_think_prompt(text: str) -> str:
-    return text[len("/think") :].strip()[:240]
+    stripped = text.strip()
+    if not stripped:
+        return ""
+
+    parts = stripped.split(maxsplit=1)
+    command = parts[0]
+    if command != "/think":
+        return ""
+    if len(parts) == 1:
+        return ""
+    return parts[1].strip()[:240]
 
 
 def _sanitize_drive_http_error(exc: HttpError) -> str:
