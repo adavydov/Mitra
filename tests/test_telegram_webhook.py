@@ -1358,6 +1358,7 @@ def test_task_command_without_llm_json_uses_fallback_spec(monkeypatch):
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
 
     calls = []
+    audits = []
 
     async def fake_send_message(chat_id: int, text: str):
         calls.append((chat_id, text))
@@ -1377,9 +1378,13 @@ def test_task_command_without_llm_json_uses_fallback_spec(monkeypatch):
         assert "Добавь новую команду" in body
         return 91, "https://github.com/o/r/issues/91"
 
+    def fake_log_event(event: dict[str, object]):
+        audits.append(event)
+
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
     monkeypatch.setattr("mitra_app.main.AnthropicClient", FakeAnthropicClient)
     monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_github_issue)
+    monkeypatch.setattr("mitra_app.audit.log_event", fake_log_event)
 
     response = client.post(
         "/telegram/webhook",
@@ -1397,6 +1402,10 @@ def test_task_command_without_llm_json_uses_fallback_spec(monkeypatch):
     assert len(calls) == 1
     assert "Issue создан: https://github.com/o/r/issues/91" in calls[0][1]
     assert "Spec auto-filled from request (LLM JSON parse failed)" in calls[0][1]
+
+    task_audit = next(event for event in audits if event.get("event") == "telegram_task_open_issue")
+    assert task_audit["action_type"] == "/task"
+    assert task_audit["degraded"] is True
 
 
 def test_task_command_without_body_returns_usage(monkeypatch):
@@ -1421,7 +1430,7 @@ def test_task_command_without_body_returns_usage(monkeypatch):
     assert calls == [(123, "Usage: /task <request>")]
 
 
-def test_build_task_spec_returns_fallback_when_json_parse_fails(caplog):
+def test_build_task_spec_logs_fallback_with_compact_diagnostics_on_non_json_response(caplog):
     class FakeClient:
         def create_message(self, *, messages, system):
             return {
@@ -1434,17 +1443,33 @@ def test_build_task_spec_returns_fallback_when_json_parse_fails(caplog):
     with caplog.at_level(logging.WARNING, logger="mitra_app.main"):
         spec = _build_task_spec("Сделай команду /hello", llm_client=FakeClient())
 
-    assert spec == {
-        "title": "Сделай команду /hello",
-        "summary": "Сделай команду /hello",
-        "components": [],
-        "required_env_secrets": [],
-        "new_commands": [],
-        "acceptance_criteria": [],
-        "tests_to_add": [],
-        "risk_level": "R2",
-        "degraded": True,
-    }
+    assert spec["degraded"] is True
+    primary_record = next(rec for rec in caplog.records if rec.message == "task_spec_parse_primary_failed")
+    assert primary_record.content_type == "list"
+    assert primary_record.total_blocks == 2
+    assert primary_record.text_blocks_count == 1
+    assert primary_record.has_non_text_blocks is True
+    assert primary_record.non_text_block_types == ["thinking"]
+
+    fallback_record = next(rec for rec in caplog.records if rec.message == "task_spec_fallback_used")
+    assert fallback_record.parse_outcome == "fallback_used"
+    assert fallback_record.primary_parse["text_blocks_count"] == 1
+    assert fallback_record.primary_parse["non_text_block_types"] == ["thinking"]
+    assert fallback_record.retry_parse["non_text_block_types"] == ["thinking"]
+
+
+def test_build_task_spec_logs_retry_success(monkeypatch, caplog):
+    responses = [
+        {"content": [{"type": "text", "text": "not json"}]},
+        {
+            "content": [
+                {
+                    "type": "text",
+                    "text": '{"title":"T","summary":"S","components":[],"required_env_secrets":[],"new_commands":[],"acceptance_criteria":[],"tests_to_add":[],"risk_level":"R1"}',
+                }
+            ]
+        },
+    ]
 
     assert "OPENAI_API_KEY=top-secret" not in caplog.text
     assert any(rec.message == "task_spec_degraded_json_parse_failed" for rec in caplog.records)
