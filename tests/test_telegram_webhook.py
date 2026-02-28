@@ -163,6 +163,77 @@ def test_start_command_lists_search(monkeypatch):
     ]
 
 
+
+
+def test_reflect_command_returns_summary_and_drive_link_without_thinking(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_upload_markdown(title: str, markdown_body: str):
+        assert "EVO-0 report" in markdown_body
+        return DriveUploadResult(file_id="file-1", web_view_link="https://drive.test/evo0")
+
+    class FakeReflectLlm:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def create_message(self, *, messages, system):
+            assert "AL0" in system
+            assert "Текущая цель" in messages[0]["content"]
+            return {
+                "usage": {"input_tokens": 12, "output_tokens": 34},
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "<thinking>hidden</thinking>\n- Гипотеза 1: улучшить intake\n- Гипотеза 2: ускорить smoke\n- Гипотеза 3: сократить шум аудита",
+                    }
+                ],
+            }
+
+    async def fake_render_budget():
+        return "Budget day: 2026-01-01"
+
+    llm_usage_calls = []
+    drive_write_calls = []
+
+    async def fake_record_llm_usage(payload):
+        llm_usage_calls.append(payload)
+
+    async def fake_record_drive_write(count: int = 1):
+        drive_write_calls.append(count)
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
+    monkeypatch.setattr("mitra_app.main.AnthropicClient", FakeReflectLlm)
+    monkeypatch.setattr("mitra_app.main._load_current_goal", lambda: "Снизить MTTR")
+    monkeypatch.setattr("mitra_app.main._load_recent_audit_events", lambda limit=12: [{"event": "e1"}])
+    monkeypatch.setattr("mitra_app.main._deploy_revision_hint", lambda: "abc123")
+    monkeypatch.setattr("mitra_app.main.budget_ledger.render_budget", fake_render_budget)
+    monkeypatch.setattr("mitra_app.main.budget_ledger.record_llm_usage", fake_record_llm_usage)
+    monkeypatch.setattr("mitra_app.main.budget_ledger.record_drive_write", fake_record_drive_write)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/reflect", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert llm_usage_calls == [{"input_tokens": 12, "output_tokens": 34}]
+    assert drive_write_calls == [1]
+    assert len(calls) == 1
+    reply = calls[0][1]
+    assert "<thinking>" not in reply
+    assert reply.count("- ") >= 3
+    assert "https://drive.test/evo0" in reply
+
 def test_think_command_returns_short_read_only_response(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")

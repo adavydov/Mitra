@@ -1,4 +1,5 @@
 import json
+import hashlib
 import logging
 import os
 import re
@@ -54,6 +55,12 @@ HELP_TEXT = (
     "Commands: /status, /oauth_status, /search <query>, /research <query>, /think <prompt>, "
     "/report <text>, /pr <title>\\n<spec>, /pr_status <issue#|pr#>, /evo_issue <n> [risk:R0-R3], /drive_check, /budget, "
     "/smoke, /smoke_deep"
+)
+
+_REFLECT_SYSTEM_PROMPT = (
+    "Ты MITRA EVO brain в режиме AL0: только гипотезы, без выполнения действий. "
+    "Верни EVO-0 отчёт на русском языке в markdown с разделами: "
+    "Краткая выжимка, Гипотезы (3-7 пунктов), Риски (R0-R3), Что тестировать, Не трогать."
 )
 
 
@@ -196,6 +203,7 @@ _COMMAND_POLICIES: dict[str, CommandPolicy] = {
     "/evo_issue": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="search"),
     "/drive_check": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
     "/budget": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
+    "/reflect": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
 }
 
 _policy_enforcer = CommandPolicyEnforcer(Path(__file__).resolve().parents[1])
@@ -343,6 +351,101 @@ class PerUserRateLimiter:
 
 
 _pr_rate_limiter = PerUserRateLimiter(limit=5, window_seconds=3600)
+
+
+def _parse_goal_command(text: str) -> tuple[str, str | None] | None:
+    normalized = text.strip()
+    if normalized == "/goal":
+        return "show", None
+    if normalized.startswith("/goal set"):
+        goal_text = normalized[len("/goal set") :].strip()
+        return "set", goal_text or None
+    return None
+
+
+def _truncate_goal_preview(goal_text: str, limit: int = _GOAL_PREVIEW_MAX_CHARS) -> str:
+    if len(goal_text) <= limit:
+        return goal_text
+    return f"{goal_text[:limit].rstrip()}…"
+
+
+def _goal_state_from_audit() -> dict[str, str] | None:
+    audit_path = Path(os.getenv("MITRA_AUDIT_LOG", "audit/audit.jsonl"))
+    if not audit_path.exists():
+        return None
+
+    try:
+        lines = audit_path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        logger.exception("goal_audit_read_failed", extra={"path": str(audit_path)})
+        return None
+
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if payload.get("event") != "telegram_goal_set" or payload.get("outcome") != "success":
+            continue
+
+        preview = payload.get("goal_preview")
+        link = payload.get("goal_link")
+        goal_hash = payload.get("goal_hash")
+        if isinstance(preview, str) and isinstance(link, str) and isinstance(goal_hash, str):
+            return {"preview": preview, "link": link, "hash": goal_hash}
+
+    return None
+
+
+def _build_goal_show_reply() -> str:
+    goal_state = _goal_state_from_audit()
+    if goal_state is None:
+        return "Цель не задана. Используйте /goal set <текст цели>."
+
+    return f"Текущая цель: {goal_state['preview']}\nDrive: {goal_state['link']}"
+
+
+async def _set_goal(
+    *,
+    goal_text: str,
+    action_id: str,
+    telegram_update_id: int | None,
+    user_id: int | None,
+    chat_id: int | None,
+) -> str:
+    goal_preview = _truncate_goal_preview(goal_text)
+    goal_hash = hashlib.sha256(goal_text.encode("utf-8")).hexdigest()
+    title = f"mitra_state-goal {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    markdown_body = (
+        f"# Mitra Goal\n\n"
+        f"goal:\n{goal_text}\n\n"
+        f"goal_hash_sha256: {goal_hash}\n"
+        f"action_id: {action_id}\n"
+        f"user_id: {user_id}\n"
+        f"timestamp: {datetime.now(timezone.utc).isoformat()}\n"
+    )
+
+    upload = await upload_markdown(title=title, markdown_body=markdown_body)
+    goal_link = upload.web_view_link or upload.file_id
+    _safe_audit_event(
+        {
+            "event": "telegram_goal_set",
+            "action_id": action_id,
+            "telegram_update_id": telegram_update_id,
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "action_type": "/goal set",
+            "goal_hash": goal_hash,
+            "goal_preview": goal_preview,
+            "goal_link": goal_link,
+            "file_id": upload.file_id,
+            "outcome": "success",
+            "log_level": "info",
+        }
+    )
+    return f"Goal saved: {goal_link}"
 
 
 def _parse_pr_command(text: str) -> tuple[str, str] | None:
@@ -704,6 +807,138 @@ def _sanitize_research_error(exc: Exception) -> str:
     return "Research failed"
 
 
+def _final_only_sanitize(text: str) -> str:
+    sanitized = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    sanitized = re.sub(r"</?thinking>", "", sanitized, flags=re.IGNORECASE)
+    return sanitized.strip()
+
+
+def _extract_llm_text(response: dict[str, Any]) -> str:
+    content = response.get("content")
+    if not isinstance(content, list):
+        return ""
+
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+    return "\n".join(parts).strip()
+
+
+def _audit_log_path() -> str:
+    return os.getenv("MITRA_AUDIT_LOG", "audit/audit.jsonl")
+
+
+def _load_recent_audit_events(limit: int = 12) -> list[dict[str, Any]]:
+    path = Path(_audit_log_path())
+    if not path.exists():
+        return []
+
+    events: list[dict[str, Any]] = []
+    for raw_line in reversed(path.read_text(encoding="utf-8").splitlines()):
+        if len(events) >= limit:
+            break
+        try:
+            payload = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            events.append(payload)
+    events.reverse()
+    return events
+
+
+def _load_current_goal() -> str:
+    env_goal = os.getenv("MITRA_CURRENT_GOAL", "").strip()
+    if env_goal:
+        return env_goal
+
+    for event in reversed(_load_recent_audit_events(limit=60)):
+        for key in ("goal", "current_goal"):
+            value = event.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return "Goal is not set. Use /goal in PR-1 flow."
+
+
+def _deploy_revision_hint() -> str:
+    for env_name in ("MITRA_DEPLOY_VERSION", "MITRA_DEPLOY_COMMIT", "GIT_COMMIT"):
+        value = os.getenv(env_name, "").strip()
+        if value:
+            return value
+    return "unknown"
+
+
+def _build_reflect_prompt(goal: str, audit_events: list[dict[str, Any]], budget_status: str) -> str:
+    events_preview = json.dumps(audit_events, ensure_ascii=False, indent=2)
+    return (
+        "Собери EVO-0 отчёт по входным фактам.\n"
+        f"Текущая цель:\n{goal}\n\n"
+        f"Последние audit-события:\n{events_preview}\n\n"
+        f"Статус бюджета:\n{budget_status}\n\n"
+        f"Версия/коммит деплоя: {_deploy_revision_hint()}\n\n"
+        "Требования:\n"
+        "1) Дай 3-7 гипотез улучшения.\n"
+        "2) Для каждой: польза, риск (R0-R3), что тестировать.\n"
+        "3) Добавь раздел 'Не трогать' (например governance/*).\n"
+        "4) Только предложения; ничего не выполнять."
+    )
+
+
+def _extract_summary_points(report_text: str, *, min_items: int = 3, max_items: int = 7) -> list[str]:
+    candidates: list[str] = []
+    for line in report_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        cleaned = re.sub(r"^[-*•]\s+", "", stripped)
+        cleaned = re.sub(r"^\d+[\.)]\s+", "", cleaned)
+        if cleaned != stripped or re.match(r"^Гипотеза\s*\d+", cleaned, flags=re.IGNORECASE):
+            candidates.append(cleaned)
+        if len(candidates) >= max_items:
+            break
+
+    while len(candidates) < min_items:
+        candidates.append("Гипотеза: уточнить узкое место по последним аудит-событиям и проверить на dry-run.")
+    return candidates[:max_items]
+
+
+async def _run_reflect() -> tuple[str, str, str]:
+    goal = _load_current_goal()
+    audit_events = _load_recent_audit_events(limit=12)
+    budget_status = await budget_ledger.render_budget()
+    prompt = _build_reflect_prompt(goal, audit_events, budget_status)
+
+    payload = AnthropicClient(max_tokens_out=1200).create_message(
+        messages=[{"role": "user", "content": prompt}],
+        system=_REFLECT_SYSTEM_PROMPT,
+    )
+    await budget_ledger.record_llm_usage(payload.get("usage") if isinstance(payload, dict) else None)
+
+    report = _final_only_sanitize(_extract_llm_text(payload))
+    if not report:
+        report = "# EVO-0\n\nГипотеза 1: Уточнить целевой KPI и baseline."
+
+    summary_points = _extract_summary_points(report)
+    summary = "\n".join(f"- {point}" for point in summary_points)
+
+    title = f"mitra-evo0-reflect {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}"
+    full_report = (
+        "# EVO-0 report\n\n"
+        f"## Goal\n{goal}\n\n"
+        f"## Budget\n{budget_status}\n\n"
+        f"## Model output\n{report}\n"
+    )
+    upload = await upload_markdown(title=title, markdown_body=full_report)
+    await budget_ledger.record_drive_write()
+    link = upload.web_view_link or upload.file_id
+
+    reply = _final_only_sanitize(f"EVO-0 hypotheses:\n{summary}\n\nDrive: {link}")
+    return reply, upload.file_id, link
+
+
 def _audit_drive_check(user_id: int | None, chat_id: int | None, auth_mode: str, outcome: str, detail: str) -> None:
     event = {
         "event": "drive_check",
@@ -889,6 +1124,8 @@ async def telegram_webhook(
         from_user = message.get("from") or {}
         user_id = from_user.get("id")
         action_type = text.split()[0] if isinstance(text, str) and text else "no_command"
+        if isinstance(text, str) and text.strip().startswith("/goal set"):
+            action_type = "/goal set"
 
         if isinstance(update_id, int) and _recent_update_deduplicator.is_duplicate(update_id):
             _audit_dedup(update_id=update_id, user_id=user_id, chat_id=chat_id, action_id=action_id)
@@ -1018,6 +1255,54 @@ async def telegram_webhook(
                 )
         elif not allowlist_configured:
             reply_text = "Allowlist not configured. Set ALLOWED_TELEGRAM_USER_IDS."
+        elif text.startswith("/goal"):
+            goal_command = _parse_goal_command(text)
+            if goal_command is None:
+                reply_text = "Usage: /goal or /goal set <text>"
+            else:
+                goal_action, goal_value = goal_command
+                if goal_action == "show":
+                    reply_text = _build_goal_show_reply()
+                elif goal_value is None:
+                    reply_text = "Usage: /goal set <text>"
+                else:
+                    try:
+                        reply_text = await _set_goal(
+                            goal_text=goal_value,
+                            action_id=action_id,
+                            telegram_update_id=telegram_update_id,
+                            user_id=user_id,
+                            chat_id=chat_id,
+                        )
+                    except DriveNotConfigured:
+                        reply_text = "Drive not configured for /goal set"
+                        _safe_audit_event(
+                            {
+                                "event": "telegram_goal_set",
+                                "action_id": action_id,
+                                "telegram_update_id": telegram_update_id,
+                                "user_id": user_id,
+                                "chat_id": chat_id,
+                                "action_type": "/goal set",
+                                "outcome": "drive_disabled",
+                                "log_level": "error",
+                            }
+                        )
+                    except Exception:
+                        logger.exception("goal_set_failed")
+                        reply_text = "Goal save failed"
+                        _safe_audit_event(
+                            {
+                                "event": "telegram_goal_set",
+                                "action_id": action_id,
+                                "telegram_update_id": telegram_update_id,
+                                "user_id": user_id,
+                                "chat_id": chat_id,
+                                "action_type": "/goal set",
+                                "outcome": "error",
+                                "log_level": "error",
+                            }
+                        )
         elif text.startswith("/think"):
             think_prompt = _extract_think_prompt(text)
             if not think_prompt:
@@ -1031,6 +1316,34 @@ async def telegram_webhook(
                     logger.exception("think_command_failed")
                     reply_text = "Не удалось получить ответ LLM для /think"
                     _audit_think_command(action_id=action_id, user_id=user_id, command="/think", outcome="error")
+        elif text.startswith("/reflect"):
+            file_id = ""
+            try:
+                reply_text, file_id, link = await _run_reflect()
+                log_report_event(
+                    action_id=action_id,
+                    telegram_update_id=telegram_update_id,
+                    file_id=file_id,
+                    outcome="success",
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    link=link,
+                    action_type="/reflect",
+                    log_level="info",
+                )
+            except Exception as exc:
+                logger.exception("reflect_command_failed")
+                reply_text = _sanitize_report_error(exc)
+                log_report_event(
+                    action_id=action_id,
+                    telegram_update_id=telegram_update_id,
+                    file_id=file_id,
+                    outcome="error",
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    action_type="/reflect",
+                    log_level="error",
+                )
         elif text.startswith("/reports"):
             try:
                 files = await list_recent_files(limit=5)
