@@ -906,12 +906,62 @@ def _extract_intents_from_request(request_text: str) -> set[str]:
         "webhook": "telegram",
         "drive": "drive",
         "calendar": "calendar",
+        "календар": "calendar",
+        "встреч": "calendar",
+        "доступност": "calendar",
         "report": "reporting",
     }
     for marker, intent in intent_hints.items():
         if marker in lowered:
             intents.add(intent)
     return intents
+
+
+def _paths_exist(relative_paths: list[str]) -> bool:
+    project_root = Path(__file__).resolve().parents[1]
+    for rel in relative_paths:
+        candidate = (project_root / rel).resolve()
+        if candidate.exists():
+            return True
+    return False
+
+
+def _resolve_capability_artifacts(capability: dict[str, Any]) -> dict[str, bool]:
+    capability_id = str(capability.get("id", "")).strip().lower()
+    artifacts = capability.get("artifacts")
+    if not isinstance(artifacts, dict):
+        artifacts = {}
+
+    code_paths = [str(item).strip() for item in artifacts.get("code", []) if str(item).strip()]
+    if not code_paths and capability_id == "calendar":
+        code_paths = [
+            "mitra_app/handlers/calendar.py",
+            "mitra_app/modules/calendar.py",
+            "service/calendar.py",
+        ]
+
+    tests_paths = [str(item).strip() for item in capability.get("tests", []) if str(item).strip()]
+    runbook_paths = [str(item).strip() for item in artifacts.get("runbook", []) if str(item).strip()]
+    if not runbook_paths and capability_id:
+        runbook_paths = [f"runbooks/{capability_id}.md"]
+
+    policy_paths = [str(item).strip() for item in capability.get("policies", []) if str(item).strip()]
+
+    required_env = capability.get("required_env")
+    if isinstance(required_env, list):
+        required_env_values = [str(item).strip() for item in required_env if str(item).strip()]
+    else:
+        required_env_values = []
+
+    return {
+        "has_code": _paths_exist(code_paths),
+        "has_tests": _paths_exist(tests_paths),
+        "has_runbook": _paths_exist(runbook_paths),
+        "has_policy": _paths_exist(policy_paths),
+        "has_config": bool(capability.get("tools") or required_env_values),
+        "has_secrets": bool(required_env_values),
+        "requires_secrets": bool(required_env_values),
+    }
 
 
 def detect_capability_gaps(request_text: str) -> dict[str, Any]:
@@ -931,26 +981,49 @@ def detect_capability_gaps(request_text: str) -> dict[str, Any]:
             "gaps": list(_CAPABILITY_GAP_TYPES),
         }
 
-    has_policy = any(cap.get("policies") for cap in matched)
-    has_tests = any(cap.get("tests") for cap in matched)
-    has_secrets = any(cap.get("required_env") for cap in matched)
-    has_code = any(cap.get("tools") for cap in matched)
-    has_config = any(cap.get("tools") or cap.get("required_env") for cap in matched)
-    has_runbook = any((Path(__file__).resolve().parents[1] / "runbooks" / f"{cap.get('id', '')}.md").exists() for cap in matched)
+    artifact_state = [_resolve_capability_artifacts(capability) for capability in matched]
+
+    has_policy = any(state["has_policy"] for state in artifact_state)
+    has_tests = any(state["has_tests"] for state in artifact_state)
+    has_secrets = any(state["has_secrets"] for state in artifact_state)
+    has_code = any(state["has_code"] for state in artifact_state)
+    has_config = any(state["has_config"] for state in artifact_state)
+    has_runbook = any(state["has_runbook"] for state in artifact_state)
+
+    required_gaps: set[str] = set()
+    for capability in matched:
+        for criterion in capability.get("minimum_implementation", []):
+            if isinstance(criterion, str) and criterion.strip():
+                required_gaps.add(criterion.strip().lower())
+
+    availability = {
+        "code": has_code,
+        "policy": has_policy,
+        "config": has_config,
+        "tests": has_tests,
+        "secrets": has_secrets,
+        "runbook": has_runbook,
+    }
 
     gaps: list[str] = []
-    if not has_code:
-        gaps.append("code")
-    if not has_policy:
-        gaps.append("policy")
-    if not has_config:
-        gaps.append("config")
-    if not has_tests:
-        gaps.append("tests")
-    if not has_secrets:
-        gaps.append("secrets")
-    if not has_runbook:
-        gaps.append("runbook")
+    if required_gaps:
+        for gap_type in _CAPABILITY_GAP_TYPES:
+            if gap_type in required_gaps and not availability.get(gap_type, False):
+                gaps.append(gap_type)
+    else:
+        if not has_code:
+            gaps.append("code")
+        if not has_policy:
+            gaps.append("policy")
+        if not has_config:
+            gaps.append("config")
+        if not has_tests:
+            gaps.append("tests")
+        requires_secrets = any(state["requires_secrets"] for state in artifact_state)
+        if requires_secrets and not has_secrets:
+            gaps.append("secrets")
+        if not has_runbook:
+            gaps.append("runbook")
 
     return {
         "intents": sorted(intents),
