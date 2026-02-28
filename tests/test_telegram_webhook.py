@@ -18,7 +18,9 @@ from mitra_app.main import (
     RecentUpdateDeduplicator,
     _COMMAND_POLICIES,
     _REFLECT_SYSTEM_PROMPT,
+    _extract_json_object,
     _build_task_spec,
+    detect_capability_gaps,
     _build_pr_status_reply,
     _extract_think_prompt,
     _load_allowed_user_ids,
@@ -1438,7 +1440,7 @@ def test_build_task_spec_logs_fallback_with_compact_diagnostics_on_non_json_resp
                 ]
             }
 
-    with caplog.at_level(logging.INFO, logger="mitra_app.main"):
+    with caplog.at_level(logging.WARNING, logger="mitra_app.main"):
         spec = _build_task_spec("Сделай команду /hello", llm_client=FakeClient())
 
     assert spec["degraded"] is True
@@ -1469,18 +1471,105 @@ def test_build_task_spec_logs_retry_success(monkeypatch, caplog):
         },
     ]
 
+    assert "OPENAI_API_KEY=top-secret" not in caplog.text
+    assert any(rec.message == "task_spec_degraded_json_parse_failed" for rec in caplog.records)
+
+
+def test_build_task_spec_returns_fallback_when_multiple_non_json_text_blocks_returned(caplog):
     class FakeClient:
         def create_message(self, *, messages, system):
-            return responses.pop(0)
+            return {
+                "content": [
+                    {"type": "text", "text": "still not json"},
+                    {"type": "text", "text": "also not json"},
+                ]
+            }
 
-    with caplog.at_level(logging.INFO, logger="mitra_app.main"):
-        spec = _build_task_spec("Сделай команду /hello", llm_client=FakeClient())
+    with caplog.at_level(logging.WARNING, logger="mitra_app.main"):
+        spec = _build_task_spec("Нужен fallback", llm_client=FakeClient())
 
-    assert spec["degraded"] is False
-    assert spec["risk_level"] == "R1"
+    assert spec["degraded"] is True
+    assert spec["summary"] == "Нужен fallback"
+    assert any(rec.message == "task_spec_degraded_json_parse_failed" for rec in caplog.records)
 
-    retry_record = next(rec for rec in caplog.records if rec.message == "task_spec_retry_success")
-    assert retry_record.parse_outcome == "retry_success"
+
+def test_detect_capability_gaps_for_new_capability_request_returns_all_required_blocks():
+    detection = detect_capability_gaps("Нужна новая способность для партнёрской интеграции с CRM")
+
+    assert detection["matched_capabilities"] == []
+    assert detection["gaps"] == ["code", "policy", "config", "tests", "secrets", "runbook"]
+
+
+def test_task_command_includes_gap_sections_in_issue_body(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_create_github_issue(title: str, body: str):
+        assert title == "Добавить новую способность CRM"
+        assert "## Capability gaps to close" in body
+        assert "### GAP: code" in body
+        assert "### GAP: policy" in body
+        assert "### GAP: config" in body
+        assert "### GAP: tests" in body
+        assert "### GAP: secrets" in body
+        assert "### GAP: runbook" in body
+        return 109, "https://github.com/o/r/issues/109"
+
+    def fake_build_task_spec(request_text: str):
+        assert "новую способность" in request_text
+        return {
+            "title": "Добавить новую способность CRM",
+            "summary": "Нужно создать способность для CRM-синхронизации.",
+            "components": [],
+            "required_env_secrets": [],
+            "new_commands": [],
+            "acceptance_criteria": ["Способность документирована и интегрирована"],
+            "tests_to_add": [],
+            "risk_level": "R2",
+        }
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main._build_task_spec", fake_build_task_spec)
+    monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_github_issue)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={
+            "message": {
+                "text": "/task Добавить новую способность CRM с синхронизацией",
+                "chat": {"id": 123},
+                "from": {"id": 123},
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert "Issue создан: https://github.com/o/r/issues/109" in calls[0][1]
+    assert "Обнаружены gaps: code, policy, config, tests, secrets, runbook" in calls[0][1]
+
+
+def test_extract_json_object_handles_dirty_text_with_fenced_block_and_json():
+    dirty = """Ниже набросок ответа.
+```text
+Это не JSON
+```
+```json
+{"title":"Dirty JSON title", "risk_level":"R1"}
+```
+Хвостовой текст.
+"""
+
+    parsed = _extract_json_object(dirty)
+
+    assert parsed == {"title": "Dirty JSON title", "risk_level": "R1"}
 
 
 def test_github_actions_callback_posts_to_admin_chat(monkeypatch):
