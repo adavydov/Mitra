@@ -1322,6 +1322,7 @@ def test_task_command_creates_codex_issue_and_reports_expected_command(monkeypat
     async def fake_create_github_issue(title: str, body: str):
         assert title == "Добавить /hello"
         assert "## Acceptance criteria" in body
+        assert "## Allowed file scope" in body
         return 88, "https://github.com/o/r/issues/88"
 
     def fake_build_task_spec(request_text: str):
@@ -1335,6 +1336,7 @@ def test_task_command_creates_codex_issue_and_reports_expected_command(monkeypat
             "acceptance_criteria": ["Команда /hello отвечает hello from mitra"],
             "tests_to_add": ["pytest для /telegram/webhook"],
             "risk_level": "R1",
+            "allowed_file_scope": ["mitra_app/*", "tests/*"],
         }
 
     monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
@@ -1376,6 +1378,7 @@ def test_task_command_without_llm_json_uses_fallback_spec(monkeypatch):
         assert "Добавь новую команду" in title
         assert "## Summary" in body
         assert "## Risk level\n- R2" in body
+        assert "## Allowed file scope\n- mitra_app/*\n- tests/*" in body
         assert "Добавь новую команду" in body
         return 91, "https://github.com/o/r/issues/91"
 
@@ -1520,12 +1523,7 @@ def test_build_task_spec_returns_fallback_when_json_parse_fails(caplog):
         "acceptance_criteria": [],
         "tests_to_add": [],
         "risk_level": "R2",
-        "task_type": "maintenance",
-        "missing_capabilities": [],
-        "required_code_changes": [],
-        "policy_config_updates": [],
-        "acceptance_checks": [],
-        "rollback_safety": [],
+        "allowed_file_scope": ["mitra_app/*", "tests/*"],
         "degraded": True,
     }
 

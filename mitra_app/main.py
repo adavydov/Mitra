@@ -62,11 +62,8 @@ HELP_TEXT = (
 _TASK_SYSTEM_PROMPT = (
     "Ты переводишь пользовательскую задачу в codex-ready спецификацию issue для GitHub. "
     "Верни только JSON-объект с ключами: title, summary, components, required_env_secrets, "
-    "new_commands, acceptance_criteria, tests_to_add, risk_level, task_type, missing_capabilities, "
-    "required_code_changes, policy_config_updates, acceptance_checks, rollback_safety. "
-    "components/new_commands/required_env_secrets/acceptance_criteria/tests_to_add/missing_capabilities/"
-    "required_code_changes/policy_config_updates/acceptance_checks/rollback_safety должны быть массивами строк. "
-    "task_type должен быть одним из: new capability, bugfix, maintenance, research. "
+    "new_commands, acceptance_criteria, tests_to_add, risk_level, allowed_file_scope. "
+    "components/new_commands/required_env_secrets/acceptance_criteria/tests_to_add/allowed_file_scope должны быть массивами строк. "
     "risk_level должен быть одним из R0,R1,R2,R3,R4. "
     "required_env_secrets указывай только именами переменных без значений."
 )
@@ -76,11 +73,8 @@ _TASK_RETRY_SYSTEM_PROMPT = (
     "Ответь строго одним валидным JSON-объектом и ничем больше. "
     "Запрещены markdown-блоки, комментарии, пояснения, префиксы/суффиксы текста. "
     "Ключи JSON: title, summary, components, required_env_secrets, new_commands, "
-    "acceptance_criteria, tests_to_add, risk_level, task_type, missing_capabilities, "
-    "required_code_changes, policy_config_updates, acceptance_checks, rollback_safety. "
-    "components/new_commands/required_env_secrets/acceptance_criteria/tests_to_add/missing_capabilities/"
-    "required_code_changes/policy_config_updates/acceptance_checks/rollback_safety — массивы строк. "
-    "task_type — одно из: new capability, bugfix, maintenance, research. "
+    "acceptance_criteria, tests_to_add, risk_level, allowed_file_scope. "
+    "components/new_commands/required_env_secrets/acceptance_criteria/tests_to_add/allowed_file_scope — массивы строк. "
     "risk_level — одно из R0,R1,R2,R3,R4. "
     "required_env_secrets указывай только именами переменных без значений."
 )
@@ -821,12 +815,7 @@ def _build_fallback_task_spec(request_text: str) -> dict[str, Any]:
         "acceptance_criteria": [],
         "tests_to_add": [],
         "risk_level": "R2",
-        "task_type": "maintenance",
-        "missing_capabilities": [],
-        "required_code_changes": [],
-        "policy_config_updates": [],
-        "acceptance_checks": [],
-        "rollback_safety": [],
+        "allowed_file_scope": ["mitra_app/*", "tests/*"],
         "degraded": True,
     }
 
@@ -1020,6 +1009,7 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
                     "retry_parse": retry_diagnostics,
                 },
             )
+            logger.warning("task_spec_degraded_json_parse_failed")
             return _build_fallback_task_spec(request_text)
 
         logger.info(
@@ -1051,12 +1041,7 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
         "acceptance_criteria": _normalize_string_list(parsed.get("acceptance_criteria")),
         "tests_to_add": _normalize_string_list(parsed.get("tests_to_add")),
         "risk_level": risk_level,
-        "task_type": _normalize_task_type(parsed.get("task_type")),
-        "missing_capabilities": _normalize_string_list(parsed.get("missing_capabilities")),
-        "required_code_changes": _normalize_string_list(parsed.get("required_code_changes")),
-        "policy_config_updates": _normalize_string_list(parsed.get("policy_config_updates")),
-        "acceptance_checks": _normalize_string_list(parsed.get("acceptance_checks")),
-        "rollback_safety": _normalize_string_list(parsed.get("rollback_safety")),
+        "allowed_file_scope": _normalize_string_list(parsed.get("allowed_file_scope")) or ["mitra_app/*", "tests/*"],
         "degraded": False,
     }
 
@@ -1089,32 +1074,7 @@ def _render_task_issue(spec: dict[str, Any]) -> tuple[str, str]:
         body_lines.append("")
     body_lines.append(f"## Risk level\n- {spec.get('risk_level', 'R2')}")
     body_lines.append("")
-    task_type = _normalize_task_type(spec.get("task_type"))
-    missing_sections = _new_capability_missing_sections(spec) if task_type == "new capability" else []
-    machine_check_payload = {
-        "task_type": task_type,
-        "mandatory_sections": {
-            section_key: bool(_normalize_string_list(spec.get(section_key)))
-            for section_key in _NEW_CAPABILITY_SECTION_KEYS.values()
-        },
-        "mandatory_sections_complete": not missing_sections,
-    }
-    body_lines.append("## CI completeness block")
-    body_lines.append("```json")
-    body_lines.append(json.dumps(machine_check_payload, ensure_ascii=False, sort_keys=True))
-    body_lines.append("```")
-
-    capability_gaps = [str(item) for item in spec.get("capability_gaps", []) if str(item).strip()]
-    if capability_gaps:
-        body_lines.append("")
-        body_lines.append("## Capability gaps to close")
-        body_lines.append("Заполнить каждый раздел ниже перед началом реализации.")
-        for gap in capability_gaps:
-            body_lines.append("")
-            body_lines.append(f"### GAP: {gap}")
-            body_lines.append("- Context:")
-            body_lines.append("- Proposed change:")
-            body_lines.append("- Validation:")
+    body_lines.extend(render_list("Allowed file scope", spec.get("allowed_file_scope", ["mitra_app/*", "tests/*"])))
 
     return title, "\n".join(body_lines).strip()
 
