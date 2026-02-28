@@ -5,7 +5,7 @@ import os
 import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 import time
@@ -795,6 +795,19 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
+def _parse_json_object_strict(text: str) -> dict[str, Any] | None:
+    candidate = text.strip()
+    if not candidate:
+        return None
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
 def _normalize_string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -959,14 +972,21 @@ def detect_capability_gaps(request_text: str) -> dict[str, Any]:
     }
 
 
-def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = None) -> dict[str, Any]:
+def build_task_spec_resilient(request_text: str, llm_client: AnthropicClient | None = None) -> dict[str, Any]:
     client = llm_client or AnthropicClient(max_tokens_out=900)
-    response = client.create_message(
-        messages=[{"role": "user", "content": request_text}],
-        system=_TASK_SYSTEM_PROMPT,
-    )
-    content = response.get("content")
-    parse_diagnostics = _build_task_parse_diagnostics(content)
+
+    content: Any = None
+    parse_diagnostics: dict[str, Any] = {"content_type": "unknown"}
+    try:
+        response = client.create_message(
+            messages=[{"role": "user", "content": request_text}],
+            system=_TASK_SYSTEM_PROMPT,
+        )
+        content = response.get("content")
+        parse_diagnostics = _build_task_parse_diagnostics(content)
+    except Exception:
+        logger.warning("task_spec_primary_llm_failed", exc_info=True)
+
     text_blocks: list[str] = []
     if isinstance(content, list):
         for block in content:
@@ -975,25 +995,34 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
                 if isinstance(text, str) and text.strip():
                     text_blocks.append(text.strip())
 
-    parse_diagnostics = _build_task_parse_diagnostics(content)
-    parsed = _extract_json_object("\n".join(text_blocks))
+    primary_text = "\n".join(text_blocks)
+    parsed = _parse_json_object_strict(primary_text)
+    if not parsed:
+        parsed = _extract_json_object(primary_text)
+
     if not parsed:
         logger.warning("task_spec_parse_primary_failed", extra=parse_diagnostics)
 
-        retry_response = client.create_message(
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        "Верни строго JSON-объект по схеме из system prompt без markdown и комментариев.\n"
-                        f"Запрос пользователя: {request_text}"
-                    ),
-                }
-            ],
-            system=_TASK_RETRY_SYSTEM_PROMPT,
-        )
-        retry_content = retry_response.get("content")
-        retry_diagnostics = _build_task_parse_diagnostics(retry_content)
+        retry_content: Any = None
+        retry_diagnostics: dict[str, Any] = {"content_type": "unknown"}
+        try:
+            retry_response = client.create_message(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            "Верни строго JSON-объект по схеме из system prompt без markdown и комментариев.\n"
+                            f"Запрос пользователя: {request_text}"
+                        ),
+                    }
+                ],
+                system=_TASK_RETRY_SYSTEM_PROMPT,
+            )
+            retry_content = retry_response.get("content")
+            retry_diagnostics = _build_task_parse_diagnostics(retry_content)
+        except Exception:
+            logger.warning("task_spec_retry_llm_failed", exc_info=True)
+
         retry_text_blocks: list[str] = []
         if isinstance(retry_content, list):
             for block in retry_content:
@@ -1002,7 +1031,10 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
                     if isinstance(text, str) and text.strip():
                         retry_text_blocks.append(text.strip())
 
-        parsed = _extract_json_object("\n".join(retry_text_blocks))
+        retry_text = "\n".join(retry_text_blocks)
+        parsed = _parse_json_object_strict(retry_text)
+        if not parsed:
+            parsed = _extract_json_object(retry_text)
         if not parsed:
             logger.warning(
                 "task_spec_degraded_json_parse_failed",
@@ -1012,7 +1044,7 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
                     "retry_parse": retry_diagnostics,
                 },
             )
-            logger.warning("task_spec_degraded_json_parse_failed")
+            logger.warning("task_spec_fallback_used")
             return _build_fallback_task_spec(request_text)
 
         logger.info(
@@ -1049,7 +1081,11 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
     }
 
 
-def _render_task_issue(spec: dict[str, Any]) -> tuple[str, str]:
+def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = None) -> dict[str, Any]:
+    return build_task_spec_resilient(request_text, llm_client=llm_client)
+
+
+def _render_task_issue(spec: dict[str, Any], mitra_meta: dict[str, Any] | None = None) -> tuple[str, str]:
     title = str(spec.get("title", "Task from Telegram")).strip()
     summary = str(spec.get("summary", "")).strip()
 
@@ -1078,6 +1114,14 @@ def _render_task_issue(spec: dict[str, Any]) -> tuple[str, str]:
     body_lines.append(f"## Risk level\n- {spec.get('risk_level', 'R2')}")
     body_lines.append("")
     body_lines.extend(render_list("Allowed file scope", spec.get("allowed_file_scope", ["mitra_app/*", "tests/*"])))
+    meta = mitra_meta or {}
+    body_lines.append("")
+    body_lines.append("## Mitra meta")
+    body_lines.append(f"- chat_id: {meta.get('chat_id')}")
+    body_lines.append(f"- user_id: {meta.get('user_id')}")
+    body_lines.append(f"- action_id: {meta.get('action_id')}")
+    body_lines.append(f"- request_text: {meta.get('request_text')}")
+    body_lines.append(f"- timestamp: {meta.get('timestamp')}")
 
     capability_gaps = _normalize_string_list(spec.get("capability_gaps"))
     if capability_gaps:
@@ -1901,7 +1945,16 @@ async def telegram_webhook(
                     degraded = bool(spec.get("degraded"))
                     capability_detection = detect_capability_gaps(enriched_request)
                     spec["capability_gaps"] = capability_detection.get("gaps", [])
-                    issue_title, issue_body = _render_task_issue(spec)
+                    issue_title, issue_body = _render_task_issue(
+                        spec,
+                        mitra_meta={
+                            "chat_id": chat_id,
+                            "user_id": user_id,
+                            "action_id": action_id,
+                            "request_text": enriched_request,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
                     issue_number, issue_url = await _create_github_issue(title=issue_title, body=issue_body)
                     await budget_ledger.record_github_write()
 
@@ -2283,7 +2336,16 @@ async def telegram_webhook(
                         degraded = bool(spec.get("degraded"))
                         capability_detection = detect_capability_gaps(request_text)
                         spec["capability_gaps"] = capability_detection.get("gaps", [])
-                        issue_title, issue_body = _render_task_issue(spec)
+                        issue_title, issue_body = _render_task_issue(
+                            spec,
+                            mitra_meta={
+                                "chat_id": chat_id,
+                                "user_id": user_id,
+                                "action_id": action_id,
+                                "request_text": request_text,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                            },
+                        )
                         issue_number, issue_url = await _create_github_issue(title=issue_title, body=issue_body)
                         await budget_ledger.record_github_write()
 
