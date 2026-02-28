@@ -1,4 +1,5 @@
 import json
+import hashlib
 import logging
 import os
 import re
@@ -52,9 +53,11 @@ _THINK_SYSTEM_PROMPT = (
 
 HELP_TEXT = (
     "Commands: /status, /oauth_status, /search <query>, /research <query>, /think <prompt>, "
-    "/report <text>, /pr <title>\\n<spec>, /pr_status <issue#|pr#>, /drive_check, /budget, "
+    "/goal, /goal set <text>, /report <text>, /pr <title>\\n<spec>, /pr_status <issue#|pr#>, /drive_check, /budget, "
     "/smoke, /smoke_deep"
 )
+
+_GOAL_PREVIEW_MAX_CHARS = 500
 
 
 def _sensitive_env_names() -> set[str]:
@@ -195,6 +198,8 @@ _COMMAND_POLICIES: dict[str, CommandPolicy] = {
     "/pr_status": CommandPolicy(required_al="AL1", risk_level="R1", budget_category="search"),
     "/drive_check": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
     "/budget": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
+    "/goal": CommandPolicy(required_al="AL1", risk_level="R1", budget_category="drive"),
+    "/goal set": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
 }
 
 _policy_enforcer = CommandPolicyEnforcer(Path(__file__).resolve().parents[1])
@@ -342,6 +347,101 @@ class PerUserRateLimiter:
 
 
 _pr_rate_limiter = PerUserRateLimiter(limit=5, window_seconds=3600)
+
+
+def _parse_goal_command(text: str) -> tuple[str, str | None] | None:
+    normalized = text.strip()
+    if normalized == "/goal":
+        return "show", None
+    if normalized.startswith("/goal set"):
+        goal_text = normalized[len("/goal set") :].strip()
+        return "set", goal_text or None
+    return None
+
+
+def _truncate_goal_preview(goal_text: str, limit: int = _GOAL_PREVIEW_MAX_CHARS) -> str:
+    if len(goal_text) <= limit:
+        return goal_text
+    return f"{goal_text[:limit].rstrip()}…"
+
+
+def _goal_state_from_audit() -> dict[str, str] | None:
+    audit_path = Path(os.getenv("MITRA_AUDIT_LOG", "audit/audit.jsonl"))
+    if not audit_path.exists():
+        return None
+
+    try:
+        lines = audit_path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        logger.exception("goal_audit_read_failed", extra={"path": str(audit_path)})
+        return None
+
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if payload.get("event") != "telegram_goal_set" or payload.get("outcome") != "success":
+            continue
+
+        preview = payload.get("goal_preview")
+        link = payload.get("goal_link")
+        goal_hash = payload.get("goal_hash")
+        if isinstance(preview, str) and isinstance(link, str) and isinstance(goal_hash, str):
+            return {"preview": preview, "link": link, "hash": goal_hash}
+
+    return None
+
+
+def _build_goal_show_reply() -> str:
+    goal_state = _goal_state_from_audit()
+    if goal_state is None:
+        return "Цель не задана. Используйте /goal set <текст цели>."
+
+    return f"Текущая цель: {goal_state['preview']}\nDrive: {goal_state['link']}"
+
+
+async def _set_goal(
+    *,
+    goal_text: str,
+    action_id: str,
+    telegram_update_id: int | None,
+    user_id: int | None,
+    chat_id: int | None,
+) -> str:
+    goal_preview = _truncate_goal_preview(goal_text)
+    goal_hash = hashlib.sha256(goal_text.encode("utf-8")).hexdigest()
+    title = f"mitra_state-goal {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    markdown_body = (
+        f"# Mitra Goal\n\n"
+        f"goal:\n{goal_text}\n\n"
+        f"goal_hash_sha256: {goal_hash}\n"
+        f"action_id: {action_id}\n"
+        f"user_id: {user_id}\n"
+        f"timestamp: {datetime.now(timezone.utc).isoformat()}\n"
+    )
+
+    upload = await upload_markdown(title=title, markdown_body=markdown_body)
+    goal_link = upload.web_view_link or upload.file_id
+    _safe_audit_event(
+        {
+            "event": "telegram_goal_set",
+            "action_id": action_id,
+            "telegram_update_id": telegram_update_id,
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "action_type": "/goal set",
+            "goal_hash": goal_hash,
+            "goal_preview": goal_preview,
+            "goal_link": goal_link,
+            "file_id": upload.file_id,
+            "outcome": "success",
+            "log_level": "info",
+        }
+    )
+    return f"Goal saved: {goal_link}"
 
 
 def _parse_pr_command(text: str) -> tuple[str, str] | None:
@@ -773,6 +873,8 @@ async def telegram_webhook(
         from_user = message.get("from") or {}
         user_id = from_user.get("id")
         action_type = text.split()[0] if isinstance(text, str) and text else "no_command"
+        if isinstance(text, str) and text.strip().startswith("/goal set"):
+            action_type = "/goal set"
 
         if isinstance(update_id, int) and _recent_update_deduplicator.is_duplicate(update_id):
             _audit_dedup(update_id=update_id, user_id=user_id, chat_id=chat_id, action_id=action_id)
@@ -902,6 +1004,54 @@ async def telegram_webhook(
                 )
         elif not allowlist_configured:
             reply_text = "Allowlist not configured. Set ALLOWED_TELEGRAM_USER_IDS."
+        elif text.startswith("/goal"):
+            goal_command = _parse_goal_command(text)
+            if goal_command is None:
+                reply_text = "Usage: /goal or /goal set <text>"
+            else:
+                goal_action, goal_value = goal_command
+                if goal_action == "show":
+                    reply_text = _build_goal_show_reply()
+                elif goal_value is None:
+                    reply_text = "Usage: /goal set <text>"
+                else:
+                    try:
+                        reply_text = await _set_goal(
+                            goal_text=goal_value,
+                            action_id=action_id,
+                            telegram_update_id=telegram_update_id,
+                            user_id=user_id,
+                            chat_id=chat_id,
+                        )
+                    except DriveNotConfigured:
+                        reply_text = "Drive not configured for /goal set"
+                        _safe_audit_event(
+                            {
+                                "event": "telegram_goal_set",
+                                "action_id": action_id,
+                                "telegram_update_id": telegram_update_id,
+                                "user_id": user_id,
+                                "chat_id": chat_id,
+                                "action_type": "/goal set",
+                                "outcome": "drive_disabled",
+                                "log_level": "error",
+                            }
+                        )
+                    except Exception:
+                        logger.exception("goal_set_failed")
+                        reply_text = "Goal save failed"
+                        _safe_audit_event(
+                            {
+                                "event": "telegram_goal_set",
+                                "action_id": action_id,
+                                "telegram_update_id": telegram_update_id,
+                                "user_id": user_id,
+                                "chat_id": chat_id,
+                                "action_type": "/goal set",
+                                "outcome": "error",
+                                "log_level": "error",
+                            }
+                        )
         elif text.startswith("/think"):
             think_prompt = _extract_think_prompt(text)
             if not think_prompt:

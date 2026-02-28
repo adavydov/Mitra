@@ -157,10 +157,82 @@ def test_start_command_lists_search(monkeypatch):
         (
             123,
             "Commands: /status, /oauth_status, /search <query>, /research <query>, /think <prompt>, "
-            "/report <text>, /pr <title>\\n<spec>, /pr_status <issue#|pr#>, /drive_check, /budget, /smoke, /smoke_deep",
+            "/goal, /goal set <text>, /report <text>, /pr <title>\\n<spec>, /pr_status <issue#|pr#>, /drive_check, /budget, /smoke, /smoke_deep",
         )
     ]
 
+
+
+
+def test_goal_show_without_state_returns_not_set(monkeypatch, tmp_path):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    monkeypatch.setenv("MITRA_AUDIT_LOG", str(tmp_path / "events.ndjson"))
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/goal", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(123, "Цель не задана. Используйте /goal set <текст цели>.")]
+
+
+def test_goal_set_persists_via_audit_and_goal_show_returns_preview_and_link(monkeypatch, tmp_path):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    monkeypatch.setenv("MITRA_AUDIT_LOG", str(tmp_path / "events.ndjson"))
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    async def fake_upload_markdown(title: str, markdown_body: str):
+        assert title.startswith("mitra_state-goal ")
+        assert "goal_hash_sha256:" in markdown_body
+        return DriveUploadResult(file_id="goal-file-id", web_view_link="https://drive.test/goal")
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.upload_markdown", fake_upload_markdown)
+
+    goal_text = "/goal set Сделать петлю автоулучшений: /task → issue → PR → deploy → новая команда"
+
+    response_set = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": goal_text, "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+    response_show = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={"message": {"text": "/goal", "chat": {"id": 123}, "from": {"id": 123}}},
+    )
+
+    assert response_set.status_code == 200
+    assert response_show.status_code == 200
+    assert calls[0] == (123, "Goal saved: https://drive.test/goal")
+    assert calls[1][0] == 123
+    assert "Текущая цель:" in calls[1][1]
+    assert "Сделать петлю автоулучшений" in calls[1][1]
+    assert "Drive: https://drive.test/goal" in calls[1][1]
+
+    events = (tmp_path / "events.ndjson").read_text(encoding="utf-8").strip().splitlines()
+    payload = [json.loads(line) for line in events if json.loads(line).get("event") == "telegram_goal_set"][-1]
+    assert payload["outcome"] == "success"
+    assert payload["goal_hash"]
+    assert payload["goal_preview"].startswith("Сделать петлю автоулучшений")
+    assert payload["goal_link"] == "https://drive.test/goal"
 
 def test_think_command_returns_short_read_only_response(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
