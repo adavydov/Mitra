@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 _THINK_PROMPT_MAX_CHARS = 1200
 _THINK_OUTPUT_MAX_CHARS = 900
 _GOAL_PREVIEW_MAX_CHARS = 160
+_TASK_PARSE_PREVIEW_MAX_CHARS = 260
 _SECRET_ENV_NAME_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|PRIVATE|API_KEY|ACCESS_KEY|CLIENT_SECRET)", re.IGNORECASE)
 _THINK_SYSTEM_PROMPT = (
     "Ты помощник в режиме /think. Нужен только анализ текста пользователя без внешних действий. "
@@ -667,6 +668,43 @@ def _normalize_string_list(value: Any) -> list[str]:
     return items
 
 
+def _sanitize_task_parse_preview(text: str, limit: int = _TASK_PARSE_PREVIEW_MAX_CHARS) -> str:
+    sanitized = _final_only_sanitize(text)
+    sanitized = _sanitize_think_prompt(sanitized)
+    sanitized = re.sub(r"\s+", " ", sanitized).strip()
+    if len(sanitized) <= limit:
+        return sanitized
+    return f"{sanitized[:limit].rstrip()}…"
+
+
+def _build_task_parse_diagnostics(content: Any) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {
+        "content_type": type(content).__name__,
+        "block_types": [],
+        "text_previews": [],
+    }
+
+    if not isinstance(content, list):
+        return diagnostics
+
+    block_types: list[str] = []
+    text_previews: list[str] = []
+    for block in content:
+        if isinstance(block, dict):
+            block_type = str(block.get("type") or "unknown")
+            block_types.append(block_type)
+            if block_type == "text":
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    text_previews.append(_sanitize_task_parse_preview(text))
+        else:
+            block_types.append(type(block).__name__)
+
+    diagnostics["block_types"] = block_types
+    diagnostics["text_previews"] = text_previews
+    return diagnostics
+
+
 def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = None) -> dict[str, Any]:
     client = llm_client or AnthropicClient(max_tokens_out=900)
     response = client.create_message(
@@ -674,6 +712,7 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
         system=_TASK_SYSTEM_PROMPT,
     )
     content = response.get("content")
+    parse_diagnostics = _build_task_parse_diagnostics(content)
     text_blocks: list[str] = []
     if isinstance(content, list):
         for block in content:
@@ -684,6 +723,7 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
 
     parsed = _extract_json_object("\n".join(text_blocks))
     if not parsed:
+        logger.warning("task_spec_parse_failed", extra=parse_diagnostics)
         raise ValueError("LLM did not return JSON spec")
 
     risk_level = str(parsed.get("risk_level", "R2")).strip().upper()
