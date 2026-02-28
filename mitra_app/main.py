@@ -52,6 +52,13 @@ _THINK_SYSTEM_PROMPT = (
     "Следующие шаги: ..."
 )
 
+_REFLECT_SYSTEM_PROMPT = (
+    "Ты формируешь краткий EVO-0 отчет по текущему состоянию Mitra. "
+    "Учитывай цель, последние audit-события и бюджет. "
+    "Оценивай только факты из контекста, не придумывай новые данные. "
+    "Сформируй 3 короткие гипотезы улучшений для AL0 и next actions."
+)
+
 HELP_TEXT = (
     "Commands: /status, /oauth_status, /search <query>, /research <query>, /think <prompt>, "
     "/report <text>, /pr <title>\\n<spec>, /task <request>, /pr_status <issue#|pr#>, /drive_check, /budget, "
@@ -380,7 +387,9 @@ def _parse_goal_command(text: str) -> tuple[str, str | None] | None:
     return None
 
 
-def _truncate_goal_preview(goal_text: str, limit: int = _GOAL_PREVIEW_MAX_CHARS) -> str:
+def _truncate_goal_preview(goal_text: str, limit: int | None = None) -> str:
+    if limit is None:
+        limit = _GOAL_PREVIEW_MAX_CHARS
     if len(goal_text) <= limit:
         return goal_text
     return f"{goal_text[:limit].rstrip()}…"
