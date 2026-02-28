@@ -1,10 +1,13 @@
 import logging
 import os
+import re
 from typing import Any
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+_TELEGRAM_TEXT_LIMIT = 4096
 
 
 def _build_expected_webhook_url(public_base_url: str) -> str:
@@ -64,14 +67,57 @@ async def send_message(chat_id: int, text: str) -> bool:
         return True
 
     api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
+    sanitized_text = sanitize_telegram_text(text)
+    if not sanitized_text:
+        logger.info("telegram_send_message_skipped_empty", extra={"chat_id": chat_id})
+        return True
+
+    chunks = chunk_telegram_message(sanitized_text, limit=_TELEGRAM_TEXT_LIMIT)
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.post(api_url, json=payload)
-            response.raise_for_status()
+            for chunk in chunks:
+                payload = {"chat_id": chat_id, "text": chunk}
+                response = await client.post(api_url, json=payload)
+                response.raise_for_status()
     except httpx.HTTPError:
         logger.exception("telegram_send_message_http_error", extra={"chat_id": chat_id})
         return False
 
     return True
+
+
+def sanitize_telegram_text(text: str) -> str:
+    sanitized = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    sanitized = re.sub(r"</?thinking>", "", sanitized, flags=re.IGNORECASE)
+    return sanitized.strip()
+
+
+def chunk_telegram_message(text: str, limit: int = _TELEGRAM_TEXT_LIMIT) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    start = 0
+    total_len = len(text)
+    while start < total_len:
+        end = min(start + limit, total_len)
+        if end == total_len:
+            chunks.append(text[start:end])
+            break
+
+        split_at = max(text.rfind("\n", start, end + 1), text.rfind(" ", start, end + 1))
+        if split_at <= start:
+            split_at = end
+
+        chunk = text[start:split_at].rstrip()
+        if not chunk:
+            chunk = text[start:end]
+            split_at = end
+        chunks.append(chunk)
+
+        start = split_at
+        while start < total_len and text[start].isspace():
+            start += 1
+
+    return chunks
