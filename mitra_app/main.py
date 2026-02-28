@@ -42,7 +42,6 @@ logger = logging.getLogger(__name__)
 _THINK_PROMPT_MAX_CHARS = 1200
 _THINK_OUTPUT_MAX_CHARS = 900
 _GOAL_PREVIEW_MAX_CHARS = 160
-_TASK_PARSE_PREVIEW_MAX_CHARS = 260
 _SECRET_ENV_NAME_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|PRIVATE|API_KEY|ACCESS_KEY|CLIENT_SECRET)", re.IGNORECASE)
 _THINK_SYSTEM_PROMPT = (
     "Ты помощник в режиме /think. Нужен только анализ текста пользователя без внешних действий. "
@@ -700,25 +699,23 @@ def _build_task_parse_diagnostics(content: Any) -> dict[str, Any]:
     if not isinstance(content, list):
         return diagnostics
 
-    block_types: list[str] = []
-    text_previews: list[str] = []
+    text_blocks_count = 0
+    non_text_block_types: list[str] = []
     for block in content:
         if not isinstance(block, dict):
-            block_types.append(type(block).__name__)
+            non_text_block_types.append(type(block).__name__)
             continue
 
         block_type = str(block.get("type", "unknown"))
-        block_types.append(block_type)
-        if block_type != "text":
+        if block_type == "text":
+            text_blocks_count += 1
             continue
+        non_text_block_types.append(block_type)
 
-        text = block.get("text")
-        if isinstance(text, str) and text.strip():
-            sanitized = _sanitize_think_prompt(text.strip())
-            text_previews.append(_cap_output_chars(sanitized, _TASK_PARSE_PREVIEW_MAX_CHARS))
-
-    diagnostics["block_types"] = block_types
-    diagnostics["text_previews"] = text_previews
+    diagnostics["total_blocks"] = len(content)
+    diagnostics["text_blocks_count"] = text_blocks_count
+    diagnostics["has_non_text_blocks"] = bool(non_text_block_types)
+    diagnostics["non_text_block_types"] = sorted(set(non_text_block_types))
     return diagnostics
 
 
