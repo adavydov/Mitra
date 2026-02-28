@@ -3,9 +3,12 @@ import hashlib
 import logging
 import os
 import re
+import sys
+import traceback
+import asyncio
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from threading import Lock
 import time
@@ -68,7 +71,7 @@ _THINK_SYSTEM_PROMPT = (
 HELP_TEXT = (
     "Commands: /status, /oauth_status, /search <query>, /research <query>, /think <prompt>, "
     "/report <text>, /pr <title>\\n<spec>, /task <request>, /pr_status <issue#|pr#>, /drive_check, /budget, "
-    "/smoke, /smoke_deep"
+    "/smoke, /smoke_deep, /autoevo on|off"
 )
 
 _TASK_SYSTEM_PROMPT = (
@@ -149,6 +152,13 @@ _FAILURE_REASON_TO_GAP: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(timeout|flaky|race|intermittent|network|connection reset)\b", re.IGNORECASE), "infra_instability"),
     (re.compile(r"\b(lint|format|type check|mypy|ruff|black)\b", re.IGNORECASE), "quality_gate"),
 ]
+
+_AUTO_GAP_ISSUE_THROTTLE_PER_HOUR = 3
+_AUTO_GAP_ISSUE_WINDOW_SECONDS = 3600
+_MISSING_CAPABILITY_ERROR_RE = re.compile(r"(not configured|missing|unsupported|unknown command|usage:|forbidden|allowlist)", re.IGNORECASE)
+_autoevo_enabled_override: bool | None = None
+_auto_gap_issue_timestamps: list[float] = []
+_auto_gap_issue_lock = Lock()
 
 
 
@@ -312,6 +322,7 @@ _COMMAND_POLICIES: dict[str, CommandPolicy] = {
     "/budget_reset_day": CommandPolicy(required_al="AL3", risk_level="R3", budget_category="search"),
     "/budget": CommandPolicy(required_al="AL1", risk_level="R0", budget_category="search"),
     "/reflect": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="drive"),
+    "/autoevo": CommandPolicy(required_al="AL2", risk_level="R2", budget_category="github"),
 }
 
 _policy_enforcer = CommandPolicyEnforcer(Path(__file__).resolve().parents[1])
@@ -1446,6 +1457,13 @@ def _remember_admin_chat_if_allowed(user_id: int | None, chat_id: int | None, al
     except (OSError, ValueError):
         logger.exception("failed_to_persist_admin_chat_id", extra={"chat_id": chat_id})
 
+
+
+def _parse_autoevo_command(text: str) -> str | None:
+    payload = text[len("/autoevo") :].strip().lower()
+    if payload in {"on", "off"}:
+        return payload
+    return None
 def _parse_pr_status_command(text: str) -> str | None:
     body = text[len("/pr_status") :].strip()
     return body or None
@@ -1618,6 +1636,89 @@ def _is_allowlist_configured(raw_value: str | None) -> bool:
     return bool(raw_value and raw_value.strip())
 
 
+def _is_flag_enabled(env_name: str, default: bool = False) -> bool:
+    raw = os.getenv(env_name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_autoevo_enabled() -> bool:
+    if _autoevo_enabled_override is not None:
+        return _autoevo_enabled_override
+    return _is_flag_enabled("MITRA_AUTO_GAP_ISSUES", default=False)
+
+
+def _set_autoevo_enabled(enabled: bool) -> None:
+    global _autoevo_enabled_override
+    _autoevo_enabled_override = enabled
+
+
+def _classify_error_type(action_type: str, detail: str) -> str:
+    combined = f"{action_type} {detail}".strip()
+    if _MISSING_CAPABILITY_ERROR_RE.search(combined):
+        return "missing-capability"
+    return "bugfix"
+
+
+def _auto_gap_issue_allowed_now() -> bool:
+    now_ts = time.time()
+    min_ts = now_ts - _AUTO_GAP_ISSUE_WINDOW_SECONDS
+    with _auto_gap_issue_lock:
+        _auto_gap_issue_timestamps[:] = [ts for ts in _auto_gap_issue_timestamps if ts >= min_ts]
+        if len(_auto_gap_issue_timestamps) >= _AUTO_GAP_ISSUE_THROTTLE_PER_HOUR:
+            return False
+        _auto_gap_issue_timestamps.append(now_ts)
+    return True
+
+
+def _safe_env_hints() -> str:
+    hints = {
+        "autonomy_level": os.getenv("MITRA_AUTONOMY_LEVEL", "AL2"),
+        "python_version": sys.version.split()[0],
+        "auto_gap_issues": "on" if _is_autoevo_enabled() else "off",
+        "allowlist_configured": "yes" if bool(os.getenv("ALLOWED_TELEGRAM_USER_IDS", "").strip()) else "no",
+    }
+    return "\n".join(f"- {key}: {value}" for key, value in hints.items())
+
+
+async def _maybe_create_auto_gap_issue(event: dict[str, object]) -> None:
+    if not _is_autoevo_enabled() or bool(event.get("suppress_auto_gap_issue")):
+        return
+    if not _auto_gap_issue_allowed_now():
+        return
+
+    action_type = str(event.get("action_type") or "unknown")
+    command_input = str(event.get("command_input") or "")
+    detail = str(event.get("detail") or event.get("reason") or "")
+    classification = str(event.get("error_classification") or _classify_error_type(action_type, detail))
+    stacktrace = str(event.get("stacktrace") or "")
+    stacktrace_trimmed = (stacktrace[:1800] + "…") if len(stacktrace) > 1800 else stacktrace
+
+    title = f"[auto-gap] {action_type} failed ({classification})"
+    body = (
+        "## Reproduction\n"
+        "1. Trigger command from Telegram webhook.\n"
+        f"2. Observe error outcome for `{action_type}` in audit.\n\n"
+        "## Command/Input\n"
+        f"- action_type: `{action_type}`\n"
+        f"- input: `{command_input[:300]}`\n"
+        f"- detail: `{detail[:400]}`\n"
+        f"- classification: `{classification}`\n\n"
+        "## Truncated stacktrace\n"
+        "```\n"
+        f"{stacktrace_trimmed or 'stacktrace unavailable'}\n"
+        "```\n\n"
+        "## Env hints\n"
+        f"{_safe_env_hints()}\n"
+    )
+
+    try:
+        await github.create_issue(title=title, body=body, labels=["mitra:codex"])
+    except Exception:
+        logger.exception("auto_gap_issue_create_failed", extra={"action_type": action_type})
+
+
 def _audit_allowlist_denied(
     user_id: int | None,
     chat_id: int | None,
@@ -1655,15 +1756,33 @@ def _audit_dedup(update_id: int, user_id: int | None, chat_id: int | None, actio
 
 
 def _safe_audit_event(event: dict[str, object]) -> None:
+    payload = dict(event)
+    if payload.get("outcome") == "error" and "error_classification" not in payload:
+        detail = str(payload.get("detail") or payload.get("reason") or "")
+        payload["error_classification"] = _classify_error_type(str(payload.get("action_type") or ""), detail)
+    if payload.get("outcome") == "error" and "command_input" not in payload:
+        payload["command_input"] = str(payload.get("action_type") or "")
+
+    exc_type, _, _ = sys.exc_info()
+    if payload.get("outcome") == "error" and exc_type is not None and "stacktrace" not in payload:
+        payload["stacktrace"] = traceback.format_exc(limit=25)
+
     log_event = getattr(audit, "log_event", None)
     if callable(log_event):
         try:
-            log_event(event)
+            log_event(payload)
         except Exception:
-            logger.exception("telegram_audit_failed", extra={"event": event})
+            logger.exception("telegram_audit_failed", extra={"event": payload})
+        else:
+            if payload.get("outcome") == "error":
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(_maybe_create_auto_gap_issue(payload))
+                except RuntimeError:
+                    pass
         return
 
-    logger.info("telegram_audit_event", extra=event)
+    logger.info("telegram_audit_event", extra=payload)
 
 
 
@@ -1926,6 +2045,12 @@ def _is_budget_admin(user_id: int | None) -> bool:
     return str(user_id) == owner_id.strip()
 
 
+def _is_admin_or_allowlisted(user_id: int | None, allowed_user_ids: set[int]) -> bool:
+    if user_id is None:
+        return False
+    return user_id in allowed_user_ids or _is_budget_admin(user_id)
+
+
 def _smoke_line(name: str, status: str, reason: str) -> str:
     return f"- {name}: {status} ({reason})"
 
@@ -2159,6 +2284,23 @@ async def telegram_webhook(
             text = _route_plain_text_command(text)
 
         action_type = text.split()[0] if isinstance(text, str) and text else "no_command"
+        if isinstance(text, str) and text.strip() and not text.strip().startswith("/"):
+            text = f"/task {text.strip()}"
+            action_type = "/task"
+            _safe_audit_event(
+                {
+                    "event": "telegram_nl_router",
+                    "action_id": action_id,
+                    "telegram_update_id": telegram_update_id,
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "action_type": "/task",
+                    "outcome": "safe_path",
+                    "suppress_auto_gap_issue": True,
+                    "command_input": text,
+                    "log_level": "info",
+                }
+            )
         if isinstance(text, str) and text.strip().startswith("/goal set"):
             action_type = "/goal set"
 
@@ -2380,6 +2522,29 @@ async def telegram_webhook(
                         "outcome": "error",
                         "detail": repr(exc),
                         "log_level": "error",
+                    }
+                )
+        elif text.startswith("/autoevo"):
+            mode = _parse_autoevo_command(text)
+            if mode is None:
+                reply_text = "Usage: /autoevo on|off"
+            elif not _is_admin_or_allowlisted(user_id if isinstance(user_id, int) else None, allowed_user_ids):
+                reply_text = "Forbidden"
+            else:
+                enabled = mode == "on"
+                _set_autoevo_enabled(enabled)
+                reply_text = f"Auto-evolution issue mode: {'ON' if enabled else 'OFF'}"
+                _safe_audit_event(
+                    {
+                        "event": "telegram_autoevo_toggle",
+                        "action_id": action_id,
+                        "telegram_update_id": telegram_update_id,
+                        "user_id": user_id,
+                        "chat_id": chat_id,
+                        "action_type": "/autoevo",
+                        "outcome": "success",
+                        "enabled": enabled,
+                        "log_level": "info",
                     }
                 )
         elif not allowlist_configured:
