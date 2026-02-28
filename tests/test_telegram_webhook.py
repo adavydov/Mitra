@@ -1392,7 +1392,7 @@ def test_task_command_without_body_returns_usage(monkeypatch):
     assert calls == [(123, "Usage: /task <request>")]
 
 
-def test_build_task_spec_logs_warning_with_diagnostics_on_non_json_response(caplog):
+def test_build_task_spec_logs_fallback_with_diagnostics_on_non_json_response(caplog):
     class FakeClient:
         def create_message(self, *, messages, system):
             return {
@@ -1402,14 +1402,46 @@ def test_build_task_spec_logs_warning_with_diagnostics_on_non_json_response(capl
                 ]
             }
 
-    with caplog.at_level(logging.WARNING, logger="mitra_app.main"):
-        with pytest.raises(ValueError, match="LLM did not return JSON spec"):
-            _build_task_spec("Сделай команду /hello", llm_client=FakeClient())
+    with caplog.at_level(logging.INFO, logger="mitra_app.main"):
+        spec = _build_task_spec("Сделай команду /hello", llm_client=FakeClient())
 
-    record = next(rec for rec in caplog.records if rec.message == "task_spec_parse_failed")
-    assert record.content_type == "list"
-    assert record.block_types == ["thinking", "text"]
-    assert record.text_previews == ["Not JSON. OPENAI_API_KEY=[REDACTED]"]
+    assert spec["degraded"] is True
+    primary_record = next(rec for rec in caplog.records if rec.message == "task_spec_parse_primary_failed")
+    assert primary_record.content_type == "list"
+    assert primary_record.block_types == ["thinking", "text"]
+    assert primary_record.text_previews == ["Not JSON. OPENAI_API_KEY=[REDACTED]"]
+
+    fallback_record = next(rec for rec in caplog.records if rec.message == "task_spec_fallback_used")
+    assert fallback_record.parse_outcome == "fallback_used"
+    assert fallback_record.primary_parse["block_types"] == ["thinking", "text"]
+    assert fallback_record.retry_parse["block_types"] == ["thinking", "text"]
+
+
+def test_build_task_spec_logs_retry_success(monkeypatch, caplog):
+    responses = [
+        {"content": [{"type": "text", "text": "not json"}]},
+        {
+            "content": [
+                {
+                    "type": "text",
+                    "text": '{"title":"T","summary":"S","components":[],"required_env_secrets":[],"new_commands":[],"acceptance_criteria":[],"tests_to_add":[],"risk_level":"R1"}',
+                }
+            ]
+        },
+    ]
+
+    class FakeClient:
+        def create_message(self, *, messages, system):
+            return responses.pop(0)
+
+    with caplog.at_level(logging.INFO, logger="mitra_app.main"):
+        spec = _build_task_spec("Сделай команду /hello", llm_client=FakeClient())
+
+    assert spec["degraded"] is False
+    assert spec["risk_level"] == "R1"
+
+    retry_record = next(rec for rec in caplog.records if rec.message == "task_spec_retry_success")
+    assert retry_record.parse_outcome == "retry_success"
 
 
 def test_github_actions_callback_posts_to_admin_chat(monkeypatch):
