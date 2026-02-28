@@ -1,4 +1,4 @@
-from mitra_app.main import _extract_json_object, build_task_spec_resilient
+from mitra_app.main import _extract_json_object, _extract_missing_context, build_task_spec_resilient
 
 
 def test_extract_json_from_thinking_block():
@@ -73,3 +73,9 @@ def test_task_spec_schema_types():
     assert spec["tests_to_add"] == ["pytest"]
     assert spec["risk_level"] == "R2"
     assert spec["allowed_file_scope"] == ["mitra_app/*"]
+
+
+def test_extract_missing_context_defaults_to_github_for_git_repo_requests():
+    context = _extract_missing_context("Митра живет в гите, репо всегда в git")
+
+    assert context.issue_provider == "GitHub"

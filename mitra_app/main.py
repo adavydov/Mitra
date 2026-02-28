@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import asyncio
+import sys
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
@@ -666,6 +667,8 @@ def _extract_missing_context(request_text: str) -> MissingContext:
     issue_provider_match = re.search(r"\b(github|jira|linear)\b", lowered)
     if issue_provider_match:
         context.issue_provider = _normalize_provider_name(issue_provider_match.group(1))
+    elif any(token in lowered for token in ("git", "гит", "repo", "репо", "repository", "репозитор")):
+        context.issue_provider = "GitHub"
 
     integration_provider_match = re.search(r"\b(yandex|яндекс|google|гугл|outlook|аутлук)\b", lowered)
     if integration_provider_match:
