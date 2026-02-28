@@ -1881,10 +1881,10 @@ async def telegram_webhook(
                 return {"status": "ok"}
 
         pending_task_state = _task_dialog_state_by_chat.get(chat_id) if isinstance(chat_id, int) else None
-        if pending_task_state is not None and isinstance(text, str) and text.strip() and not text.strip().startswith("/"):
+        if pending_task_state is not None and isinstance(text, str) and text.strip():
             _merge_context_answer(pending_task_state, text)
             next_question = _build_context_question(pending_task_state.context)
-            if next_question is not None and not _context_above_threshold(pending_task_state.context):
+            if next_question is not None:
                 field_name, question = next_question
                 pending_task_state.last_question_field = field_name
                 reply_text = question
