@@ -1322,6 +1322,52 @@ def test_task_command_creates_codex_issue_and_reports_expected_command(monkeypat
     assert "Ожидаемая новая команда: /hello" in calls[0][1]
 
 
+def test_task_command_without_llm_json_uses_fallback_spec(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+
+    calls = []
+
+    async def fake_send_message(chat_id: int, text: str):
+        calls.append((chat_id, text))
+        return True
+
+    class FakeAnthropicClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def create_message(self, messages, system):
+            return {"content": [{"type": "text", "text": "Не JSON ответ"}]}
+
+    async def fake_create_github_issue(title: str, body: str):
+        assert title == "Добавь новую команду, которая отвечает текущим временем и коротким статусом сист"
+        assert "## Summary" in body
+        assert "## Risk level\n- R2" in body
+        assert "Добавь новую команду" in body
+        return 91, "https://github.com/o/r/issues/91"
+
+    monkeypatch.setattr("mitra_app.main.send_message", fake_send_message)
+    monkeypatch.setattr("mitra_app.main.AnthropicClient", FakeAnthropicClient)
+    monkeypatch.setattr("mitra_app.main._create_github_issue", fake_create_github_issue)
+
+    response = client.post(
+        "/telegram/webhook",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
+        json={
+            "message": {
+                "text": "/task Добавь новую команду, которая отвечает текущим временем и коротким статусом системы",
+                "chat": {"id": 123},
+                "from": {"id": 123},
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert "Issue создан: https://github.com/o/r/issues/91" in calls[0][1]
+    assert "Spec auto-filled from request (LLM JSON parse failed)" in calls[0][1]
+
+
 def test_task_command_without_body_returns_usage(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")

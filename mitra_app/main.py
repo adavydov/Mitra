@@ -667,6 +667,22 @@ def _normalize_string_list(value: Any) -> list[str]:
     return items
 
 
+def _build_fallback_task_spec(request_text: str) -> dict[str, Any]:
+    summary = request_text
+    title = request_text[:80].strip() or "Task from Telegram"
+    return {
+        "title": title,
+        "summary": summary,
+        "components": [],
+        "required_env_secrets": [],
+        "new_commands": [],
+        "acceptance_criteria": [],
+        "tests_to_add": [],
+        "risk_level": "R2",
+        "degraded": True,
+    }
+
+
 def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = None) -> dict[str, Any]:
     client = llm_client or AnthropicClient(max_tokens_out=900)
     response = client.create_message(
@@ -684,7 +700,8 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
 
     parsed = _extract_json_object("\n".join(text_blocks))
     if not parsed:
-        raise ValueError("LLM did not return JSON spec")
+        logger.warning("task_spec_degraded_json_parse_failed")
+        return _build_fallback_task_spec(request_text)
 
     risk_level = str(parsed.get("risk_level", "R2")).strip().upper()
     if risk_level not in {"R0", "R1", "R2", "R3", "R4"}:
@@ -706,6 +723,7 @@ def _build_task_spec(request_text: str, llm_client: AnthropicClient | None = Non
         "acceptance_criteria": _normalize_string_list(parsed.get("acceptance_criteria")),
         "tests_to_add": _normalize_string_list(parsed.get("tests_to_add")),
         "risk_level": risk_level,
+        "degraded": False,
     }
 
 
@@ -1703,8 +1721,10 @@ async def telegram_webhook(
                 reply_text = "Rate limit exceeded: max 5 /task per hour"
             else:
                 issue_number: int | None = None
+                degraded = False
                 try:
                     spec = _build_task_spec(request_text)
+                    degraded = bool(spec.get("degraded"))
                     issue_title, issue_body = _render_task_issue(spec)
                     issue_number, issue_url = await _create_github_issue(title=issue_title, body=issue_body)
                     await budget_ledger.record_github_write()
@@ -1716,9 +1736,11 @@ async def telegram_webhook(
                         lines.append("Требуются ключи/доступы: " + ", ".join(required_secrets))
                     if expected_commands:
                         lines.append("Ожидаемая новая команда: " + ", ".join(expected_commands))
+                    if degraded:
+                        lines.append("Spec auto-filled from request (LLM JSON parse failed)")
                     lines.append(_TASK_EXAMPLE_HINT)
                     reply_text = "\n".join(lines)
-                    outcome = "success"
+                    outcome = "degraded" if degraded else "success"
                 except Exception:
                     logger.exception("telegram_task_create_issue_failed")
                     reply_text = "Failed to create task issue"
@@ -1733,8 +1755,9 @@ async def telegram_webhook(
                         "chat_id": chat_id,
                         "action_type": "/task",
                         "issue_number": issue_number,
+                        "degraded": degraded,
                         "outcome": outcome,
-                        "log_level": "info" if outcome == "success" else "error",
+                        "log_level": "info" if outcome in {"success", "degraded"} else "error",
                     }
                 )
         elif text.startswith("/pr"):
