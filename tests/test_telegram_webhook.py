@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -11,7 +12,13 @@ from googleapiclient.errors import HttpError
 from fastapi.testclient import TestClient
 
 from mitra_app.drive import DriveNotConfiguredError, DriveUploadResult, OAuthRefreshInvalidGrant
-from mitra_app.main import RecentUpdateDeduplicator, _load_allowed_user_ids, app
+from mitra_app.main import (
+    RecentUpdateDeduplicator,
+    _build_pr_status_reply,
+    _load_allowed_user_ids,
+    _parse_pr_or_issue_ref,
+    app,
+)
 
 
 client = TestClient(app)
@@ -1324,3 +1331,62 @@ def test_policy_enforcement_exception_never_crashes_webhook(monkeypatch):
     assert denial["required_al"] == "AL2"
     assert denial["risk_level"] == "R2"
     assert denial["outcome"] == "denied"
+
+
+def test_parse_pr_or_issue_ref_supports_issue_and_pr_forms():
+    assert _parse_pr_or_issue_ref("42") == ("issue", 42)
+    assert _parse_pr_or_issue_ref("#42") == ("issue", 42)
+    assert _parse_pr_or_issue_ref("https://github.com/o/r/issues/42") == ("issue", 42)
+    assert _parse_pr_or_issue_ref("pr#42") == ("pr", 42)
+    assert _parse_pr_or_issue_ref("https://github.com/o/r/pull/42") == ("pr", 42)
+    assert _parse_pr_or_issue_ref("not-a-number") is None
+
+
+def test_build_pr_status_reply_accepts_pr_reference(monkeypatch):
+    @dataclass
+    class FakePrStatus:
+        number: int
+        state: str
+        draft: bool
+        merged: bool | None
+        mergeable: bool | None
+        head_sha: str
+        html_url: str
+
+    @dataclass
+    class FakeChecks:
+        total: int
+        successful: int
+        failed: int
+        pending: int
+
+    async def forbidden_find_linked_pr(*args, **kwargs):
+        raise AssertionError("find_linked_pr should not be called for PR references")
+
+    async def fake_get_pr_status(number: int):
+        assert number == 84
+        return FakePrStatus(
+            number=84,
+            state="open",
+            draft=False,
+            merged=False,
+            mergeable=True,
+            head_sha="abc123",
+            html_url="https://github.com/o/r/pull/84",
+        )
+
+    async def fake_get_pr_checks_summary(head_sha: str):
+        assert head_sha == "abc123"
+        return FakeChecks(total=3, successful=2, failed=1, pending=0)
+
+    monkeypatch.setattr("mitra_app.main.github.find_linked_pr", forbidden_find_linked_pr)
+    monkeypatch.setattr("mitra_app.main.github.get_pr_status", fake_get_pr_status)
+    monkeypatch.setattr("mitra_app.main.github.get_pr_checks_summary", fake_get_pr_checks_summary)
+
+    reply = asyncio.run(_build_pr_status_reply("pr#84"))
+
+    assert reply == (
+        "PR: https://github.com/o/r/pull/84\n"
+        "State: open\n"
+        "Checks: total=3, success=2, failed=1, pending=0"
+    )

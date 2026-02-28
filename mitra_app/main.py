@@ -380,21 +380,51 @@ def _parse_pr_status_command(text: str) -> str | None:
     return body or None
 
 
+def _parse_pr_or_issue_ref(ref: str) -> tuple[str, int] | None:
+    normalized = ref.strip()
+    if not normalized:
+        return None
+
+    lower = normalized.lower()
+    kind = "issue"
+    if "pull/" in lower or "pulls/" in lower or lower.startswith("pr"):
+        kind = "pr"
+
+    match = re.search(r"(\d+)\s*$", normalized)
+    if not match:
+        return None
+
+    number = int(match.group(1))
+    if number <= 0:
+        return None
+
+    return kind, number
+
+
 async def _build_pr_status_reply(ref: str) -> str:
-    try:
-        issue_number = int(ref)
-    except ValueError:
+    parsed_ref = _parse_pr_or_issue_ref(ref)
+    if parsed_ref is None:
         return "Usage: /pr_status <issue#|pr#>"
 
-    try:
-        linked_pr = await github.find_linked_pr(issue_number)
-        if linked_pr is None:
-            return f"No linked PR found for issue #{issue_number}"
+    ref_kind, ref_number = parsed_ref
 
-        pr_status = await github.get_pr_status(linked_pr.number)
+    try:
+        if ref_kind == "pr":
+            pr_number = ref_number
+            pr_status = await github.get_pr_status(pr_number)
+            pr_url = pr_status.html_url
+        else:
+            issue_number = ref_number
+            linked_pr = await github.find_linked_pr(issue_number)
+            if linked_pr is None:
+                return f"No linked PR found for issue #{issue_number}"
+            pr_number = linked_pr.number
+            pr_url = linked_pr.html_url
+
+        pr_status = await github.get_pr_status(pr_number)
         checks = await github.get_pr_checks_summary(pr_status.head_sha)
     except Exception:
-        logger.exception("telegram_pr_status_failed", extra={"issue_number": issue_number})
+        logger.exception("telegram_pr_status_failed", extra={"reference": ref})
         return "Failed to fetch PR status"
 
     state = pr_status.state or "unknown"
@@ -404,7 +434,7 @@ async def _build_pr_status_reply(ref: str) -> str:
         state = "merged"
 
     return (
-        f"PR: {linked_pr.html_url}\n"
+        f"PR: {pr_url}\n"
         f"State: {state}\n"
         f"Checks: total={checks.total}, success={checks.successful}, failed={checks.failed}, pending={checks.pending}"
     )
